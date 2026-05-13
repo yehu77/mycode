@@ -253,6 +253,10 @@ def build_review_execution(_session: "Session", args: str) -> CommandExecution:
         allowed_tool_names=_REVIEW_ALLOWED_TOOLS,
         allowed_bash_command_prefixes=_REVIEW_ALLOWED_BASH_PREFIXES,
         progress_message="Reviewing pull request",
+        metadata={
+            "command_policy_name": "review",
+            "command_policy_source": "repl:/review",
+        },
     )
 
 
@@ -267,6 +271,10 @@ def build_commit_execution(session: "Session", args: str) -> str | CommandExecut
         allowed_tool_names=_COMMIT_ALLOWED_TOOLS,
         allowed_bash_command_prefixes=_COMMIT_ALLOWED_BASH_PREFIXES,
         progress_message="Creating commit",
+        metadata={
+            "command_policy_name": "commit",
+            "command_policy_source": "repl:/commit",
+        },
     )
 
 
@@ -281,6 +289,10 @@ def build_security_review_execution(session: "Session", args: str) -> str | Comm
         allowed_tool_names=_SECURITY_REVIEW_ALLOWED_TOOLS,
         allowed_bash_command_prefixes=_SECURITY_REVIEW_ALLOWED_BASH_PREFIXES,
         progress_message="Running security review",
+        metadata={
+            "command_policy_name": "security-review",
+            "command_policy_source": "repl:/security-review",
+        },
     )
 
 
@@ -329,6 +341,8 @@ def build_ultraplan_execution(
         prompt = "\n".join(derivation_lines) + "\n\n" + prompt
     metadata = {
         "command_kind": "ultraplan",
+        "command_policy_name": "ultraplan",
+        "command_policy_source": "repl:/ultraplan",
         "goal": request,
         "scout_categories": [
             "architecture-boundaries",

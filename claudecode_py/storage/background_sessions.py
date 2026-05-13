@@ -6,14 +6,30 @@ from pathlib import Path
 from uuid import uuid4
 import json
 
+from ..workspace.isolation import derive_workspace_health
+
 
 @dataclass(slots=True)
 class BackgroundSessionRecord:
     bg_id: str
     cwd: str
+    session_execution_mode: str
+    session_command_policy_name: str | None
+    session_command_policy_source: str | None
+    session_command_policy_allowed_tool_names: list[str]
+    session_command_policy_allowed_bash_prefixes: list[str]
+    session_command_policy_require_read_only_subagents: bool
     original_cwd: str | None
     effective_cwd: str | None
     workspace_mode: str
+    workspace_label: str | None
+    workspace_created_at: str | None
+    workspace_health: str
+    workspace_cleanup_status: str
+    workspace_cleanup_error: str | None
+    workspace_unavailable: bool
+    workspace_unavailable_reason: str | None
+    workspace_fallback_cwd: str | None
     prompt: str
     provider: str
     model: str
@@ -86,9 +102,23 @@ def create_background_session(
     record = BackgroundSessionRecord(
         bg_id=bg_id,
         cwd=str(cwd),
+        session_execution_mode="background-session",
+        session_command_policy_name=None,
+        session_command_policy_source=None,
+        session_command_policy_allowed_tool_names=[],
+        session_command_policy_allowed_bash_prefixes=[],
+        session_command_policy_require_read_only_subagents=False,
         original_cwd=str(cwd),
         effective_cwd=str(cwd),
         workspace_mode="main",
+        workspace_label=None,
+        workspace_created_at=None,
+        workspace_health="healthy",
+        workspace_cleanup_status="none",
+        workspace_cleanup_error=None,
+        workspace_unavailable=False,
+        workspace_unavailable_reason=None,
+        workspace_fallback_cwd=str(cwd),
         prompt=prompt,
         provider=provider,
         model=model,
@@ -162,12 +192,78 @@ def resolve_background_session(cwd: Path, identifier: str) -> BackgroundSessionR
 
 def _load_background_record(payload: dict) -> BackgroundSessionRecord:
     cwd = str(payload.get("cwd", ""))
+    session_execution_mode = str(payload.get("session_execution_mode", "background-session") or "background-session")
+    workspace_mode = str(payload.get("workspace_mode", "main") or "main")
+    workspace_cleanup_status = str(payload.get("workspace_cleanup_status", "none") or "none")
+    workspace_unavailable = bool(payload.get("workspace_unavailable", False))
     return BackgroundSessionRecord(
         bg_id=str(payload["bg_id"]),
         cwd=cwd,
+        session_execution_mode=session_execution_mode,
+        session_command_policy_name=(
+            str(payload.get("session_command_policy_name"))
+            if payload.get("session_command_policy_name") is not None
+            else None
+        ),
+        session_command_policy_source=(
+            str(payload.get("session_command_policy_source"))
+            if payload.get("session_command_policy_source") is not None
+            else None
+        ),
+        session_command_policy_allowed_tool_names=[
+            str(item)
+            for item in payload.get("session_command_policy_allowed_tool_names", [])
+            if item is not None
+        ],
+        session_command_policy_allowed_bash_prefixes=[
+            str(item)
+            for item in payload.get("session_command_policy_allowed_bash_prefixes", [])
+            if item is not None
+        ],
+        session_command_policy_require_read_only_subagents=bool(
+            payload.get("session_command_policy_require_read_only_subagents", False)
+        ),
         original_cwd=str(payload.get("original_cwd") or cwd),
         effective_cwd=str(payload.get("effective_cwd") or cwd),
-        workspace_mode=str(payload.get("workspace_mode", "main") or "main"),
+        workspace_mode=workspace_mode,
+        workspace_label=(
+            str(payload.get("workspace_label"))
+            if payload.get("workspace_label") is not None
+            else None
+        ),
+        workspace_created_at=(
+            str(payload.get("workspace_created_at"))
+            if payload.get("workspace_created_at") is not None
+            else None
+        ),
+        workspace_health=str(
+            payload.get(
+                "workspace_health",
+                derive_workspace_health(
+                    workspace_mode=workspace_mode,
+                    workspace_cleanup_status=workspace_cleanup_status,
+                    workspace_unavailable=workspace_unavailable,
+                ),
+            )
+            or "healthy"
+        ),
+        workspace_cleanup_status=workspace_cleanup_status,
+        workspace_cleanup_error=(
+            str(payload.get("workspace_cleanup_error"))
+            if payload.get("workspace_cleanup_error") is not None
+            else None
+        ),
+        workspace_unavailable=workspace_unavailable,
+        workspace_unavailable_reason=(
+            str(payload.get("workspace_unavailable_reason"))
+            if payload.get("workspace_unavailable_reason") is not None
+            else None
+        ),
+        workspace_fallback_cwd=(
+            str(payload.get("workspace_fallback_cwd"))
+            if payload.get("workspace_fallback_cwd") is not None
+            else None
+        ),
         prompt=str(payload.get("prompt", "")),
         provider=str(payload.get("provider", "")),
         model=str(payload.get("model", "")),

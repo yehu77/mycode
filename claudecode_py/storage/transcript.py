@@ -9,11 +9,13 @@ import json
 from ..config import SessionConfig
 from ..state import (
     AdvisorReviewSummary,
+    ExplicitContextEntry,
     PlanningArtifact,
     SessionState,
     WorkspaceChangeSet,
     WorkspaceFileChange,
 )
+from ..workspace.isolation import derive_workspace_health
 
 
 @dataclass(slots=True)
@@ -28,8 +30,24 @@ class TranscriptSummary:
     original_cwd: str | None
     effective_cwd: str | None
     workspace_mode: str | None
+    workspace_label: str | None
+    workspace_created_at: str | None
+    workspace_health: str | None
+    workspace_cleanup_status: str | None
+    workspace_unavailable: bool
+    workspace_unavailable_reason: str | None
+    workspace_fallback_cwd: str | None
+    session_execution_mode: str | None
+    session_command_policy_name: str | None
+    session_command_policy_source: str | None
+    session_command_policy_allowed_tool_names: tuple[str, ...]
+    session_command_policy_allowed_bash_prefixes: tuple[str, ...]
+    session_command_policy_require_read_only_subagents: bool
     message_count: int
     context_summary_present: bool
+    active_planning_artifact_id: str | None
+    planning_artifact_count: int
+    task_surface_counts: dict[str, int]
 
 
 def utc_now_iso() -> str:
@@ -49,6 +67,11 @@ def save_transcript(config: SessionConfig, state: SessionState) -> Path:
     storage_dir = get_session_storage_dir(transcript_cwd)
     storage_dir.mkdir(parents=True, exist_ok=True)
     state.updated_at = utc_now_iso()
+    workspace_health = derive_workspace_health(
+        workspace_mode=state.workspace_mode,
+        workspace_cleanup_status=state.workspace_cleanup_status,
+        workspace_unavailable=bool(state.workspace_unavailable),
+    )
     planning_artifacts = (
         state.planning_artifact_history
         if state.planning_artifact_history
@@ -59,10 +82,25 @@ def save_transcript(config: SessionConfig, state: SessionState) -> Path:
         "session_id": state.session_id,
         "created_at": state.created_at,
         "updated_at": state.updated_at,
+        "session_execution_mode": state.session_execution_mode,
+        "session_command_policy_name": state.session_command_policy_name,
+        "session_command_policy_source": state.session_command_policy_source,
+        "session_command_policy_allowed_tool_names": state.session_command_policy_allowed_tool_names,
+        "session_command_policy_allowed_bash_prefixes": state.session_command_policy_allowed_bash_prefixes,
+        "session_command_policy_require_read_only_subagents": state.session_command_policy_require_read_only_subagents,
         "original_cwd": state.original_cwd,
         "effective_cwd": state.effective_cwd,
         "workspace_mode": state.workspace_mode,
+        "workspace_label": state.workspace_label,
+        "workspace_created_at": state.workspace_created_at,
+        "workspace_health": workspace_health,
+        "workspace_cleanup_status": state.workspace_cleanup_status,
+        "workspace_cleanup_error": state.workspace_cleanup_error,
+        "workspace_unavailable": state.workspace_unavailable,
+        "workspace_unavailable_reason": state.workspace_unavailable_reason,
+        "workspace_fallback_cwd": state.workspace_fallback_cwd,
         "context_summary": state.context_summary,
+        "explicit_context_entries": [asdict(item) for item in state.explicit_context_entries],
         "advisor_model": state.advisor_model,
         "advisor_mode": state.advisor_mode,
         "advisor_last_result": asdict(state.advisor_last_result) if state.advisor_last_result is not None else None,
@@ -81,6 +119,8 @@ def save_transcript(config: SessionConfig, state: SessionState) -> Path:
         "disabled_plugin_names": state.disabled_plugin_names,
         "enabled_skill_names": state.enabled_skill_names,
         "disabled_skill_names": state.disabled_skill_names,
+        "session_permission_rules": list(state.session_permission_rules),
+        "activated_deferred_tool_names": state.activated_deferred_tool_names,
         "cwd": str(config.cwd),
         "transcript_cwd": str(transcript_cwd),
         "provider": config.provider,
@@ -89,6 +129,8 @@ def save_transcript(config: SessionConfig, state: SessionState) -> Path:
         "messages": state.messages,
         "recent_change_sets": [asdict(item) for item in state.recent_change_sets],
         "undone_change_sets": [asdict(item) for item in state.undone_change_sets],
+        "saved_task_records": list(state.saved_task_records),
+        "saved_task_surface_counts": dict(state.saved_task_surface_counts),
         "active_planning_artifact_id": state.active_planning_artifact_id,
         "planning_artifact_history": [asdict(item) for item in planning_artifacts],
         "recent_planning_artifacts": [asdict(item) for item in planning_artifacts],
@@ -111,14 +153,88 @@ def load_transcript(path: Path) -> SessionState:
         )
         if item is not None
     ]
+    workspace_mode = str(payload.get("workspace_mode", "main") or "main")
+    workspace_cleanup_status = str(payload.get("workspace_cleanup_status", "none") or "none")
+    workspace_unavailable = bool(payload.get("workspace_unavailable", False))
     return SessionState(
         session_id=payload["session_id"],
         created_at=payload.get("created_at", utc_now_iso()),
         updated_at=payload.get("updated_at"),
+        session_execution_mode=str(payload.get("session_execution_mode", "main") or "main"),
+        session_command_policy_name=(
+            str(payload.get("session_command_policy_name"))
+            if payload.get("session_command_policy_name") is not None
+            else None
+        ),
+        session_command_policy_source=(
+            str(payload.get("session_command_policy_source"))
+            if payload.get("session_command_policy_source") is not None
+            else None
+        ),
+        session_command_policy_allowed_tool_names=[
+            str(item) for item in payload.get("session_command_policy_allowed_tool_names", []) if item is not None
+        ],
+        session_command_policy_allowed_bash_prefixes=[
+            str(item)
+            for item in payload.get("session_command_policy_allowed_bash_prefixes", [])
+            if item is not None
+        ],
+        session_command_policy_require_read_only_subagents=bool(
+            payload.get("session_command_policy_require_read_only_subagents", False)
+        ),
         original_cwd=payload.get("original_cwd"),
         effective_cwd=payload.get("effective_cwd"),
-        workspace_mode=str(payload.get("workspace_mode", "main") or "main"),
+        workspace_mode=workspace_mode,
+        workspace_label=(
+            str(payload.get("workspace_label"))
+            if payload.get("workspace_label") is not None
+            else None
+        ),
+        workspace_created_at=(
+            str(payload.get("workspace_created_at"))
+            if payload.get("workspace_created_at") is not None
+            else None
+        ),
+        workspace_health=str(
+            payload.get(
+                "workspace_health",
+                derive_workspace_health(
+                    workspace_mode=workspace_mode,
+                    workspace_cleanup_status=workspace_cleanup_status,
+                    workspace_unavailable=workspace_unavailable,
+                ),
+            )
+            or "healthy"
+        ),
+        workspace_cleanup_status=workspace_cleanup_status,
+        workspace_cleanup_error=(
+            str(payload.get("workspace_cleanup_error"))
+            if payload.get("workspace_cleanup_error") is not None
+            else None
+        ),
+        workspace_unavailable=workspace_unavailable,
+        workspace_unavailable_reason=(
+            str(payload.get("workspace_unavailable_reason"))
+            if payload.get("workspace_unavailable_reason") is not None
+            else None
+        ),
+        workspace_fallback_cwd=(
+            str(payload.get("workspace_fallback_cwd"))
+            if payload.get("workspace_fallback_cwd") is not None
+            else None
+        ),
         context_summary=payload.get("context_summary"),
+        explicit_context_entries=[
+            ExplicitContextEntry(
+                raw_path=str(entry.get("raw_path") or ""),
+                resolved_path=str(entry.get("resolved_path") or ""),
+                kind=str(entry.get("kind") or "file"),
+                added_at=str(entry.get("added_at") or utc_now_iso()),
+                resolved=bool(entry.get("resolved", True)),
+            )
+            for entry in payload.get("explicit_context_entries", [])
+            if isinstance(entry, dict)
+        ],
         advisor_model=payload.get("advisor_model"),
         advisor_mode=_resolve_advisor_mode(payload),
         advisor_last_result=_load_advisor_summary(payload.get("advisor_last_result")),
@@ -165,6 +281,16 @@ def load_transcript(path: Path) -> SessionState:
         disabled_plugin_names=list(payload.get("disabled_plugin_names", [])),
         enabled_skill_names=list(payload.get("enabled_skill_names", [])),
         disabled_skill_names=list(payload.get("disabled_skill_names", [])),
+        session_permission_rules=[
+            {
+                "decision": str(item.get("decision", "")),
+                "scope": str(item.get("scope", "")),
+                "value": str(item.get("value", "")),
+            }
+            for item in payload.get("session_permission_rules", [])
+            if isinstance(item, dict)
+        ],
+        activated_deferred_tool_names=list(payload.get("activated_deferred_tool_names", [])),
         messages=list(payload.get("messages", [])),
         recent_change_sets=[
             WorkspaceChangeSet(
@@ -172,12 +298,26 @@ def load_transcript(path: Path) -> SessionState:
                 created_at=item.get("created_at", utc_now_iso()),
                 tool_name=item.get("tool_name", ""),
                 summary=item.get("summary", ""),
+                change_kind=str(item.get("change_kind", "workspace_change") or "workspace_change"),
+                undoable=bool(item.get("undoable", True)),
                 files=[
                     WorkspaceFileChange(
                         path=file_item["path"],
                         existed_before=bool(file_item.get("existed_before", False)),
                         before_content=file_item.get("before_content", ""),
                         after_content=file_item.get("after_content"),
+                        action_kind=str(file_item.get("action_kind", "") or ""),
+                        source_path=(
+                            str(file_item.get("source_path"))
+                            if file_item.get("source_path") is not None
+                            else None
+                        ),
+                        replacement_count=(
+                            int(file_item["replacement_count"])
+                            if file_item.get("replacement_count") is not None
+                            else None
+                        ),
+                        change_mode=str(file_item.get("change_mode", "") or ""),
                     )
                     for file_item in item.get("files", [])
                 ],
@@ -190,18 +330,36 @@ def load_transcript(path: Path) -> SessionState:
                 created_at=item.get("created_at", utc_now_iso()),
                 tool_name=item.get("tool_name", ""),
                 summary=item.get("summary", ""),
+                change_kind=str(item.get("change_kind", "workspace_change") or "workspace_change"),
+                undoable=bool(item.get("undoable", True)),
                 files=[
                     WorkspaceFileChange(
                         path=file_item["path"],
                         existed_before=bool(file_item.get("existed_before", False)),
                         before_content=file_item.get("before_content", ""),
                         after_content=file_item.get("after_content"),
+                        action_kind=str(file_item.get("action_kind", "") or ""),
+                        source_path=(
+                            str(file_item.get("source_path"))
+                            if file_item.get("source_path") is not None
+                            else None
+                        ),
+                        replacement_count=(
+                            int(file_item["replacement_count"])
+                            if file_item.get("replacement_count") is not None
+                            else None
+                        ),
+                        change_mode=str(file_item.get("change_mode", "") or ""),
                     )
                     for file_item in item.get("files", [])
                 ],
             )
             for item in payload.get("undone_change_sets", [])
         ],
+        saved_task_records=[
+            dict(item) for item in payload.get("saved_task_records", []) if isinstance(item, dict)
+        ],
+        saved_task_surface_counts=_normalize_task_surface_counts(payload.get("saved_task_surface_counts")),
         active_planning_artifact_id=(
             str(payload.get("active_planning_artifact_id"))
             if payload.get("active_planning_artifact_id") is not None
@@ -215,24 +373,29 @@ def load_transcript(path: Path) -> SessionState:
 def load_transcript_by_session_id(cwd: Path, session_id: str) -> tuple[SessionState | None, Path | None]:
     path = get_session_path(cwd, session_id)
     if not path.exists():
-        return None, None
+        for storage_dir in _iter_session_storage_dirs(cwd):
+            candidate = storage_dir / f"{session_id}.json"
+            if candidate.exists():
+                path = candidate
+                break
+        else:
+            return None, None
     return load_transcript(path), path
 
 
 def list_transcripts(cwd: Path, *, limit: int | None = None) -> list[TranscriptSummary]:
-    storage_dir = get_session_storage_dir(cwd)
-    if not storage_dir.exists():
-        return []
-    summaries: list[TranscriptSummary] = []
-    for path in storage_dir.glob("*.json"):
-        if not path.is_file():
+    summaries_by_session_id: dict[str, TranscriptSummary] = {}
+    for storage_dir in _iter_session_storage_dirs(cwd):
+        if not storage_dir.exists():
             continue
-        try:
-            payload = _read_transcript_payload(path)
-        except Exception:  # noqa: BLE001
-            continue
-        summaries.append(
-            TranscriptSummary(
+        for path in storage_dir.glob("*.json"):
+            if not path.is_file():
+                continue
+            try:
+                payload = _read_transcript_payload(path)
+            except Exception:  # noqa: BLE001
+                continue
+            summary = TranscriptSummary(
                 session_id=payload.get("session_id", path.stem),
                 path=path,
                 created_at=payload.get("created_at"),
@@ -243,10 +406,57 @@ def list_transcripts(cwd: Path, *, limit: int | None = None) -> list[TranscriptS
                 original_cwd=payload.get("original_cwd"),
                 effective_cwd=payload.get("effective_cwd"),
                 workspace_mode=payload.get("workspace_mode"),
+                workspace_label=payload.get("workspace_label"),
+                workspace_created_at=payload.get("workspace_created_at"),
+                workspace_health=payload.get(
+                    "workspace_health",
+                    derive_workspace_health(
+                        workspace_mode=str(payload.get("workspace_mode", "main") or "main"),
+                        workspace_cleanup_status=str(
+                            payload.get("workspace_cleanup_status", "none") or "none"
+                        ),
+                        workspace_unavailable=bool(payload.get("workspace_unavailable", False)),
+                    ),
+                ),
+                workspace_cleanup_status=payload.get("workspace_cleanup_status"),
+                workspace_unavailable=bool(payload.get("workspace_unavailable", False)),
+                workspace_unavailable_reason=payload.get("workspace_unavailable_reason"),
+                workspace_fallback_cwd=payload.get("workspace_fallback_cwd"),
+                session_execution_mode=payload.get("session_execution_mode"),
+                session_command_policy_name=payload.get("session_command_policy_name"),
+                session_command_policy_source=payload.get("session_command_policy_source"),
+                session_command_policy_allowed_tool_names=tuple(
+                    str(item)
+                    for item in payload.get("session_command_policy_allowed_tool_names", [])
+                    if item is not None
+                ),
+                session_command_policy_allowed_bash_prefixes=tuple(
+                    str(item)
+                    for item in payload.get("session_command_policy_allowed_bash_prefixes", [])
+                    if item is not None
+                ),
+                session_command_policy_require_read_only_subagents=bool(
+                    payload.get("session_command_policy_require_read_only_subagents", False)
+                ),
                 message_count=int(payload.get("message_count", len(payload.get("messages", [])))),
                 context_summary_present=bool(payload.get("context_summary")),
+                active_planning_artifact_id=(
+                    str(payload.get("active_planning_artifact_id"))
+                    if payload.get("active_planning_artifact_id") is not None
+                    else None
+                ),
+                planning_artifact_count=len(
+                    payload.get(
+                        "planning_artifact_history",
+                        payload.get("recent_planning_artifacts", []),
+                    )
+                ),
+                task_surface_counts=_summary_task_surface_counts(payload),
             )
-        )
+            current = summaries_by_session_id.get(summary.session_id)
+            if current is None or _summary_sort_key(summary) > _summary_sort_key(current):
+                summaries_by_session_id[summary.session_id] = summary
+    summaries = list(summaries_by_session_id.values())
     summaries.sort(
         key=lambda item: (
             item.updated_at or "",
@@ -268,8 +478,74 @@ def load_latest_transcript(cwd: Path) -> tuple[SessionState | None, Path | None]
     return load_transcript(latest), latest
 
 
+def update_transcript_workspace_metadata(
+    path: Path,
+    *,
+    original_cwd: str,
+    effective_cwd: str,
+    workspace_mode: str,
+    workspace_label: str | None,
+    workspace_created_at: str | None,
+    workspace_health: str,
+    workspace_cleanup_status: str,
+    workspace_cleanup_error: str | None,
+    workspace_unavailable: bool,
+    workspace_unavailable_reason: str | None,
+    workspace_fallback_cwd: str | None,
+) -> None:
+    payload = _read_transcript_payload(path)
+    payload["original_cwd"] = original_cwd
+    payload["effective_cwd"] = effective_cwd
+    payload["workspace_mode"] = workspace_mode
+    payload["workspace_label"] = workspace_label
+    payload["workspace_created_at"] = workspace_created_at
+    payload["workspace_health"] = workspace_health
+    payload["workspace_cleanup_status"] = workspace_cleanup_status
+    payload["workspace_cleanup_error"] = workspace_cleanup_error
+    payload["workspace_unavailable"] = workspace_unavailable
+    payload["workspace_unavailable_reason"] = workspace_unavailable_reason
+    payload["workspace_fallback_cwd"] = workspace_fallback_cwd
+    payload["updated_at"] = utc_now_iso()
+    path.write_text(json.dumps(payload, ensure_ascii=True, indent=2), encoding="utf-8")
+
+
 def _read_transcript_payload(path: Path) -> dict:
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _iter_session_storage_dirs(cwd: Path) -> list[Path]:
+    root = cwd.resolve()
+    discovered: list[Path] = []
+    seen: set[Path] = set()
+    for directory in _candidate_session_storage_dirs(root):
+        resolved = directory.resolve()
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        discovered.append(resolved)
+    return discovered
+
+
+def _candidate_session_storage_dirs(root: Path) -> list[Path]:
+    directories = [get_session_storage_dir(root)]
+    pyclaude_dir = root / ".pyclaude"
+    for group_name in ("workspaces", "worktrees"):
+        parent = pyclaude_dir / group_name
+        if not parent.exists():
+            continue
+        for child in parent.iterdir():
+            if not child.is_dir():
+                continue
+            directories.append(get_session_storage_dir(child))
+    return directories
+
+
+def _summary_sort_key(summary: TranscriptSummary) -> tuple[str, str, str]:
+    return (
+        summary.updated_at or "",
+        summary.created_at or "",
+        summary.session_id,
+    )
 
 
 def _resolve_advisor_mode(payload: dict) -> str:
@@ -339,3 +615,45 @@ def _load_legacy_artifact_id(payload: dict) -> str:
     created_at = str(payload.get("created_at", ""))
     digest = sha1(f"{goal}\n{created_at}".encode("utf-8")).hexdigest()
     return f"plan-{digest[:10]}"
+
+
+def _normalize_task_surface_counts(payload: object) -> dict[str, int]:
+    if not isinstance(payload, dict):
+        return {}
+    counts: dict[str, int] = {}
+    for key, value in payload.items():
+        try:
+            counts[str(key)] = int(value)
+        except (TypeError, ValueError):
+            continue
+    return counts
+
+
+def _summary_task_surface_counts(payload: dict) -> dict[str, int]:
+    counts = _normalize_task_surface_counts(payload.get("saved_task_surface_counts"))
+    if counts:
+        return counts
+    fallback = {
+        "checklist": 0,
+        "workspace_maintenance": 0,
+        "child_execution": 0,
+        "background_execution": 0,
+        "active_plan_execution": 0,
+        "other_task": 0,
+    }
+    for item in payload.get("saved_task_records", []):
+        if not isinstance(item, dict):
+            continue
+        task_kind = str(item.get("kind") or "").strip()
+        metadata = item.get("metadata")
+        task_metadata = dict(metadata) if isinstance(metadata, dict) else {}
+        surface_kind = "other_task"
+        task_role = str(task_metadata.get("task_role") or "").strip()
+        if task_kind == "workspace":
+            surface_kind = "workspace_maintenance"
+        elif task_role == "execution":
+            surface_kind = "active_plan_execution"
+        elif task_kind in {"agent", "ultraplan_scout"}:
+            surface_kind = "child_execution" if task_role == "scout" else "background_execution"
+        fallback[surface_kind] = fallback.get(surface_kind, 0) + 1
+    return fallback

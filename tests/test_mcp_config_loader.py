@@ -45,7 +45,7 @@ class _HttpLoaderHandler(BaseHTTPRequestHandler):
                     "result": {
                         "protocolVersion": "2024-11-05",
                         "serverInfo": {"version": "0.0.3"},
-                        "capabilities": {"tools": {}},
+                        "capabilities": {"tools": {}, "resources": {}},
                     },
                 },
             )
@@ -62,6 +62,24 @@ class _HttpLoaderHandler(BaseHTTPRequestHandler):
                                 "name": "echo_text",
                                 "description": "Return the provided text.",
                                 "inputSchema": {"type": "object", "properties": {"text": {"type": "string"}}},
+                            }
+                        ]
+                    },
+                },
+            )
+            return
+        if method == "resources/list":
+            self._write_json(
+                200,
+                {
+                    "jsonrpc": "2.0",
+                    "id": msg_id,
+                    "result": {
+                        "resources": [
+                            {
+                                "uri": "docs://guide",
+                                "name": "Guide",
+                                "mimeType": "text/plain",
                             }
                         ]
                     },
@@ -123,7 +141,7 @@ class _SseLoaderHandler(BaseHTTPRequestHandler):
                 "result": {
                     "protocolVersion": "2024-11-05",
                     "serverInfo": {"version": "0.0.4"},
-                    "capabilities": {"tools": {}},
+                    "capabilities": {"tools": {}, "resources": {}},
                 },
             }
         elif method == "tools/list":
@@ -136,6 +154,20 @@ class _SseLoaderHandler(BaseHTTPRequestHandler):
                             "name": "echo_text",
                             "description": "Return the provided text.",
                             "inputSchema": {"type": "object", "properties": {"text": {"type": "string"}}},
+                        }
+                    ]
+                },
+            }
+        elif method == "resources/list":
+            response = {
+                "jsonrpc": "2.0",
+                "id": msg_id,
+                "result": {
+                    "resources": [
+                        {
+                            "uri": "docs://guide",
+                            "name": "Guide",
+                            "mimeType": "text/plain",
                         }
                     ]
                 },
@@ -169,7 +201,7 @@ class _FakeWebSocketTransport:
                 "result": {
                     "protocolVersion": "2024-11-05",
                     "serverInfo": {"version": "0.0.6"},
-                    "capabilities": {"tools": {}},
+                    "capabilities": {"tools": {}, "resources": {}},
                 },
             }
         if method == "tools/list":
@@ -182,6 +214,20 @@ class _FakeWebSocketTransport:
                             "name": "echo_text",
                             "description": "Return the provided text.",
                             "inputSchema": {"type": "object", "properties": {"text": {"type": "string"}}},
+                        }
+                    ]
+                },
+            }
+        if method == "resources/list":
+            return {
+                "jsonrpc": "2.0",
+                "id": self._request_id,
+                "result": {
+                    "resources": [
+                        {
+                            "uri": "docs://guide",
+                            "name": "Guide",
+                            "mimeType": "text/plain",
                         }
                     ]
                 },

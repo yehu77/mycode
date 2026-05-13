@@ -1,0 +1,15 @@
+{
+  "name": "mcp-echo",
+  "description": "Example project-local external plugin with a local stdio MCP server.",
+  "version": "0.1.0",
+  "mcp_servers": [
+    {
+      "name": "plugin-echo",
+      "transport": "stdio",
+      "command": "python",
+      "args": [
+        "server.py"
+      ]
+    }
+  ]
+}

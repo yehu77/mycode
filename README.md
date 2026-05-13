@@ -1,68 +1,141 @@
 # Python ClaudeCode
 
-This directory contains a Python reimplementation of the local Claude Code workflow, guided by the extracted upstream sources in `../package/src-extracted/src`.
+This directory contains the active Python reimplementation of the local Claude Code workflow, guided by the extracted upstream sources in `../package/src-extracted/src`.
 
-It is still a port-in-progress, but it is no longer just a minimal skeleton. The current implementation covers the main local coding-agent loop and a large part of the product surface around it.
+## Scope
+
+This project is aimed at a local developer tool first.
+
+The goal is to reproduce the useful local coding-agent behavior of Claude Code on a Python runtime: interactive prompting, tool orchestration, planning, task tracking, workspace isolation, MCP integration, and local/remote session control.
+
+Hosted product flows are intentionally out of scope unless they are required to support local tool behavior.
+
+## Current Status
+
+- The core local coding-agent runtime is implemented and usable.
+- The full Python test suite currently passes: `575 passed`.
+- Project-local external plugin loading, session/resume continuity, and session-level working-set/file-context navigation are implemented and validated.
+- `/context` now provides a dedicated REPL/headless context-usage surface aligned with the runtime prompt/tool chain.
+- `/project-context` now provides a dedicated REPL/headless project memory / skills / plugins / reload-status inspection surface above the local context workflow.
+- `/files` and `/diff` now provide explicit REPL/headless entry surfaces for working-set files, focused file context, and diff-backed local work.
+- `/compact` now provides a manual conversation-compaction surface above the existing `context_summary` and auto-compaction path.
+- `/add-dir` now provides explicit local context curation on top of the shared working-set/file-context model.
+- REPL/headless inspection depth now covers `/history`, `/sessions`, `/config`, `/model`, and `/status` slice views in addition to the deeper `/changes` and `/workspaces` surfaces.
+- Recent test hygiene work added `pytest.ini` collection guards and excludes transient cache/temp artifacts such as `pytest-cache-files-*`, `tests/_tmp*`, and test-local `.pyclaude` residue.
 
 ## Current Capabilities
 
-- CLI, REPL, and optional Textual TUI
-- shared session runtime and Anthropic-like internal message model
-- tool-calling query loop with permission control and workspace change tracking
-- Anthropic and OpenAI-compatible providers
-- MCP loading from `.pyclaude/mcp_servers.json`
-- background sessions with `ask --background`, `ps`, `logs`, `attach`, and `kill`
-- live attach / reattach through the bridge service, including bridged approval flow
-- structured headless commands for symbol lookup, references, IDE targets, and MCP diagnosis
-- built-in plugin registry and plugin-backed commands
-- advisor modes with final-answer review and interactive checkpoints before plan / write / final answer
-- `/ultraplan` multi-scout read-only planning mode with reusable planning artifacts
-- `/plan` management commands for active planning artifacts
-- transcript persistence, session insights, local skills, and isolated workspaces
-- workspace metadata and advisor constraint visibility in `/config`, `/tasks`, `/insights`, attach, and TUI
+### CLI, REPL, TUI, and Background Sessions
 
-## Built-in Plugin Commands
+- `pyclaude ask`, `repl`, and `tui`
+- detached sessions with `ask --background`, `ps`, `logs`, `attach`, and `kill`
+- background-session inspection depth now includes `ps <id>` detail and `logs <id> [summary|tail]` with continuation-state and next-action guidance
+- local slash-command workflow for planning, tasks, workspaces, symbols, plugins, permissions, MCP, and insights
+- deeper REPL/headless inspection for `/changes`, `/workspaces`, `/history`, `/sessions`, `/config`, and `/model` without switching to TUI
+- deeper REPL/headless context-usage inspection through `/context`
+- explicit REPL/headless working-set and diff entry surfaces through `/files [context|working-set|focused|changes|tasks|plan|explicit|auto|show <n>]` and `/diff [summary|focused|working-set|change ...]`
+- deeper REPL/headless overview through `/status [summary|workspace|workflow|resume]`
+- scoped local reset paths through `/clear [history|changes|symbol|plan|session]`
+- manual history compaction through `/compact [status|preview]`
+- explicit local context curation through `/add-dir <path>|list|clear|remove <n>`
+- shared local session state across REPL, TUI, attach, stdio, and bridge surfaces
+- saved-session resume and live background attach with aligned local session metadata
+- background session surfaces now classify continuation state as `live attachable`, `saved resumable`, or `inactive only`
 
-The default built-in plugins currently provide:
+### Runtime, Query Loop, and Tool Orchestration
 
+- shared session runtime with transcript persistence
+- tool-calling query loop with approval flow and change tracking
+- default tool surfaces plus plugin-backed commands
+- task/checklist storage and task-detail views
+- isolated child/background workspaces with health tracking and cleanup/repair flows
+- focused local file-context and change/diff navigation built on the shared `file_context` model
+- derived session-level working-set scope with `in scope because`, related-change, diff-hunk, and context-only signals
+- a dedicated `/context` surface that estimates current prompt/tool context usage from the real runtime input chain
+- compact `/files` and `/diff` surfaces layered on top of the same focused-file and working-set model
+- explicit context paths that persist with saved sessions and contribute to the same working-set model with `explicit context path` scope reasoning
+
+### Providers and MCP
+
+- Anthropic provider support
+- OpenAI-compatible provider support
+- MCP server loading from `.pyclaude/mcp_servers.json`
+- MCP tool exposure inside the local runtime
+- stdio service and TCP bridge for remote session access
+- project-local external plugins via `.pyclaude/plugins/<name>/plugin.json` for declarative `skills` and `mcp_servers`
+- unified project-context inspection through `/project-context [summary|memory|skills|plugins|reload-status]`
+
+### Planning, Advisor, Tasks, Workspaces, and Symbols
+
+- `/advisor` final-review and interactive-review modes
+- `/ultraplan` read-only multi-scout planning flow
+- reusable planning artifacts and active-plan management through `/plan`
+- execution/scout task tracking, replay, timeline, and lineage audit views
+- `/task`, `/tasks`, `/workspaces`, and `/symbol` local surfaces with TUI/remote visibility
+- `Changes`, `Task Detail`, `Active Plan`, and `Status` share one focused-file/working-set model with primary/diff target navigation
+- `/changes` now supports stack-filtered summaries, change drill-down, per-file drill-down, and session-level `working set` rendering
+- `/workspaces` now supports concise list view plus detailed `current` and `show <label|session-id|all>` inspection surfaces
+- `/history` now supports filtered audit views for messages, task activity, workspace audit, and recent changes
+- `/sessions` now supports saved-session detail, compact summary, and workspace-focused inspection paths
+- `/config` and `/model` now support narrower runtime/workspace/permissions/plugins/MCP/advisor inspection slices instead of only one large dump
+- `/status` now provides a compact current-session overview plus `workspace`, `workflow`, and `resume` slices
+- `/context` now provides estimated context-usage summary for system prompt sections, messages, and tool definitions
+- `/add-dir` now provides explicit context-path curation, while `/files explicit|auto` exposes explicit-vs-automatic working-set scope directly
+- `/clear` now supports scoped local reset for history, changes, symbol surface, active plan, or lightweight session workflow state
+- `/project-context` now provides project memory, grouped skill-state, plugin-contribution, and latest reload-status inspection without leaving the REPL
+- `/files` now provides a compact file/workingset context surface, while `/diff` provides a compact diff-backed work surface
+
+### Remote Attach and Headless Surfaces
+
+- JSON-RPC stdio service for structured session access
+- TCP bridge for attach/reattach flows
+- bridged approval handling during attached remote operation
+- structured symbol and MCP-oriented headless commands
+- remote attach exists to support the local workflow, but local single-session usability remains the primary direction
+
+## Built-in Command Surface
+
+Main entrypoints:
+
+- `ask`
+- `repl`
+- `tui`
+- `serve-stdio`
+- `serve-bridge`
+- `sessions`
+- `ps`
+- `logs`
+- `attach`
+- `kill`
+
+Common local slash-command surfaces:
+
+- `/advisor`
+- `/plan`
+- `/task`
+- `/tasks`
+- `/workspaces`
+- `/symbol`
+- `/plugins`
+- `/project-context`
+- `/files`
+- `/diff`
+- `/add-dir`
+- `/permissions`
+- `/mcp`
+- `/insights`
 - `/review`
 - `/commit`
 - `/security-review`
 - `/init`
 - `/install`
-- `/advisor`
-- `/insights`
-- `/plan`
 - `/ultraplan`
 
-`/advisor` supports:
+## What This Project Is Not
 
-- `/advisor`
-- `/advisor status`
-- `/advisor <model> [final-review|interactive-review]`
-- `/advisor mode <final-review|interactive-review>`
-- `/advisor off`
-
-`/plan` supports:
-
-- `/plan`
-- `/plan list`
-- `/plan show [id|latest]`
-- `/plan use <id>`
-- `/plan clear`
-
-`/ultraplan <goal>` now runs a fixed two-phase planning flow:
-
-- scout phase: launches read-only sub-agents for architecture, interfaces, tests, and risks
-- synthesis phase: merges scout results into a structured implementation plan
-
-Plugin state can be inspected and changed with:
-
-- `/plugins`
-- `/plugin list`
-- `/plugin show <name>`
-- `/plugin enable <name>`
-- `/plugin disable <name>`
+- It is not a reproduction of hosted auth, account, usage, rate-limit, or subscription flows.
+- It is not trying to recreate desktop/mobile distribution or other product-delivery surfaces.
+- It is not aiming for one-to-one parity with every upstream command in the extracted TypeScript source tree.
 
 ## Install
 
@@ -94,12 +167,77 @@ Run a single prompt:
 pyclaude ask "Summarize this repository"
 ```
 
-Launch a detached background session:
+Launch and reattach to a background session:
 
 ```bash
 pyclaude ask "Review the pending changes" --background
 pyclaude ps
+pyclaude ps <session-id>
+pyclaude logs <session-id> summary
 pyclaude attach <session-id>
+```
+
+Inspect workspaces:
+
+```bash
+pyclaude repl
+/workspaces list
+/workspaces current
+/workspaces show <label|session-id|all>
+/workspaces cleanup
+/workspaces repair <label|session|all>
+```
+
+Inspect recorded changes:
+
+```bash
+pyclaude repl
+/changes
+/changes undo
+/changes redo
+/changes show <index-or-change-id>
+/changes show <index-or-change-id> file <n>
+/changes working-set
+/files
+/files show 2
+/diff
+/diff working-set
+``` 
+
+Inspect tasks and symbol state:
+
+```bash
+pyclaude repl
+/tasks
+/symbol actions <name>
+/symbol next definition
+/symbol next reference
+```
+
+Inspect session state and saved-session detail:
+
+```bash
+pyclaude repl
+/context
+/files
+/files explicit
+/files focused
+/add-dir src
+/add-dir list
+/project-context
+/project-context skills
+/project-context reload-status
+/history
+/history workspace
+/status
+/status workflow
+/compact status
+/compact preview
+/sessions show latest
+/sessions show <session-id-prefix> workspace
+/config runtime
+/model advisor
+/clear session
 ```
 
 Start the TUI:
@@ -108,101 +246,262 @@ Start the TUI:
 pyclaude tui
 ```
 
-## CLI Surface
+## Local Navigation
 
-Main interactive commands:
+The current TUI workflow is built around one shared focused-file and working-set model.
 
-- `ask`
-- `repl`
-- `tui`
-- `serve-stdio`
-- `serve-bridge`
-- `sessions`
-- `ps`
-- `logs`
-- `attach`
-- `kill`
+- `Changes`, `Task Detail`, and `Active Plan` all surface the same focused file context
+- `Status` exposes the session-level `Working Set`, including why files are in scope and whether they are modified or context-only
+- `Ctrl+Left/Right` moves the focused file within the active surface
+- `F9` opens the focused primary target
+- `F10` opens the focused diff target when available, otherwise falls back to the primary target
 
-Structured/headless commands:
+Each focused-file block also shows a navigation legend, so you can see the current `F9/F10` target before navigating. The same model now highlights:
 
-- `locate-symbol`
-- `references`
-- `open-file`
-- `open-symbol`
-- `diff-targets`
-- `reference-targets`
-- `symbol-actions`
-- `mcp-call`
-- `mcp-verify`
+- `in scope because`
+- `related change`
+- `diff hunks`
+- `context-only`
 
-## Providers
+The local REPL/headless workflow now exposes the same inspection depth for changes, workspace state, and session-state surfaces:
 
-### Anthropic
+- `/changes` can filter undo vs redo stacks, drill into a selected change, drill into a selected file inside that change, or render only the session-level `Working set`
+- `/files` can render the compact working-set inventory, show only change-backed files, or focus one working-set item directly
+- `/diff` can summarize diff-backed work, focus the current diff-oriented file view, show only diff-backed working-set files, or delegate into `/changes show ...`
+- `/workspaces current` shows the current session workspace with health, effective/fallback cwd, and primary/secondary/tertiary actions
+- `/workspaces show <label|session-id|all>` renders detailed isolated-workspace inventory entries without leaving the REPL
+- `/history` can render all recent state together or filter to `messages`, `tasks`, `workspace`, or `changes`
+- `/status` can render a compact current-session overview or focus on `workspace`, `workflow`, or `resume`
+- `/sessions show latest|<id>` can render saved-session detail, compact summary, or workspace-focused resume metadata
+- `/config` can focus on `workspace`, `runtime`, `permissions`, `plugins`, or `mcp`
+- `/model advisor` shows the runtime-vs-advisor model relationship directly
+- `/clear` can now reset only `history`, `changes`, `symbol`, `plan`, or the lightweight local `session` workflow state instead of forcing one all-or-nothing clear
+- `/compact` can manually compact older message history into `context_summary`, preview what would be compacted, or show current compaction status
+- `/add-dir` can add, remove, list, and clear explicit context paths, and `/files explicit|auto` shows how that layer affects the current working set
+- `/project-context` can summarize current project memory/skills/plugins and show the latest session-local reload outcome after `/context-refresh` or `/skills-reload`
 
-```bash
-pyclaude --provider anthropic repl
+## External Plugin Examples
+
+Project-local external plugins live under:
+
+```text
+.pyclaude/plugins/<plugin-name>/plugin.json
 ```
 
-Environment variables:
+Minimal example plugins are included in this repository at:
 
-```bash
-ANTHROPIC_API_KEY=...
+```text
+examples/external-plugin/docs/plugin.json
+examples/external-plugin/mcp-echo/plugin.json
 ```
 
-### OpenAI-compatible
+### Skill-Only Example
 
-Works with OpenAI and other APIs that implement the Chat Completions tool-calling shape.
+To try the skill-only example in a workspace:
 
-```bash
-pyclaude --provider openai-compatible --base-url https://api.openai.com/v1 repl
+1. Create `.pyclaude/plugins/docs/` inside your target workspace.
+2. Copy `examples/external-plugin/docs/plugin.json` into that directory as `plugin.json`.
+3. Start `pyclaude` in the target workspace and reload project context:
+
+```text
+pyclaude repl
+/skills-reload
+/plugins
+/plugin show docs
+/skills
 ```
 
-Environment variables:
+That example defines one auto-enabled skill, so after `/skills-reload` you should see:
 
-```bash
-PYCLAUDE_PROVIDER=openai-compatible
-PYCLAUDE_API_KEY=...
-PYCLAUDE_BASE_URL=https://api.openai.com/v1
-PYCLAUDE_MODEL=gpt-4.1-mini
+- an external plugin named `docs`
+- a loaded skill named `docs-style`
+
+Example manifest:
+
+```json
+{
+  "name": "docs",
+  "description": "Example project-local external plugin.",
+  "version": "0.1.0",
+  "skills": [
+    {
+      "name": "docs-style",
+      "description": "Use stable user-facing terminology in documentation.",
+      "content": "Prefer stable user-facing terminology. Keep docs concise, concrete, and implementation-aware.",
+      "auto_enable": true,
+      "tags": ["docs", "style"]
+    }
+  ]
+}
 ```
 
-## Use a `.env` File
+### MCP-Backed Example
 
-Create `python_claudecode/.env`:
+To try the MCP-backed example in a workspace:
 
-```bash
-copy .env.example .env
+1. Create `.pyclaude/plugins/mcp-echo/` inside your target workspace.
+2. Copy both of these files into that directory:
+   - `examples/external-plugin/mcp-echo/plugin.json`
+   - `examples/external-plugin/mcp-echo/server.py`
+3. Start `pyclaude` in the target workspace.
+4. Reload project context and MCP config:
+
+```text
+pyclaude repl
+/skills-reload
+/plugins
+/plugin show mcp-echo
+/mcp-refresh
+/mcp
+/mcp-tools
+/mcp-call plugin-echo echo_text {"text":"hello"}
 ```
 
-Then set values such as:
+If the example is loaded correctly, you should see:
 
-```bash
-PYCLAUDE_PROVIDER=openai-compatible
-PYCLAUDE_API_KEY=your-real-key
-PYCLAUDE_BASE_URL=https://api.openai.com/v1
-PYCLAUDE_MODEL=gpt-4.1-mini
+- an external plugin named `mcp-echo`
+- an MCP server named `plugin-echo`
+- an MCP tool named `plugin-echo.echo_text`
+- a direct MCP call result containing `echo:hello`
+
+Example manifest:
+
+```json
+{
+  "name": "mcp-echo",
+  "description": "Example project-local external plugin with a local stdio MCP server.",
+  "version": "0.1.0",
+  "mcp_servers": [
+    {
+      "name": "plugin-echo",
+      "transport": "stdio",
+      "command": "python",
+      "args": ["server.py"]
+    }
+  ]
+}
 ```
 
-The CLI auto-loads `.env` from the selected `--cwd` before building the session config.
+This example is intended for local testing of plugin-injected MCP loading, not for production deployment.
 
-## Workspace Data
+External plugins are v1 data-only plugins. They can provide skills, MCP server definitions, metadata, and hook names, but they do not load arbitrary Python code.
 
-Runtime data is stored under `.pyclaude/` in the chosen working directory.
+### External Plugin Manifest Reference
 
-Common contents:
+Project-local external plugins use this layout:
 
-- `.pyclaude/sessions/`: saved transcripts
-- `.pyclaude/background_sessions/`: detached session registry and logs
-- `.pyclaude/skills/`: local markdown skills
-- `.pyclaude/mcp_servers.json`: MCP server configuration
-- `.pyclaude/workspaces/`: isolated workspace snapshots
-- `.pyclaude/worktrees/`: git worktree-backed isolated workspaces when the repo is clean
+```text
+.pyclaude/plugins/<plugin-name>/plugin.json
+```
 
-Saved transcripts now also persist advisor review summaries, active planning artifact state, workspace mode metadata, and planning history, which are surfaced by `/insights`.
+Supported top-level manifest fields:
 
-## Notes and Gaps
+- `name`: plugin name used in `/plugins` and `/plugin show <name>`
+- `description`: short plugin description
+- `version`: optional version string, defaulting to `0.1.0`
+- `skills`: optional list of declarative skill definitions
+- `mcp_servers`: optional list of declarative MCP server definitions
+- `hooks`: optional list of hook names; accepted as config data only in v1
 
-- This is a Python product clone, not a literal upstream source port.
-- The architecture is intentionally aligned with the upstream concepts: session runtime, tool registry, providers, orchestrator, permissions, tasks, plugins, and remote attach.
-- Some heavier product areas from upstream Claude Code are still incomplete or intentionally simplified.
-- The codebase is optimized around local coding-agent workflows first; parity for every upstream command or UI surface is not the goal.
+Minimal manifest:
+
+```json
+{
+  "name": "docs",
+  "description": "Example project-local external plugin."
+}
+```
+
+`skills` entries support:
+
+- `name`
+- `description`
+- `content`
+- `auto_enable`
+- `tags`
+
+Minimal skill example:
+
+```json
+{
+  "name": "docs",
+  "description": "Example project-local external plugin.",
+  "skills": [
+    {
+      "name": "docs-style",
+      "description": "Use stable user-facing terminology in documentation.",
+      "content": "Prefer stable user-facing terminology.",
+      "auto_enable": true,
+      "tags": ["docs"]
+    }
+  ]
+}
+```
+
+`mcp_servers` entries support the same declarative MCP fields already accepted by the runtime loader, including:
+
+- `name`
+- `transport`
+- `command`
+- `args`
+- `env`
+- `headers`
+- `auth`
+- `cwd`
+- `url`
+- `timeout_sec`
+
+Minimal MCP server example:
+
+```json
+{
+  "name": "mcp-echo",
+  "description": "Example project-local external plugin with a local stdio MCP server.",
+  "mcp_servers": [
+    {
+      "name": "plugin-echo",
+      "transport": "stdio",
+      "command": "python",
+      "args": ["server.py"]
+    }
+  ]
+}
+```
+
+`hooks` is a list of hook names such as:
+
+```json
+{
+  "name": "docs",
+  "description": "Example project-local external plugin.",
+  "hooks": ["before_final_answer"]
+}
+```
+
+Current external plugin constraints:
+
+- project-local only
+- data-only
+- no arbitrary Python plugin loading
+- no custom executable command handlers
+- no marketplace, browse, install, or trust flows
+
+## Verification
+
+Run the canonical test command from `python_claudecode/`:
+
+```bash
+python -m pytest -q
+```
+
+If you want to confirm collection behavior separately:
+
+```bash
+python -m pytest --collect-only -q
+```
+
+## Related Documents
+
+- [../README.md](../README.md): repository overview and project positioning
+- [CLAUDE.md](CLAUDE.md): current implementation status and next-stage roadmap
+- [PARITY_MATRIX.md](PARITY_MATRIX.md): upstream-to-Python parity tracking for local-agent-relevant surfaces

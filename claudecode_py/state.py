@@ -21,6 +21,10 @@ class WorkspaceFileChange:
     existed_before: bool
     before_content: str
     after_content: str | None
+    action_kind: str = ""
+    source_path: str | None = None
+    replacement_count: int | None = None
+    change_mode: str = ""
 
 
 @dataclass
@@ -29,6 +33,8 @@ class WorkspaceChangeSet:
     created_at: str = field(default_factory=_utc_now_iso)
     tool_name: str = ""
     summary: str = ""
+    change_kind: str = "workspace_change"
+    undoable: bool = True
     files: list[WorkspaceFileChange] = field(default_factory=list)
 
 
@@ -64,14 +70,38 @@ class PlanningArtifact:
 
 
 @dataclass
+class ExplicitContextEntry:
+    raw_path: str
+    resolved_path: str
+    kind: str
+    added_at: str = field(default_factory=_utc_now_iso)
+    resolved: bool = True
+
+
+@dataclass
 class SessionState:
     session_id: str = field(default_factory=lambda: uuid4().hex)
     created_at: str = field(default_factory=_utc_now_iso)
     updated_at: str | None = None
+    session_execution_mode: str = "main"
+    session_command_policy_name: str | None = None
+    session_command_policy_source: str | None = None
+    session_command_policy_allowed_tool_names: list[str] = field(default_factory=list)
+    session_command_policy_allowed_bash_prefixes: list[str] = field(default_factory=list)
+    session_command_policy_require_read_only_subagents: bool = False
     original_cwd: str | None = None
     effective_cwd: str | None = None
     workspace_mode: str = "main"
+    workspace_label: str | None = None
+    workspace_created_at: str | None = None
+    workspace_health: str = "healthy"
+    workspace_cleanup_status: str = "none"
+    workspace_cleanup_error: str | None = None
+    workspace_unavailable: bool = False
+    workspace_unavailable_reason: str | None = None
+    workspace_fallback_cwd: str | None = None
     context_summary: str | None = None
+    explicit_context_entries: list[ExplicitContextEntry] = field(default_factory=list)
     advisor_model: str | None = None
     advisor_mode: str = "off"
     advisor_last_result: AdvisorReviewSummary | None = None
@@ -90,9 +120,13 @@ class SessionState:
     disabled_plugin_names: list[str] = field(default_factory=list)
     enabled_skill_names: list[str] = field(default_factory=list)
     disabled_skill_names: list[str] = field(default_factory=list)
+    session_permission_rules: list[dict[str, str]] = field(default_factory=list)
+    activated_deferred_tool_names: list[str] = field(default_factory=list)
     messages: list[Message] = field(default_factory=list)
     recent_change_sets: list[WorkspaceChangeSet] = field(default_factory=list)
     undone_change_sets: list[WorkspaceChangeSet] = field(default_factory=list)
+    saved_task_records: list[dict[str, object]] = field(default_factory=list)
+    saved_task_surface_counts: dict[str, int] = field(default_factory=dict)
     active_planning_artifact_id: str | None = None
     planning_artifact_history: list[PlanningArtifact] = field(default_factory=list)
     recent_planning_artifacts: list[PlanningArtifact] = field(default_factory=list)

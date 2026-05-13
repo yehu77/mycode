@@ -33,6 +33,8 @@ BRIDGE_METHODS = (
     "session.action",
     "session.approval_status",
     "session.approval_respond",
+    "session.question_status",
+    "session.question_respond",
     "symbol.locate",
     "symbol.references",
     "symbol.actions",
@@ -110,6 +112,8 @@ class BridgeConnection:
                             "session.closed",
                             "session.approval_required",
                             "session.approval_resolved",
+                            "session.question_required",
+                            "session.question_resolved",
                         ],
                     },
                 }
@@ -238,6 +242,10 @@ def _notification_name_for_event(event_payload: dict[str, Any]) -> str:
         return "session.approval_required"
     if event_payload.get("kind") == "approval_resolved":
         return "session.approval_resolved"
+    if event_payload.get("kind") == "question_required":
+        return "session.question_required"
+    if event_payload.get("kind") == "question_resolved":
+        return "session.question_resolved"
     return "session.event"
 
 

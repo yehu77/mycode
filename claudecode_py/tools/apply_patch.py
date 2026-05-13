@@ -4,7 +4,15 @@ from dataclasses import dataclass
 
 from ..permissions import ApprovalRequest
 from ..state import WorkspaceFileChange
-from .base import BaseTool, render_diff_preview, render_pending_preview, resolve_workspace_path, truncate_detail_lines
+from .base import (
+    BaseTool,
+    count_workspace_change_actions,
+    render_file_change_preview,
+    render_pending_preview,
+    resolve_workspace_path,
+    truncate_detail_lines,
+    workspace_change_to_approval,
+)
 
 
 @dataclass(slots=True)
@@ -69,66 +77,72 @@ class ApplyPatchTool(BaseTool):
             return request
         try:
             actions = self._parse_patch(patch_text, tolerant=True)
-            details: list[tuple[str, str]] = []
-            creates = 0
-            deletes = 0
-            updates = 0
-            moves = 0
+            target_paths: list[str] = []
+            changes: list[WorkspaceFileChange] = []
             for action in actions:
                 if isinstance(action, AddAction):
-                    creates += 1
+                    target_paths.append(action.path)
                     preview = "\n".join(action.lines)
-                    details.append(
-                        (
-                            f"create {action.path}",
-                            render_diff_preview(action.path, "", preview),
+                    changes.append(
+                        WorkspaceFileChange(
+                            path=action.path,
+                            existed_before=False,
+                            before_content="",
+                            after_content=preview,
+                            action_kind="create",
                         )
                     )
                 elif isinstance(action, DeleteAction):
-                    deletes += 1
+                    target_paths.append(action.path)
                     path = resolve_workspace_path(ctx.cwd, action.path)
                     before = path.read_text(encoding="utf-8") if path.exists() else ""
-                    details.append(
-                        (
-                            f"delete {action.path}",
-                            render_diff_preview(action.path, before, ""),
+                    changes.append(
+                        WorkspaceFileChange(
+                            path=action.path,
+                            existed_before=path.exists(),
+                            before_content=before,
+                            after_content=None,
+                            action_kind="delete",
                         )
                     )
                 elif isinstance(action, UpdateAction):
+                    target_paths.append(action.path)
+                    if action.move_to is not None:
+                        target_paths.append(action.move_to)
                     path = resolve_workspace_path(ctx.cwd, action.path)
                     before = path.read_text(encoding="utf-8") if path.exists() else ""
                     after = self._apply_update(before, action.hunks, action.path)
-                    preview_path = action.move_to or action.path
                     if action.move_to:
-                        moves += 1
-                        label = f"move {action.path} -> {action.move_to}"
-                    else:
-                        updates += 1
-                        label = f"update {action.path}"
-                    details.append(
-                        (
-                            label,
-                            render_diff_preview(preview_path, before, after),
+                        changes.append(
+                            WorkspaceFileChange(
+                                path=action.move_to,
+                                existed_before=False,
+                                before_content=before,
+                                after_content=after,
+                                action_kind="move",
+                                source_path=action.path,
+                                change_mode="patch move",
+                            )
                         )
-                    )
-            summary_lines = [f"files: {len(details)}"]
-            if creates:
-                summary_lines.append(f"create: {creates}")
-            if updates:
-                summary_lines.append(f"update: {updates}")
-            if deletes:
-                summary_lines.append(f"delete: {deletes}")
-            if moves:
-                summary_lines.append(f"move: {moves}")
-            request.details = render_pending_preview(
-                "Pending patch change set",
-                summary_lines=summary_lines,
-                sections=details,
+                    else:
+                        changes.append(
+                            WorkspaceFileChange(
+                                path=action.path,
+                                existed_before=True,
+                                before_content=before,
+                                after_content=after,
+                                action_kind="update",
+                                change_mode="patch update",
+                            )
+                        )
+            request.target_paths = tuple(dict.fromkeys(target_paths))
+            request.details = render_file_change_preview(
+                [workspace_change_to_approval(change) for change in changes],
                 max_lines=28,
             )
         except Exception as exc:  # noqa: BLE001
             request.details = render_pending_preview(
-                "Pending patch change set",
+                "Pending file changes",
                 summary_lines=[f"preview unavailable: {type(exc).__name__}: {exc}"],
                 sections=[("patch", patch_text)],
                 max_lines=20,
@@ -138,44 +152,51 @@ class ApplyPatchTool(BaseTool):
     def execute(self, tool_input: dict, ctx):
         actions = self._parse_patch(tool_input["patch"])
         summaries: list[str] = []
-        recorded_changes: dict[str, WorkspaceFileChange] = {}
+        recorded_changes: list[WorkspaceFileChange] = []
 
-        def capture_before(rel_path: str) -> None:
-            if rel_path in recorded_changes:
-                return
-            current_path = resolve_workspace_path(ctx.cwd, rel_path)
-            existed_before = current_path.exists()
-            before_content = current_path.read_text(encoding="utf-8") if existed_before else ""
-            recorded_changes[rel_path] = WorkspaceFileChange(
-                path=rel_path,
-                existed_before=existed_before,
-                before_content=before_content,
-                after_content=None,
-            )
+        def append_change(change: WorkspaceFileChange) -> None:
+            recorded_changes.append(change)
 
         for action in actions:
             if isinstance(action, AddAction):
                 path = resolve_workspace_path(ctx.cwd, action.path)
-                capture_before(action.path)
                 path.parent.mkdir(parents=True, exist_ok=True)
                 if path.exists():
                     raise FileExistsError(f"Cannot add file that already exists: {action.path}")
-                path.write_text("\n".join(action.lines), encoding="utf-8")
-                summaries.append(f"Added {action.path}")
+                after_content = "\n".join(action.lines)
+                path.write_text(after_content, encoding="utf-8")
+                append_change(
+                    WorkspaceFileChange(
+                        path=action.path,
+                        existed_before=False,
+                        before_content="",
+                        after_content=after_content,
+                        action_kind="create",
+                    )
+                )
+                summaries.append(f"Created {action.path}")
                 continue
 
             if isinstance(action, DeleteAction):
                 path = resolve_workspace_path(ctx.cwd, action.path)
-                capture_before(action.path)
                 if not path.exists():
                     raise FileNotFoundError(f"Cannot delete missing file: {action.path}")
+                before_content = path.read_text(encoding="utf-8")
                 path.unlink()
+                append_change(
+                    WorkspaceFileChange(
+                        path=action.path,
+                        existed_before=True,
+                        before_content=before_content,
+                        after_content=None,
+                        action_kind="delete",
+                    )
+                )
                 summaries.append(f"Deleted {action.path}")
                 continue
 
             if isinstance(action, UpdateAction):
                 source_path = resolve_workspace_path(ctx.cwd, action.path)
-                capture_before(action.path)
                 if not source_path.exists():
                     raise FileNotFoundError(f"Cannot update missing file: {action.path}")
                 original_text = source_path.read_text(encoding="utf-8")
@@ -186,27 +207,73 @@ class ApplyPatchTool(BaseTool):
                     if action.move_to is not None
                     else source_path
                 )
-                if action.move_to is not None:
-                    capture_before(action.move_to)
+                target_existed_before = target_path.exists()
+                target_before_content = (
+                    target_path.read_text(encoding="utf-8") if target_existed_before else ""
+                )
                 target_path.parent.mkdir(parents=True, exist_ok=True)
                 target_path.write_text(updated_text, encoding="utf-8")
                 if action.move_to is not None and target_path != source_path:
                     source_path.unlink()
-                    summaries.append(f"Updated {action.path} -> {action.move_to}")
+                    append_change(
+                        WorkspaceFileChange(
+                            path=action.path,
+                            existed_before=True,
+                            before_content=original_text,
+                            after_content=None,
+                            action_kind="move_source",
+                            source_path=action.move_to,
+                            change_mode="patch move",
+                        )
+                    )
+                    append_change(
+                        WorkspaceFileChange(
+                            path=action.move_to,
+                            existed_before=target_existed_before,
+                            before_content=target_before_content,
+                            after_content=updated_text,
+                            action_kind="move",
+                            source_path=action.path,
+                            change_mode="patch move",
+                        )
+                    )
+                    summaries.append(f"Moved {action.path} -> {action.move_to}")
                 else:
+                    append_change(
+                        WorkspaceFileChange(
+                            path=action.path,
+                            existed_before=True,
+                            before_content=original_text,
+                            after_content=updated_text,
+                            action_kind="update",
+                            change_mode="patch update",
+                        )
+                    )
                     summaries.append(f"Updated {action.path}")
 
-        for rel_path, change in recorded_changes.items():
-            current_path = resolve_workspace_path(ctx.cwd, rel_path)
-            change.after_content = (
-                current_path.read_text(encoding="utf-8") if current_path.exists() else None
-            )
-
-        summary = "Applied patch:\n" + "\n".join(f"- {item}" for item in summaries)
+        visible_changes = [
+            change for change in recorded_changes if change.action_kind != "move_source"
+        ]
+        counts = count_workspace_change_actions(visible_changes)
+        count_parts = [
+            f"{name}={counts[name]}"
+            for name in ("create", "update", "delete", "move")
+            if counts[name]
+        ]
+        summary = (
+            "Applied patch:\n" + "\n".join(f"- {item}" for item in summaries)
+            if summaries
+            else "Applied patch."
+        )
+        change_summary = (
+            f"Applied patch ({len(visible_changes)} file(s); {' '.join(count_parts)})"
+            if count_parts
+            else f"Applied patch ({len(visible_changes)} file(s))"
+        )
         ctx.session.record_workspace_change(
             tool_name=self.name,
-            summary=f"Applied patch ({len(recorded_changes)} file(s))",
-            file_changes=list(recorded_changes.values()),
+            summary=change_summary,
+            file_changes=recorded_changes,
         )
         return summary
 

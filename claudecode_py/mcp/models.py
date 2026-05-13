@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 from typing import Any, Literal
 
 
-McpServerStatus = Literal["registered", "connected", "failed"]
+McpServerStatus = Literal["registered", "connected", "failed", "retrying"]
 
 
 @dataclass(slots=True, frozen=True)
@@ -39,6 +39,15 @@ class McpToolReference:
 
 
 @dataclass(slots=True, frozen=True)
+class McpResource:
+    uri: str
+    name: str
+    server_name: str
+    mime_type: str = ""
+    description: str = ""
+
+
+@dataclass(slots=True, frozen=True)
 class McpInitializeResult:
     server_name: str
     server_version: str = ""
@@ -51,6 +60,11 @@ class McpInitializeResult:
 class McpCallToolResult:
     content: list[dict[str, Any]]
     is_error: bool = False
+
+
+@dataclass(slots=True, frozen=True)
+class McpReadResourceResult:
+    contents: list[dict[str, Any]]
 
 
 @dataclass(slots=True, frozen=True)
@@ -115,6 +129,16 @@ def parse_mcp_tool(payload: dict[str, Any]) -> McpTool:
     )
 
 
+def parse_mcp_resource(server_name: str, payload: dict[str, Any]) -> McpResource:
+    return McpResource(
+        uri=str(payload["uri"]),
+        name=str(payload.get("name", payload["uri"])),
+        server_name=server_name,
+        mime_type=str(payload.get("mimeType", "")),
+        description=str(payload.get("description", "")),
+    )
+
+
 def parse_initialize_result(server_name: str, payload: dict[str, Any]) -> McpInitializeResult:
     return McpInitializeResult(
         server_name=server_name,
@@ -130,3 +154,7 @@ def parse_call_tool_result(payload: dict[str, Any]) -> McpCallToolResult:
         content=list(payload.get("content", []) or []),
         is_error=bool(payload.get("isError", False)),
     )
+
+
+def parse_read_resource_result(payload: dict[str, Any]) -> McpReadResourceResult:
+    return McpReadResourceResult(contents=list(payload.get("contents", []) or []))

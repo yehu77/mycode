@@ -10,6 +10,7 @@ EventKind = Literal[
     "assistant_tool_call",
     "assistant_tool_result_ready",
     "plan_execution",
+    "task_progress",
     "advisor",
     "advisor_review_started",
     "advisor_review_result",
@@ -28,10 +29,18 @@ EventKind = Literal[
 class RuntimeEvent:
     kind: EventKind
     message: str
+    task_id: str | None = None
     tool_name: str | None = None
     tool_call_id: str | None = None
     duration_ms: int | None = None
     is_error: bool = False
+    command_mode_name: str | None = None
+    command_mode_allowed_prefixes: tuple[str, ...] = ()
+    command_mode_violating_segment: str | None = None
+    command_mode_violating_segment_index: int | None = None
+    command_mode_complex_features: tuple[str, ...] = ()
+    decision_reason: str | None = None
+    permission_rules: tuple[str, ...] = ()
 
 
 EventSink = Callable[[RuntimeEvent], None]

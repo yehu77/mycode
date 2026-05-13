@@ -27,7 +27,7 @@ from .runtime.headless import (
     symbol_actions_headless,
 )
 from .runtime.events import RuntimeEvent
-from .session import Session
+from .session import Session, workspace_recommended_actions
 from .session_factory import SessionFactory
 from .service import BridgeTcpServer, JsonRpcStdioService, ServiceDispatcher
 from .storage.background_sessions import (
@@ -38,8 +38,10 @@ from .storage.background_sessions import (
     resolve_background_session,
     update_background_session,
 )
-from .storage.transcript import get_session_path, list_transcripts
+from .storage.transcript import get_session_path, list_transcripts, load_transcript_by_session_id
+from .workflow_semantics import build_continuation_semantics
 from .workspace import IsolatedWorkspace, cleanup_isolated_workspace, prepare_isolated_workspace
+from .workspace.isolation import derive_workspace_health
 
 if TYPE_CHECKING:
     from .tui import run_tui_app as _run_tui_app
@@ -59,6 +61,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--api-key", default=None, help="API key override")
     parser.add_argument("--base-url", default=None, help="Base URL for OpenAI-compatible APIs")
     parser.add_argument("--mcp-config", default=None, help="Path to MCP server config JSON")
+    parser.add_argument("--permission-config", default=None, help="Path to permission rules JSON")
     parser.add_argument("--model", default=None, help="Model name")
     parser.add_argument("--resume-session", default=None, help="Resume a specific saved session by id")
     parser.add_argument("--max-turns", type=int, default=None, help="Maximum tool-use turns")
@@ -86,8 +89,10 @@ def build_parser() -> argparse.ArgumentParser:
     sessions.add_argument("--limit", type=int, default=10, help="Maximum sessions to show")
     bg_ps = subparsers.add_parser("ps", help="List detached background sessions")
     bg_ps.add_argument("--limit", type=int, default=20, help="Maximum background sessions to show")
+    bg_ps.add_argument("session", nargs="?", help="Optional background session id or prefix for detail view")
     bg_logs = subparsers.add_parser("logs", help="Print background session logs")
     bg_logs.add_argument("session", help="Background session id or prefix")
+    bg_logs.add_argument("view", nargs="?", choices=["summary", "tail"], default="tail", help="Log view mode")
     bg_attach = subparsers.add_parser("attach", help="Reattach to a live background session")
     bg_attach.add_argument("session", help="Background session id or prefix")
     bg_attach.add_argument(
@@ -246,12 +251,145 @@ def _handle_repl_command(session, prompt: str) -> tuple[bool, str | CommandExecu
     return session.command_registry.handle(session, prompt)
 
 
-def run_repl(session: Session) -> int:
-    print(f"PyClaudeCode REPL in {session.config.cwd}")
-    if session.state.messages:
-        print(
-            f'Restored session {session.state.session_id} with {len(session.state.messages)} messages.'
+def _session_source_header_lines(
+    session: Session,
+    *,
+    session_source: str,
+    restored_from: Path | None = None,
+    live_background_id: str | None = None,
+) -> list[str]:
+    lines = [f"session_source: {session_source}"]
+    if restored_from is not None:
+        lines.append(f"restored_from: {restored_from}")
+        lines.append("resume_semantics: saved session resume restores state only; live work requires attach.")
+    elif live_background_id:
+        lines.append(f"background_session: {live_background_id}")
+        lines.append("resume_semantics: attached to live background work; /exit detaches without stopping it.")
+    else:
+        lines.append("resume_semantics: new live session.")
+    planning_artifact_id = getattr(session.state, "active_planning_artifact_id", None)
+    if planning_artifact_id:
+        lines.append(f"active_plan: {planning_artifact_id}")
+    if hasattr(session, "task_surface_summary_lines"):
+        counts = session.task_surface_counts_payload()
+        total = sum(int(value) for value in counts.values())
+        lines.append(f"task_surface_total: {total}")
+    lines.extend(_focused_file_context_header_lines(session))
+    return lines
+
+
+def _focused_file_context_header_lines(session: Session) -> list[str]:
+    if not hasattr(session, "working_set_payload"):
+        return []
+    try:
+        payload = session.working_set_payload()
+    except Exception:  # noqa: BLE001
+        return []
+    if not isinstance(payload, dict):
+        return []
+    files = [item for item in payload.get("file_context_files", []) if isinstance(item, dict)]
+    if not files:
+        return []
+    primary = files[0]
+    path = str(primary.get("path") or payload.get("file_context_primary_path") or "").strip()
+    source = str(primary.get("source") or "working_set").strip() or "working_set"
+    primary_target = primary.get("target") or payload.get("file_context_primary_target")
+    secondary_target = _focused_file_context_secondary_target(primary) or payload.get(
+        "file_context_primary_diff_targets"
+    )
+    lines = [
+        "focused_file_context: "
+        + "  ".join(
+            part
+            for part in (
+                f"source={source}",
+                f"path={path}" if path else "",
+                (
+                    "primary=" + _format_target_summary(primary_target)
+                    if _format_target_summary(primary_target)
+                    else ""
+                ),
+                (
+                    "secondary=" + _format_target_summary(secondary_target)
+                    if _format_target_summary(secondary_target)
+                    else ""
+                ),
+            )
+            if part
         )
+    ]
+    lines.append(f"focused_file_context_count: {len(files)}")
+    return lines
+
+
+def _focused_file_context_secondary_target(item: dict[str, object]) -> dict[str, object] | None:
+    diff_targets = item.get("diff_targets")
+    if isinstance(diff_targets, dict):
+        hunks = diff_targets.get("hunks")
+        if isinstance(hunks, list):
+            for hunk in hunks:
+                if isinstance(hunk, dict):
+                    return dict(hunk)
+        return dict(diff_targets)
+    if isinstance(diff_targets, list):
+        for hunk in diff_targets:
+            if isinstance(hunk, dict):
+                return dict(hunk)
+    return None
+
+
+def _format_target_summary(target: object) -> str | None:
+    if not isinstance(target, dict):
+        return None
+    action = str(target.get("action") or "").strip()
+    path = str(target.get("path") or "").strip()
+    line = target.get("line")
+    label = str(target.get("label") or "").strip()
+    parts: list[str] = []
+    if action:
+        parts.append(action)
+    if path:
+        location = path
+        if line not in (None, ""):
+            location += f":{line}"
+        parts.append(location)
+    if label:
+        parts.append(label)
+    return " ".join(parts) if parts else None
+
+
+def run_repl(
+    session: Session,
+    *,
+    session_source: str = "new",
+    restored_from: Path | None = None,
+    live_background_id: str | None = None,
+) -> int:
+    print(f"PyClaudeCode REPL in {session.config.cwd}")
+    if session.state.messages and restored_from is not None:
+        print(
+            f'Restored saved session {session.state.session_id} with {len(session.state.messages)} messages.'
+        )
+    elif session.state.messages and live_background_id:
+        print(
+            f'Attached to live session {session.state.session_id} with {len(session.state.messages)} messages.'
+        )
+    for line in _session_source_header_lines(
+        session,
+        session_source=session_source,
+        restored_from=restored_from,
+        live_background_id=live_background_id,
+    ):
+        print(line)
+    workspace_summary = _render_workspace_summary_line_from_state(session.state)
+    if workspace_summary:
+        print(workspace_summary)
+    print(_render_execution_summary_line_from_state(session.state))
+    for line in _render_workspace_guidance_lines_from_state(session.state):
+        print(line)
+    if hasattr(session, "task_surface_summary_lines"):
+        for line in session.task_surface_summary_lines():
+            print(line)
     print('Type "/help" for commands.')
     while True:
         try:
@@ -288,18 +426,316 @@ def run_repl(session: Session) -> int:
             renderer.finish()
 
 
-def _launch_tui(session: Session) -> int:
+def _launch_tui(
+    session: Session,
+    *,
+    session_source: str = "new",
+    restored_from: Path | None = None,
+    live_background_id: str | None = None,
+) -> int:
     try:
         from .tui import run_tui_app
     except ImportError as exc:
         if exc.name == "textual" or "textual" in str(exc):
             raise RuntimeError('Missing dependency "textual". Install with: pip install -e .[tui]') from exc
         raise
-    return run_tui_app(session)
+    return run_tui_app(
+        session,
+        session_source=session_source,
+        restored_from=restored_from,
+        live_background_id=live_background_id,
+    )
 
 
-def run_tui(session: Session) -> int:
-    return _launch_tui(session)
+def run_tui(
+    session: Session,
+    *,
+    session_source: str = "new",
+    restored_from: Path | None = None,
+    live_background_id: str | None = None,
+) -> int:
+    return _launch_tui(
+        session,
+        session_source=session_source,
+        restored_from=restored_from,
+        live_background_id=live_background_id,
+    )
+
+
+def _workspace_effective_cwd_exists(path_value: str | None) -> bool | None:
+    if not path_value:
+        return None
+    try:
+        return Path(path_value).exists()
+    except OSError:
+        return False
+
+
+def _render_workspace_bits(
+    *,
+    workspace_mode: str,
+    workspace_health: str | None,
+    workspace_label: str | None,
+    original_cwd: str | None,
+    effective_cwd: str | None,
+    workspace_cleanup_status: str | None,
+    workspace_cleanup_error: str | None = None,
+    workspace_unavailable: bool = False,
+    workspace_fallback_cwd: str | None = None,
+) -> list[str]:
+    bits = [f"workspace={workspace_mode or 'main'}"]
+    if workspace_health:
+        bits.append(f"health={workspace_health}")
+    if workspace_label:
+        bits.append(f"label={workspace_label}")
+    if original_cwd:
+        bits.append(f"origin={original_cwd}")
+    if effective_cwd:
+        bits.append(f"cwd={effective_cwd}")
+        exists = _workspace_effective_cwd_exists(effective_cwd)
+        if exists is False:
+            bits.append("cwd_exists=no")
+    cleanup_status = workspace_cleanup_status or "none"
+    bits.append(f"cleanup={cleanup_status}")
+    if workspace_cleanup_error:
+        bits.append(f"cleanup_error={workspace_cleanup_error}")
+    if workspace_unavailable:
+        bits.append("unavailable=yes")
+        if workspace_fallback_cwd:
+            bits.append(f"fallback={workspace_fallback_cwd}")
+    return bits
+
+
+def _render_workspace_summary_line_from_state(state) -> str | None:
+    mode = str(state.workspace_mode or "main")
+    cleanup_status = str(state.workspace_cleanup_status or "none")
+    bits = _render_workspace_bits(
+        workspace_mode=mode,
+        workspace_health=getattr(state, "workspace_health", "healthy"),
+        workspace_label=state.workspace_label,
+        original_cwd=state.original_cwd,
+        effective_cwd=state.effective_cwd,
+        workspace_cleanup_status=cleanup_status,
+        workspace_cleanup_error=state.workspace_cleanup_error,
+        workspace_unavailable=bool(state.workspace_unavailable),
+        workspace_fallback_cwd=state.workspace_fallback_cwd,
+    )
+    if (
+        mode == "main"
+        and cleanup_status == "none"
+        and "cwd_exists=no" not in bits
+        and "unavailable=yes" not in bits
+    ):
+        return None
+    return "workspace: " + "  ".join(bits)
+
+
+def _workspace_recommended_actions_from_state(state) -> tuple[str, ...]:
+    return workspace_recommended_actions(
+        workspace_health=str(getattr(state, "workspace_health", "healthy") or "healthy"),
+        workspace_label=getattr(state, "workspace_label", None),
+        session_id=getattr(state, "session_id", None),
+    )
+
+
+def _render_workspace_guidance_lines_from_state(state) -> list[str]:
+    actions = _workspace_recommended_actions_from_state(state)
+    if not actions and not bool(getattr(state, "workspace_unavailable", False)):
+        return []
+    lines: list[str] = [
+        f"workspace_health: {getattr(state, 'workspace_health', 'healthy')}",
+    ]
+    if bool(getattr(state, "workspace_unavailable", False)):
+        expected_cwd = str(getattr(state, "effective_cwd", "") or "").strip()
+        if expected_cwd:
+            lines.append(f"workspace_expected_effective_cwd: {expected_cwd}")
+        fallback_cwd = str(
+            getattr(state, "workspace_fallback_cwd", None)
+            or getattr(state, "original_cwd", None)
+            or ""
+        ).strip()
+        if fallback_cwd:
+            lines.append(f"workspace_fallback_cwd: {fallback_cwd}")
+    lines.append(
+        "workspace_recommended_actions: "
+        + (", ".join(actions) if actions else "none")
+    )
+    return lines
+
+
+def _render_execution_contract_bits(
+    *,
+    session_execution_mode: str | None,
+    session_command_policy_name: str | None,
+    session_command_policy_require_read_only_subagents: bool,
+) -> list[str]:
+    bits = [f"execution={session_execution_mode or 'main'}"]
+    if session_command_policy_name:
+        bits.append(f"policy={session_command_policy_name}")
+    if session_command_policy_require_read_only_subagents:
+        bits.append("read_only_subagents=yes")
+    return bits
+
+
+def _render_execution_contract_lines_from_state(state) -> list[str]:
+    lines = [f"session_execution_mode: {getattr(state, 'session_execution_mode', 'main') or 'main'}"]
+    lines.append(
+        "session_command_policy_name: "
+        + str(getattr(state, "session_command_policy_name", None) or "none")
+    )
+    lines.append(
+        "session_command_policy_source: "
+        + str(getattr(state, "session_command_policy_source", None) or "none")
+    )
+    allowed_tools = list(getattr(state, "session_command_policy_allowed_tool_names", []) or [])
+    allowed_prefixes = list(getattr(state, "session_command_policy_allowed_bash_prefixes", []) or [])
+    lines.append(
+        "session_command_policy_allowed_tools: "
+        + (", ".join(allowed_tools) if allowed_tools else "none")
+    )
+    lines.append(
+        "session_command_policy_allowed_bash_prefixes: "
+        + (", ".join(allowed_prefixes) if allowed_prefixes else "none")
+    )
+    lines.append(
+        "session_command_policy_require_read_only_subagents: "
+        + (
+            "yes"
+            if bool(getattr(state, "session_command_policy_require_read_only_subagents", False))
+            else "no"
+        )
+    )
+    return lines
+
+
+def _render_execution_summary_line_from_state(state) -> str:
+    bits = _render_execution_contract_bits(
+        session_execution_mode=getattr(state, "session_execution_mode", "main"),
+        session_command_policy_name=getattr(state, "session_command_policy_name", None),
+        session_command_policy_require_read_only_subagents=bool(
+            getattr(state, "session_command_policy_require_read_only_subagents", False)
+        ),
+    )
+    return "execution: " + "  ".join(bits)
+
+
+def _render_task_surface_bits(task_surface_counts: dict[str, int] | None) -> list[str]:
+    if not isinstance(task_surface_counts, dict):
+        return []
+    counts: dict[str, int] = {}
+    for key, value in task_surface_counts.items():
+        try:
+            counts[str(key)] = int(value)
+        except (TypeError, ValueError):
+            continue
+    if not counts:
+        return []
+    total = sum(counts.values())
+    non_zero = [f"{key}:{value}" for key, value in counts.items() if value > 0]
+    bits = [f"tasks={total}"]
+    if non_zero:
+        bits.append("task_surfaces=" + ",".join(non_zero))
+    return bits
+
+
+def _render_planning_bits(*, active_planning_artifact_id: str | None, planning_artifact_count: int | None) -> list[str]:
+    bits = [f"plans={int(planning_artifact_count or 0)}"]
+    if active_planning_artifact_id:
+        bits.append(f"active_plan={active_planning_artifact_id}")
+    return bits
+
+
+def _background_continuation_hint(record: BackgroundSessionRecord) -> str:
+    if record.status in {"busy", "running", "queued"}:
+        return f"pyclaude attach {record.bg_id}"
+    if record.session_id:
+        return f"pyclaude --resume-session {record.session_id} repl"
+    return f"pyclaude logs {record.bg_id}"
+
+
+def _background_session_is_live_attachable(record: BackgroundSessionRecord) -> bool:
+    return (
+        record.status in {"busy", "running"}
+        and bool(record.bridge_host)
+        and bool(record.bridge_port)
+        and bool(record.session_id)
+    )
+
+
+def _background_session_is_saved_resumable(record: BackgroundSessionRecord) -> bool:
+    if _background_session_is_live_attachable(record) or not record.session_id:
+        return False
+    state, _ = load_transcript_by_session_id(Path(record.cwd), record.session_id)
+    return state is not None
+
+
+def _background_continuation_category(record: BackgroundSessionRecord) -> str:
+    return _background_grouped_actions(record, detail=False)["category"]
+
+
+def _background_grouped_actions(record: BackgroundSessionRecord, *, detail: bool) -> dict[str, str]:
+    live_attachable = _background_session_is_live_attachable(record)
+    saved_resumable = _background_session_is_saved_resumable(record)
+    semantics = build_continuation_semantics(
+        is_live_attachable=live_attachable,
+        is_saved_resumable=saved_resumable,
+        live_attach_command=f"pyclaude attach {record.bg_id}",
+        resume_session_id=record.session_id,
+        stay_on_surface=(
+        f"pyclaude ps | pyclaude logs {record.bg_id}"
+        if detail
+        else f"pyclaude ps {record.bg_id} | pyclaude logs {record.bg_id}"
+        ),
+    )
+    return {
+        "category": semantics.category,
+        "go_to_live_attach": semantics.go_to_live_attach,
+        "go_to_saved_resume": semantics.go_to_saved_resume,
+        "stay_on_surface": semantics.stay_on_surface,
+    }
+
+
+def _render_background_session_header(record: BackgroundSessionRecord, *, include_prompt: bool) -> str:
+    actions = _background_grouped_actions(record, detail=True)
+    bridge_endpoint = (
+        f"{record.bridge_host}:{record.bridge_port}"
+        if record.bridge_host and record.bridge_port
+        else "none"
+    )
+    lines = [
+        "background session:",
+        f"background session id: {record.bg_id}",
+        f"session id: {record.session_id or 'none'}",
+        f"continuation category: {actions['category']}",
+        f"provider: {record.provider}",
+        f"model: {record.model}",
+        f"status: {record.status}",
+        f"created at: {record.created_at}",
+        f"updated at: {record.updated_at or 'none'}",
+        f"ended at: {record.ended_at or 'none'}",
+        f"pid: {record.pid if record.pid is not None else 'none'}",
+        f"log path: {record.log_path or 'none'}",
+        f"transcript path: {record.transcript_path or 'none'}",
+        f"workspace mode: {record.workspace_mode}",
+        f"workspace health: {getattr(record, 'workspace_health', 'healthy')}",
+        f"workspace label: {record.workspace_label or 'none'}",
+        f"origin cwd: {record.original_cwd or record.cwd}",
+        f"effective cwd: {record.effective_cwd or record.cwd}",
+        f"fallback cwd: {getattr(record, 'workspace_fallback_cwd', None) or 'none'}",
+        f"workspace unavailable: {'yes' if bool(getattr(record, 'workspace_unavailable', False)) else 'no'}",
+        f"workspace cleanup status: {record.workspace_cleanup_status}",
+        f"bridge endpoint: {bridge_endpoint}",
+        f"go_to_live_attach: {actions['go_to_live_attach']}",
+        f"go_to_saved_resume: {actions['go_to_saved_resume']}",
+        f"stay_on_surface: {actions['stay_on_surface']}",
+    ]
+    if include_prompt:
+        lines.insert(9, f"prompt: {record.prompt}")
+    return "\n".join(lines)
+
+
+def _render_background_session_detail(record: BackgroundSessionRecord) -> str:
+    return _render_background_session_header(record, include_prompt=True)
 
 
 def _render_background_sessions(records: list[BackgroundSessionRecord]) -> str:
@@ -309,10 +745,43 @@ def _render_background_sessions(records: list[BackgroundSessionRecord]) -> str:
     for item in records:
         updated = item.updated_at or item.created_at
         session_id = item.session_id or "-"
+        workspace_bits = _render_workspace_bits(
+            workspace_mode=item.workspace_mode,
+            workspace_health=getattr(item, "workspace_health", "healthy"),
+            workspace_label=item.workspace_label,
+            original_cwd=item.original_cwd,
+            effective_cwd=item.effective_cwd or item.cwd,
+            workspace_cleanup_status=item.workspace_cleanup_status,
+            workspace_cleanup_error=item.workspace_cleanup_error,
+            workspace_unavailable=bool(getattr(item, "workspace_unavailable", False)),
+            workspace_fallback_cwd=getattr(item, "workspace_fallback_cwd", None),
+        )
+        execution_bits = _render_execution_contract_bits(
+            session_execution_mode=getattr(item, "session_execution_mode", "background-session"),
+            session_command_policy_name=getattr(item, "session_command_policy_name", None),
+            session_command_policy_require_read_only_subagents=bool(
+                getattr(item, "session_command_policy_require_read_only_subagents", False)
+            ),
+        )
+        actions = _background_grouped_actions(item, detail=False)
+        source_bits = [
+            "source=live_background" if item.status in {"busy", "running", "queued"} else "source=saved_background",
+            "continue=" + _background_continuation_hint(item),
+            "continuation=" + actions["category"],
+        ]
         lines.append(
             f"{item.bg_id}  status={item.status}  updated={updated}  "
             f"session={session_id}  provider={item.provider}  model={item.model}  "
-            f"workspace={item.workspace_mode}  cwd={item.effective_cwd or item.cwd}"
+            + "  ".join(
+                [
+                    *source_bits,
+                    *workspace_bits,
+                    *execution_bits,
+                    f"go_to_live_attach={actions['go_to_live_attach']}",
+                    f"go_to_saved_resume={actions['go_to_saved_resume']}",
+                    f"stay_on_surface={actions['stay_on_surface']}",
+                ]
+            )
         )
     return "\n".join(lines)
 
@@ -331,8 +800,10 @@ def _workspace_from_background_record(record: BackgroundSessionRecord) -> Isolat
     effective_cwd = Path(record.effective_cwd or record.cwd)
     return IsolatedWorkspace(
         mode=record.workspace_mode,
+        label=record.workspace_label or "restored-workspace",
         original_cwd=original_cwd.resolve(),
         effective_cwd=effective_cwd.resolve(),
+        created_at=record.workspace_created_at or "",
     )
 
 
@@ -347,6 +818,8 @@ def _background_worker_argv(args, bg_id: str) -> list[str]:
         argv.extend(["--base-url", args.base_url])
     if args.mcp_config:
         argv.extend(["--mcp-config", args.mcp_config])
+    if args.permission_config:
+        argv.extend(["--permission-config", args.permission_config])
     if args.model:
         argv.extend(["--model", args.model])
     if args.max_turns is not None:
@@ -408,6 +881,13 @@ def _launch_background_ask(args, config) -> int:
 
 def _run_background_worker(config, *, bg_id: str, prompt: str) -> int:
     workspace = prepare_isolated_workspace(config.cwd, label="background")
+    workspace_health = derive_workspace_health(
+        workspace_mode=workspace.mode,
+        workspace_cleanup_status="pending",
+        workspace_unavailable=False,
+    )
+    workspace_cleanup_status = "pending"
+    workspace_cleanup_error: str | None = None
     worker_config = replace(
         config,
         cwd=workspace.effective_cwd,
@@ -422,11 +902,51 @@ def _run_background_worker(config, *, bg_id: str, prompt: str) -> int:
     created = dispatcher.handle({"id": 1, "method": "session.create", "params": {}})
     if "error" in created:
         error = created["error"]["message"]
-        update_background_session(config.cwd, bg_id, status="failed", error=error, exit_code=1)
+        update_background_session(
+            config.cwd,
+            bg_id,
+            status="failed",
+            error=error,
+            exit_code=1,
+            original_cwd=str(config.cwd),
+            effective_cwd=str(workspace.effective_cwd),
+            workspace_mode=workspace.mode,
+            workspace_label=workspace.label,
+            workspace_created_at=workspace.created_at,
+            workspace_health=workspace_health,
+            workspace_cleanup_status=workspace_cleanup_status,
+            workspace_cleanup_error=workspace_cleanup_error,
+            workspace_unavailable=False,
+            workspace_unavailable_reason=None,
+            workspace_fallback_cwd=str(config.cwd.resolve()),
+        )
         print(f"error: RuntimeError: {error}", flush=True)
-        cleanup_isolated_workspace(workspace)
+        try:
+            cleanup_isolated_workspace(workspace)
+            workspace_cleanup_status = "completed"
+        except Exception as exc:  # noqa: BLE001
+            workspace_cleanup_status = "failed"
+            workspace_cleanup_error = f"{type(exc).__name__}: {exc}"
+        finally:
+            update_background_session(
+                config.cwd,
+                bg_id,
+                workspace_cleanup_status=workspace_cleanup_status,
+                workspace_cleanup_error=workspace_cleanup_error,
+            )
+            dispatcher.close()
         return 1
     session_id = created["result"]["session_id"]
+    session = dispatcher._sessions[session_id].session
+    session.set_session_execution_contract(execution_mode="background-session")
+    session.state.original_cwd = str(config.cwd.resolve())
+    session.state.effective_cwd = str(workspace.effective_cwd.resolve())
+    session.state.workspace_mode = workspace.mode
+    session.state.workspace_label = workspace.label
+    session.state.workspace_created_at = workspace.created_at
+    session.state.workspace_health = workspace_health
+    session.state.workspace_cleanup_status = workspace_cleanup_status
+    session.state.workspace_cleanup_error = workspace_cleanup_error
     transcript_path = get_session_path(config.cwd, session_id)
     server = BridgeTcpServer("127.0.0.1", 0, dispatcher)
     host, port = server.server_address
@@ -441,6 +961,22 @@ def _run_background_worker(config, *, bg_id: str, prompt: str) -> int:
         original_cwd=str(config.cwd),
         effective_cwd=str(workspace.effective_cwd),
         workspace_mode=workspace.mode,
+        workspace_label=workspace.label,
+        workspace_created_at=workspace.created_at,
+        workspace_health=workspace_health,
+        workspace_cleanup_status=workspace_cleanup_status,
+        workspace_cleanup_error=workspace_cleanup_error,
+        workspace_unavailable=False,
+        workspace_unavailable_reason=None,
+        workspace_fallback_cwd=str(config.cwd.resolve()),
+        session_execution_mode=session.state.session_execution_mode,
+        session_command_policy_name=session.state.session_command_policy_name,
+        session_command_policy_source=session.state.session_command_policy_source,
+        session_command_policy_allowed_tool_names=list(session.state.session_command_policy_allowed_tool_names),
+        session_command_policy_allowed_bash_prefixes=list(session.state.session_command_policy_allowed_bash_prefixes),
+        session_command_policy_require_read_only_subagents=(
+            session.state.session_command_policy_require_read_only_subagents
+        ),
     )
 
     def run_initial_prompt() -> None:
@@ -465,6 +1001,24 @@ def _run_background_worker(config, *, bg_id: str, prompt: str) -> int:
                 original_cwd=str(config.cwd),
                 effective_cwd=str(workspace.effective_cwd),
                 workspace_mode=workspace.mode,
+                workspace_label=workspace.label,
+                workspace_created_at=workspace.created_at,
+                workspace_health=workspace_health,
+                workspace_cleanup_status=workspace_cleanup_status,
+                workspace_cleanup_error=workspace_cleanup_error,
+                workspace_unavailable=False,
+                workspace_unavailable_reason=None,
+                workspace_fallback_cwd=str(config.cwd.resolve()),
+                session_execution_mode=session.state.session_execution_mode,
+                session_command_policy_name=session.state.session_command_policy_name,
+                session_command_policy_source=session.state.session_command_policy_source,
+                session_command_policy_allowed_tool_names=list(session.state.session_command_policy_allowed_tool_names),
+                session_command_policy_allowed_bash_prefixes=list(
+                    session.state.session_command_policy_allowed_bash_prefixes
+                ),
+                session_command_policy_require_read_only_subagents=(
+                    session.state.session_command_policy_require_read_only_subagents
+                ),
             )
             return
         payload = response["result"]["payload"]
@@ -481,6 +1035,14 @@ def _run_background_worker(config, *, bg_id: str, prompt: str) -> int:
             original_cwd=str(config.cwd),
             effective_cwd=str(workspace.effective_cwd),
             workspace_mode=workspace.mode,
+            workspace_label=workspace.label,
+            workspace_created_at=workspace.created_at,
+            workspace_health=workspace_health,
+            workspace_cleanup_status=workspace_cleanup_status,
+            workspace_cleanup_error=workspace_cleanup_error,
+            workspace_unavailable=False,
+            workspace_unavailable_reason=None,
+            workspace_fallback_cwd=str(config.cwd.resolve()),
         )
 
     prompt_thread = Thread(target=run_initial_prompt, daemon=True)
@@ -489,7 +1051,14 @@ def _run_background_worker(config, *, bg_id: str, prompt: str) -> int:
         server.serve_forever()
         return 0
     except KeyboardInterrupt:
-        update_background_session(config.cwd, bg_id, status="stopped", exit_code=0)
+        update_background_session(
+            config.cwd,
+            bg_id,
+            status="stopped",
+            exit_code=0,
+            workspace_cleanup_status=workspace_cleanup_status,
+            workspace_cleanup_error=workspace_cleanup_error,
+        )
         return 0
     except Exception as exc:  # noqa: BLE001
         update_background_session(
@@ -498,22 +1067,52 @@ def _run_background_worker(config, *, bg_id: str, prompt: str) -> int:
             status="failed",
             error=f"{type(exc).__name__}: {exc}",
             exit_code=1,
+            workspace_cleanup_status=workspace_cleanup_status,
+            workspace_cleanup_error=workspace_cleanup_error,
         )
         print(f"error: {type(exc).__name__}: {exc}", flush=True)
         return 1
     finally:
         server.close()
         dispatcher.close()
-        cleanup_isolated_workspace(workspace)
+        try:
+            cleanup_isolated_workspace(workspace)
+            workspace_cleanup_status = "completed"
+            workspace_cleanup_error = None
+            workspace_health = derive_workspace_health(
+                workspace_mode=workspace.mode,
+                workspace_cleanup_status=workspace_cleanup_status,
+                workspace_unavailable=False,
+            )
+        except Exception as exc:  # noqa: BLE001
+            workspace_cleanup_status = "failed"
+            workspace_cleanup_error = f"{type(exc).__name__}: {exc}"
+            workspace_health = derive_workspace_health(
+                workspace_mode=workspace.mode,
+                workspace_cleanup_status=workspace_cleanup_status,
+                workspace_unavailable=False,
+            )
+        finally:
+            update_background_session(
+                config.cwd,
+                bg_id,
+                workspace_health=workspace_health,
+                workspace_cleanup_status=workspace_cleanup_status,
+                workspace_cleanup_error=workspace_cleanup_error,
+            )
 
 
-def _print_background_session_log(record: BackgroundSessionRecord, *, follow: bool) -> int:
+def _print_background_session_log(record: BackgroundSessionRecord, *, follow: bool, summary_only: bool = False) -> int:
+    print(_render_background_session_header(record, include_prompt=False))
+    if summary_only:
+        return 0
     log_path = Path(record.log_path) if record.log_path else None
     if log_path is None or not log_path.exists():
         print("No log output available.")
         return 0
 
     with log_path.open("r", encoding="utf-8") as handle:
+        print()
         content = handle.read()
         if content:
             print(content, end="" if content.endswith("\n") else "\n")
@@ -531,6 +1130,11 @@ def _print_background_session_log(record: BackgroundSessionRecord, *, follow: bo
 
 def _build_remote_background_session(record: BackgroundSessionRecord) -> RemoteSessionProxy:
     if not record.bridge_host or not record.bridge_port or not record.session_id:
+        if record.session_id and record.status in {"completed", "failed", "stopped"}:
+            raise RuntimeError(
+                "Background session is no longer live. "
+                f'Resume saved state with "pyclaude --resume-session {record.session_id} repl".'
+            )
         raise RuntimeError("Background session does not expose a live bridge endpoint.")
     return RemoteSessionProxy(
         host=str(record.bridge_host),
@@ -581,9 +1185,24 @@ def _run_attached_repl(session, *, bg_id: str) -> int:
         renderer.finish()
         print(f"PyClaudeCode REPL attached to background session {bg_id}")
         if session.state.messages:
-            print(
-                f'Restored session {session.state.session_id} with {len(session.state.messages)} messages.'
-            )
+            print(f'Attached to live session {session.state.session_id} with {len(session.state.messages)} messages.')
+        for line in _session_source_header_lines(
+            session,
+            session_source="live_background",
+            live_background_id=bg_id,
+        ):
+            print(line)
+        workspace_summary = _render_workspace_summary_line_from_state(session.state)
+        if workspace_summary:
+            print(workspace_summary)
+        print(_render_execution_summary_line_from_state(session.state))
+        for line in _render_workspace_guidance_lines_from_state(session.state):
+            print(line)
+        for line in _render_execution_contract_lines_from_state(session.state):
+            print(line)
+        if hasattr(session, "task_surface_summary_lines"):
+            for line in session.task_surface_summary_lines():
+                print(line)
         if getattr(session, "pending_approval", None) is not None:
             request = session.pending_approval
             print(
@@ -624,7 +1243,7 @@ def _attach_background_session(record: BackgroundSessionRecord, *, mode: str = "
     session = _build_remote_background_session(record)
     try:
         if mode == "tui":
-            return run_tui(session)
+            return run_tui(session, session_source="live_background", live_background_id=record.bg_id)
         return _run_attached_repl(session, bg_id=record.bg_id)
     finally:
         session.close()
@@ -657,6 +1276,7 @@ def main(argv: list[str] | None = None) -> int:
         api_key=args.api_key,
         base_url=args.base_url,
         mcp_config_path=args.mcp_config,
+        permission_config_path=args.permission_config,
         model=args.model,
         max_tokens=args.max_tokens,
         max_turns=args.max_turns,
@@ -675,13 +1295,57 @@ def main(argv: list[str] | None = None) -> int:
             provider = item.provider or "unknown"
             model = item.model or "unknown"
             compacted = "yes" if item.context_summary_present else "no"
+            workspace_health = getattr(item, "workspace_health", None) or derive_workspace_health(
+                workspace_mode=item.workspace_mode or "main",
+                workspace_cleanup_status=item.workspace_cleanup_status or "none",
+                workspace_unavailable=bool(getattr(item, "workspace_unavailable", False)),
+            )
+            workspace_bits = _render_workspace_bits(
+                workspace_mode=item.workspace_mode or "main",
+                workspace_health=workspace_health,
+                workspace_label=item.workspace_label,
+                original_cwd=item.original_cwd or item.cwd,
+                effective_cwd=item.effective_cwd or item.cwd,
+                workspace_cleanup_status=item.workspace_cleanup_status or "none",
+                workspace_unavailable=bool(getattr(item, "workspace_unavailable", False)),
+                workspace_fallback_cwd=getattr(item, "workspace_fallback_cwd", None),
+            )
+            recommended_actions = workspace_recommended_actions(
+                workspace_health=str(workspace_health or "healthy"),
+                workspace_label=item.workspace_label,
+                session_id=item.session_id,
+            )
+            if recommended_actions:
+                workspace_bits.append("actions=" + " | ".join(recommended_actions))
+            execution_bits = _render_execution_contract_bits(
+                session_execution_mode=getattr(item, "session_execution_mode", "main"),
+                session_command_policy_name=getattr(item, "session_command_policy_name", None),
+                session_command_policy_require_read_only_subagents=bool(
+                    getattr(item, "session_command_policy_require_read_only_subagents", False)
+                ),
+            )
+            planning_bits = _render_planning_bits(
+                active_planning_artifact_id=getattr(item, "active_planning_artifact_id", None),
+                planning_artifact_count=getattr(item, "planning_artifact_count", 0),
+            )
+            task_bits = _render_task_surface_bits(getattr(item, "task_surface_counts", {}))
             print(
                 f"{item.session_id}  updated={updated}  provider={provider}  "
-                f"model={model}  messages={item.message_count}  compacted={compacted}"
+                f"model={model}  source=saved  continue=pyclaude --resume-session {item.session_id} repl  "
+                f"messages={item.message_count}  compacted={compacted}  "
+                + "  ".join([*planning_bits, *task_bits, *workspace_bits, *execution_bits])
             )
         return 0
 
     if args.command == "ps":
+        if args.session:
+            try:
+                record = _resolve_background_session_or_raise(config.cwd, args.session)
+            except FileNotFoundError as exc:
+                print(f"error: FileNotFoundError: {exc}")
+                return 1
+            print(_render_background_session_detail(record))
+            return 0
         print(_render_background_sessions(list_background_sessions(config.cwd)[: args.limit]))
         return 0
 
@@ -692,7 +1356,7 @@ def main(argv: list[str] | None = None) -> int:
             print(f"error: FileNotFoundError: {exc}")
             return 1
         if args.command == "logs":
-            return _print_background_session_log(record, follow=False)
+            return _print_background_session_log(record, follow=False, summary_only=args.view == "summary")
         if args.command == "attach":
             try:
                 return _attach_background_session(record, mode=args.mode)
@@ -705,9 +1369,27 @@ def main(argv: list[str] | None = None) -> int:
                 return 0
             _terminate_background_session(record)
             workspace = _workspace_from_background_record(record)
+            workspace_cleanup_status = record.workspace_cleanup_status
+            workspace_cleanup_error = record.workspace_cleanup_error
+            workspace_health = getattr(record, "workspace_health", "healthy")
             if workspace is not None:
                 cleanup_isolated_workspace(workspace)
-            update_background_session(config.cwd, record.bg_id, status="stopped", exit_code=1)
+                workspace_cleanup_status = "completed"
+                workspace_cleanup_error = None
+                workspace_health = derive_workspace_health(
+                    workspace_mode=record.workspace_mode,
+                    workspace_cleanup_status=workspace_cleanup_status,
+                    workspace_unavailable=bool(getattr(record, "workspace_unavailable", False)),
+                )
+            update_background_session(
+                config.cwd,
+                record.bg_id,
+                status="stopped",
+                exit_code=1,
+                workspace_health=workspace_health,
+                workspace_cleanup_status=workspace_cleanup_status,
+                workspace_cleanup_error=workspace_cleanup_error,
+            )
             print(f'Stopped background session "{record.bg_id}".')
             return 0
         except Exception as exc:  # noqa: BLE001
@@ -986,13 +1668,21 @@ def main(argv: list[str] | None = None) -> int:
         try:
             if restored_from is not None and not session.state.messages:
                 print(f"Loaded session from {restored_from}")
-            return run_repl(session)
+            return run_repl(
+                session,
+                session_source="restored_saved" if restored_from is not None else "new",
+                restored_from=restored_from,
+            )
         finally:
             session.close()
 
     if args.command == "tui":
         try:
-            return run_tui(session)
+            return run_tui(
+                session,
+                session_source="restored_saved" if restored_from is not None else "new",
+                restored_from=restored_from,
+            )
         except Exception as exc:  # noqa: BLE001
             print(f"error: {type(exc).__name__}: {exc}")
             return 1

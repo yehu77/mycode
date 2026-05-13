@@ -10,6 +10,7 @@ import json
 
 from .commands import CommandExecution, build_default_command_registry, render_repl_command_help
 from .config import SessionConfig
+from .interactions import QuestionOption, UserQuestion, UserQuestionRequest, UserQuestionResponse
 from .permissions import ApprovalRequest, ApprovalResult
 from .runtime.events import RuntimeEvent
 from .state import SessionState
@@ -22,6 +23,7 @@ def _runtime_event_from_payload(event_payload: dict[str, Any]) -> RuntimeEvent |
         "assistant_tool_call",
         "assistant_tool_result_ready",
         "plan_execution",
+        "task_progress",
         "advisor",
         "advisor_review_started",
         "advisor_review_result",
@@ -38,6 +40,7 @@ def _runtime_event_from_payload(event_payload: dict[str, Any]) -> RuntimeEvent |
     return RuntimeEvent(
         kind=kind,  # type: ignore[arg-type]
         message=str(event_payload.get("message", "")),
+        task_id=(str(event_payload.get("task_id")) if event_payload.get("task_id") is not None else None),
         tool_name=event_payload.get("tool_name"),
         tool_call_id=event_payload.get("tool_call_id"),
         duration_ms=event_payload.get("duration_ms"),
@@ -55,6 +58,7 @@ REMOTE_REPL_COMMAND_HELP = (
     + "\n/approve         Approve the pending tool request once"
     + "\n/approve-session Approve the pending tool request for the session"
     + "\n/deny            Deny the pending tool request"
+    + "\n/cancel-question Cancel the pending structured question"
 )
 
 
@@ -148,14 +152,29 @@ class RemoteSessionProxy:
             session_id=self.session_id,
             messages=[{} for _ in range(int(described.get("message_count", 0)))],
         )
+        self._workspace_action_bundle: dict[str, str] = {}
+        self._symbol_surface: dict[str, Any] | None = None
+        self._checklist_duplicate_guard: dict[str, Any] | None = None
+        self._task_surface_counts: dict[str, int] = {}
+        self._working_set_metadata: dict[str, Any] = {}
+        self._task_detail_cache: dict[str, dict[str, Any]] = {}
+        self._sync_workspace_metadata(described)
+        self._sync_execution_contract_metadata(described)
+        self._sync_task_surface_counts(described)
+        self._sync_symbol_surface_metadata(described)
+        self._sync_working_set_metadata(described)
         self.permission_manager = _RemotePermissionManager()
         self._default_live_sink = None
         self._transient_live_sink = None
         self._approval_requested_handler = None
         self._approval_resolved_handler = None
+        self._question_requested_handler = None
+        self._question_resolved_handler = None
         self._sink_lock = Lock()
         self.pending_approval: ApprovalRequest | None = None
         self.pending_approval_id: int | None = None
+        self.pending_question: UserQuestionRequest | None = None
+        self.pending_question_id: int | None = None
         subscribed = self.client.request(
             "bridge.subscribe",
             {"session_id": self.session_id, "after_seq": 0, "limit": replay_limit},
@@ -173,6 +192,7 @@ class RemoteSessionProxy:
             if event is not None:
                 self._replay_events.append(event)
         self._sync_pending_approval()
+        self._sync_pending_question()
 
     def set_live_event_sink(self, sink) -> None:
         self._default_live_sink = sink
@@ -180,6 +200,10 @@ class RemoteSessionProxy:
     def set_approval_handlers(self, requested_handler=None, resolved_handler=None) -> None:
         self._approval_requested_handler = requested_handler
         self._approval_resolved_handler = resolved_handler
+
+    def set_question_handlers(self, requested_handler=None, resolved_handler=None) -> None:
+        self._question_requested_handler = requested_handler
+        self._question_resolved_handler = resolved_handler
 
     def take_replay_events(self) -> list[RuntimeEvent]:
         events = list(self._replay_events)
@@ -215,6 +239,7 @@ class RemoteSessionProxy:
             finally:
                 request_client.close()
         self._sync_metadata(result)
+        self._sync_from_describe()
         return str(result.get("output") or "")
 
     def run_command(self, execution: CommandExecution, sink=None) -> str:
@@ -246,6 +271,7 @@ class RemoteSessionProxy:
             finally:
                 request_client.close()
         self._sync_metadata(result)
+        self._sync_from_describe()
         return str(result.get("output") or "")
 
     def handle_repl_command(self, prompt: str) -> tuple[bool, str | CommandExecution | None]:
@@ -275,6 +301,8 @@ class RemoteSessionProxy:
                     metadata=execution.get("metadata") if isinstance(execution.get("metadata"), dict) else None,
                 ),
             )
+        if handled:
+            self._sync_from_describe()
         return handled, result.get("output")
 
     def resolve_pending_approval(self, result: ApprovalResult) -> str:
@@ -299,14 +327,589 @@ class RemoteSessionProxy:
             else f"Denied {tool_name}."
         )
 
+    def resolve_pending_question(self, result: UserQuestionResponse) -> str:
+        if self.pending_question is None or self.pending_question_id is None:
+            self._wait_for_pending_question(timeout_sec=2.0)
+        if self.pending_question is None or self.pending_question_id is None:
+            return "No pending question request."
+        question_id = self.pending_question_id
+        self.client.request(
+            "session.question_respond",
+            {
+                "session_id": self.session_id,
+                "question_id": question_id,
+                "answers": dict(result.answers),
+                "canceled": result.canceled,
+            },
+        )
+        if result.canceled:
+            return "Canceled pending structured questions."
+        return "Submitted structured question answers."
+
     def describe_tasks(self) -> str:
         return self._view_text("tasks")
+
+    def checklist_tasks_payload(self) -> list[dict[str, Any]]:
+        result = self.client.request(
+            "session.view",
+            {"session_id": self.session_id, "view": "tasks"},
+        )
+        self._sync_checklist_duplicate_guard_metadata(result)
+        self._sync_task_surface_counts(result)
+        payload = result.get("checklist_tasks")
+        if not isinstance(payload, list):
+            return []
+        return [dict(item) for item in payload if isinstance(item, dict)]
+
+    def task_surface_counts_payload(self) -> dict[str, int]:
+        return dict(self._task_surface_counts)
+
+    def task_surface_summary_lines(self) -> list[str]:
+        counts = self.task_surface_counts_payload()
+        lines = ["task_surfaces:"]
+        for kind in (
+            "checklist",
+            "workspace_maintenance",
+            "child_execution",
+            "background_execution",
+            "active_plan_execution",
+            "other_task",
+        ):
+            lines.append(f"{kind}: {int(counts.get(kind, 0))}")
+        return lines
+
+    def checklist_duplicate_guard_payload(self) -> dict[str, Any] | None:
+        if not isinstance(self._checklist_duplicate_guard, dict) or not self._checklist_duplicate_guard:
+            return None
+        return dict(self._checklist_duplicate_guard)
+
+    def working_set_payload(self, limit: int = 5) -> dict[str, Any]:
+        del limit
+        return self._extract_file_context_payload(self._working_set_metadata)
+
+    def execution_contract_payload(self) -> dict[str, Any]:
+        return {
+            "session_execution_mode": self.state.session_execution_mode,
+            "session_command_policy_name": self.state.session_command_policy_name,
+            "session_command_policy_source": self.state.session_command_policy_source,
+            "session_command_policy_allowed_tool_names": list(
+                self.state.session_command_policy_allowed_tool_names
+            ),
+            "session_command_policy_allowed_bash_prefixes": list(
+                self.state.session_command_policy_allowed_bash_prefixes
+            ),
+            "session_command_policy_require_read_only_subagents": (
+                self.state.session_command_policy_require_read_only_subagents
+            ),
+            "session_command_policy_enforce_read_only_bash": (
+                str(self.state.session_command_policy_name or "") in {
+                    "review",
+                    "security-review",
+                    "ultraplan",
+                    "read-only-subagent",
+                    "read-only-turn",
+                }
+            ),
+        }
+
+    def task_execution_detail_metadata(self, task_id: str) -> dict[str, Any] | None:
+        result = self._task_detail_view_result(task_id)
+        execution_mode = str(result.get("execution_mode") or "").strip()
+        execution_policy = str(result.get("execution_policy") or "").strip()
+        execution_policy_source = str(result.get("execution_policy_source") or "").strip()
+        allowed_tools = [str(item) for item in (result.get("allowed_tools") or []) if str(item).strip()]
+        allowed_bash_prefixes = [
+            str(item) for item in (result.get("allowed_bash_prefixes") or []) if str(item).strip()
+        ]
+        read_only_subagents = bool(result.get("read_only_subagents", False))
+        task_surface = str(result.get("task_surface") or "").strip()
+        workspace_mode = str(result.get("workspace_mode") or "").strip()
+        workspace_health = str(result.get("workspace_health") or "").strip()
+        if not any(
+            (
+                execution_mode,
+                execution_policy,
+                execution_policy_source,
+                allowed_tools,
+                allowed_bash_prefixes,
+                read_only_subagents,
+                task_surface,
+                workspace_mode,
+                workspace_health,
+            )
+        ):
+            return None
+        return {
+            "task_surface": task_surface or "other_task",
+            "execution_mode": execution_mode or "main",
+            "execution_policy": execution_policy or None,
+            "execution_policy_source": execution_policy_source or None,
+            "allowed_tools": allowed_tools,
+            "allowed_bash_prefixes": allowed_bash_prefixes,
+            "read_only_subagents": read_only_subagents,
+            "workspace_mode": workspace_mode or None,
+            "workspace_health": workspace_health or None,
+        }
+
+    def task_file_context_payload(self, task_id: str, limit: int = 5) -> dict[str, Any] | None:
+        del limit
+        payload = self._extract_file_context_payload(self._task_detail_view_result(task_id))
+        return payload if int(payload.get("file_context_file_count") or 0) > 0 else None
+
+    def active_plan_file_context_payload(
+        self,
+        identifier: str | None = None,
+        limit: int = 5,
+    ) -> dict[str, Any] | None:
+        del identifier, limit
+        result = self.client.request(
+            "session.view",
+            {
+                "session_id": self.session_id,
+                "view": "active_plan",
+            },
+        )
+        payload = self._extract_file_context_payload(result)
+        return payload if int(payload.get("file_context_file_count") or 0) > 0 else None
 
     def describe_active_plan(self) -> str:
         return self._view_text("active_plan")
 
+    def describe_active_plan_scouts(
+        self,
+        *,
+        selected_index: int = 0,
+        full_detail: bool = False,
+    ) -> str:
+        result = self.client.request(
+            "session.view",
+            {
+                "session_id": self.session_id,
+                "view": "active_plan_scouts",
+                "selected_index": selected_index,
+                "full_detail": full_detail,
+            },
+        )
+        return str(result.get("text", ""))
+
+    def describe_active_plan_execution(
+        self,
+        *,
+        selected_index: int = 0,
+        full_detail: bool = False,
+    ) -> str:
+        result = self.client.request(
+            "session.view",
+            {
+                "session_id": self.session_id,
+                "view": "active_plan_execution",
+                "selected_index": selected_index,
+                "full_detail": full_detail,
+            },
+        )
+        return str(result.get("text", ""))
+
+    def describe_active_plan_timeline(
+        self,
+        *,
+        selected_index: int = 0,
+        selected_compare_index: int = 0,
+        selected_phase_local_task_index: int = 0,
+        kind_filter: str = "all",
+        delta_mode: str = "none",
+        phase_filter: str = "none",
+        focus_mode: str = "none",
+        compare_mode: str = "none",
+        artifact_id: str | None = None,
+    ) -> str:
+        result = self.client.request(
+            "session.view",
+            {
+                "session_id": self.session_id,
+                "view": "active_plan_timeline",
+                "selected_index": selected_index,
+                "selected_compare_index": selected_compare_index,
+                "selected_phase_local_task_index": selected_phase_local_task_index,
+                "kind_filter": kind_filter,
+                "delta_mode": delta_mode,
+                "phase_filter": phase_filter,
+                "focus_mode": focus_mode,
+                "compare_mode": compare_mode,
+                "artifact_id": artifact_id,
+            },
+        )
+        self._sync_metadata(result)
+        return str(result.get("text") or "")
+
+    def describe_active_plan_lineage(self, *, selected_index: int = 0) -> str:
+        result = self.client.request(
+            "session.view",
+            {
+                "session_id": self.session_id,
+                "view": "active_plan_lineage",
+                "selected_index": selected_index,
+            },
+        )
+        return str(result.get("text", ""))
+
+    def describe_active_plan_audit(
+        self,
+        *,
+        selected_index: int = 0,
+        artifact_id: str | None = None,
+    ) -> str:
+        result = self.client.request(
+            "session.view",
+            {
+                "session_id": self.session_id,
+                "view": "active_plan_audit",
+                "selected_index": selected_index,
+                "artifact_id": artifact_id,
+            },
+        )
+        return str(result.get("text", ""))
+
+    def describe_active_plan_replay(
+        self,
+        *,
+        selected_index: int = 0,
+        selected_compare_index: int = 0,
+        selected_phase_local_task_index: int = 0,
+        kind_filter: str = "all",
+        delta_mode: str = "none",
+        phase_filter: str = "none",
+        focus_mode: str = "none",
+        compare_mode: str = "none",
+        latest: bool = False,
+        source_mode: str = "auto",
+        artifact_id: str | None = None,
+    ) -> str:
+        result = self.client.request(
+            "session.view",
+            {
+                "session_id": self.session_id,
+                "view": "active_plan_replay",
+                "selected_index": selected_index,
+                "selected_compare_index": selected_compare_index,
+                "selected_phase_local_task_index": selected_phase_local_task_index,
+                "kind_filter": kind_filter,
+                "delta_mode": delta_mode,
+                "phase_filter": phase_filter,
+                "focus_mode": focus_mode,
+                "compare_mode": compare_mode,
+                "latest": latest,
+                "source_mode": source_mode,
+                "artifact_id": artifact_id,
+            },
+        )
+        return str(result.get("text", ""))
+
+    def active_plan_lineage_index(self) -> int:
+        text = self.describe_active_plan()
+        for line in text.splitlines():
+            if not line.startswith("lineage_position:"):
+                continue
+            raw = line.split(":", 1)[1].strip()
+            head, sep, _tail = raw.partition("/")
+            if not sep:
+                break
+            try:
+                return max(0, int(head) - 1)
+            except ValueError:
+                break
+        return 0
+
+    def describe_active_plan_advisor(self) -> str:
+        return self._view_text("active_plan_advisor")
+
     def describe_advisor(self) -> str:
         return self._view_text("advisor_status")
+
+    def describe_task_detail(self, task_id: str) -> str:
+        result = self._task_detail_view_result(task_id)
+        return str(result.get("text", ""))
+
+    def selected_change_detail_metadata(
+        self,
+        *,
+        index: int = 0,
+        file_index: int = 0,
+        limit: int = 5,
+        redo: bool = False,
+    ) -> dict[str, Any]:
+        result = self.client.request(
+            "session.change_view",
+            {
+                "session_id": self.session_id,
+                "view": "detail",
+                "index": index,
+                "file_index": file_index,
+                "limit": limit,
+                "redo": redo,
+            },
+        )
+        return self._extract_file_context_payload(result)
+
+    def locate_symbol_payload(
+        self,
+        symbol: str,
+        *,
+        path: str = ".",
+        max_results: int = 50,
+    ) -> dict[str, Any]:
+        result = self.client.request(
+            "symbol.locate",
+            {
+                "session_id": self.session_id,
+                "symbol": symbol,
+                "path": path,
+                "max_results": max_results,
+            },
+        )
+        payload = dict(result)
+        self._symbol_surface = dict(payload)
+        return payload
+
+    def collect_references_payload(
+        self,
+        symbol: str,
+        *,
+        path: str = ".",
+        scope: str = "auto",
+        max_results: int = 100,
+    ) -> dict[str, Any]:
+        result = self.client.request(
+            "symbol.references",
+            {
+                "session_id": self.session_id,
+                "symbol": symbol,
+                "path": path,
+                "scope": scope,
+                "max_results": max_results,
+            },
+        )
+        payload = dict(result)
+        self._symbol_surface = dict(payload)
+        return payload
+
+    def symbol_action_surface_payload(
+        self,
+        symbol: str,
+        *,
+        path: str = ".",
+        scope: str = "workspace",
+        max_definition_results: int = 50,
+        max_reference_results: int = 100,
+    ) -> dict[str, Any]:
+        result = self.client.request(
+            "symbol.actions",
+            {
+                "session_id": self.session_id,
+                "symbol": symbol,
+                "path": path,
+                "scope": scope,
+                "max_definition_results": max_definition_results,
+                "max_reference_results": max_reference_results,
+            },
+        )
+        payload = dict(result)
+        self._symbol_surface = dict(payload)
+        return payload
+
+    def current_workspace_action_bundle(self) -> dict[str, str]:
+        return dict(self._workspace_action_bundle)
+
+    def current_symbol_surface_payload(self) -> dict[str, Any] | None:
+        if not isinstance(self._symbol_surface, dict) or not self._symbol_surface:
+            return None
+        return {
+            key: (
+                dict(value)
+                if isinstance(value, dict)
+                else [dict(item) if isinstance(item, dict) else item for item in value]
+                if isinstance(value, list)
+                else value
+            )
+            for key, value in self._symbol_surface.items()
+        }
+
+    def current_symbol_surface_action_bundle(self) -> dict[str, str] | None:
+        payload = self.current_symbol_surface_payload()
+        if payload is None:
+            return None
+        primary_action = str(payload.get("symbol_primary_action") or "").strip()
+        secondary_action = str(payload.get("symbol_secondary_action") or "").strip()
+        surface_kind = str(payload.get("surface_kind") or payload.get("symbol_surface_kind") or "none")
+        if not primary_action:
+            if surface_kind == "symbol_actions" and isinstance(payload.get("selected_definition"), dict):
+                primary_action = "/symbol open primary"
+            elif isinstance(payload.get("selected_navigation_target"), dict):
+                primary_action = "/symbol open primary"
+            else:
+                primary_action = "none"
+        if not secondary_action:
+            if surface_kind == "symbol_actions" and isinstance(payload.get("selected_reference"), dict):
+                secondary_action = "/symbol open secondary"
+            else:
+                secondary_action = "none"
+        return {
+            "primary_action": primary_action,
+            "secondary_action": secondary_action,
+            "tertiary_action": str(payload.get("symbol_tertiary_action") or "/symbol clear"),
+            "target": str(payload.get("symbol_action_target") or payload.get("selected_symbol") or "none"),
+            "surface_kind": surface_kind,
+        }
+
+    def task_workspace_action_bundle(self, task_id: str) -> dict[str, str] | None:
+        detail = self.task_workspace_detail_metadata(task_id)
+        if detail is None:
+            return None
+        return {
+            "primary_action": str(detail.get("workspace_primary_action") or ""),
+            "secondary_action": str(detail.get("workspace_secondary_action") or ""),
+            "tertiary_action": str(detail.get("workspace_tertiary_action") or ""),
+            "target": str(detail.get("workspace_action_target") or ""),
+            "workspace_health": str(detail.get("workspace_health") or self.state.workspace_health),
+        }
+
+    def task_workspace_detail_metadata(self, task_id: str) -> dict[str, Any] | None:
+        result = self._task_detail_view_result(task_id)
+        action = str(result.get("workspace_action") or "").strip()
+        primary_action = str(result.get("workspace_primary_action") or "").strip()
+        secondary_action = str(result.get("workspace_secondary_action") or "").strip()
+        tertiary_action = str(result.get("workspace_tertiary_action") or "").strip()
+        target = str(result.get("workspace_action_target") or "").strip()
+        workspace_health = str(result.get("workspace_health") or "").strip()
+        if not any((action, primary_action, secondary_action, tertiary_action, target, workspace_health)):
+            return None
+        return {
+            "workspace_action": action,
+            "workspace_target": str(result.get("workspace_target") or target),
+            "workspace_health_before": result.get("workspace_health_before"),
+            "workspace_health_after": result.get("workspace_health_after"),
+            "workspace_planned_paths": list(result.get("workspace_planned_paths") or []),
+            "workspace_applied_paths": list(result.get("workspace_applied_paths") or []),
+            "workspace_failure_reason": result.get("workspace_failure_reason"),
+            "workspace_recommended_actions": list(result.get("workspace_recommended_actions") or []),
+            "workspace_primary_action": primary_action,
+            "workspace_secondary_action": secondary_action,
+            "workspace_tertiary_action": tertiary_action,
+            "workspace_action_target": target,
+            "workspace_health": workspace_health or self.state.workspace_health,
+        }
+
+    def checklist_task_detail_metadata(self, task_id: str) -> dict[str, Any] | None:
+        result = self._task_detail_view_result(task_id)
+        checklist_task_id = str(result.get("checklist_task_id") or "").strip()
+        if not checklist_task_id:
+            return None
+        detail = {
+            "checklist_task_id": checklist_task_id,
+            "checklist_task_list_id": str(result.get("checklist_task_list_id") or ""),
+            "checklist_subject": str(result.get("checklist_subject") or ""),
+            "checklist_description": str(result.get("checklist_description") or ""),
+            "checklist_active_form": str(result.get("checklist_active_form") or ""),
+            "checklist_status": str(result.get("checklist_status") or ""),
+            "checklist_owner": str(result.get("checklist_owner") or ""),
+            "checklist_blocks": list(result.get("checklist_blocks") or []),
+            "checklist_blocked_by": list(result.get("checklist_blocked_by") or []),
+            "checklist_metadata": dict(result.get("checklist_metadata") or {}),
+            "checklist_created_at": str(result.get("checklist_created_at") or ""),
+            "checklist_updated_at": str(result.get("checklist_updated_at") or ""),
+            "checklist_total_tasks": int(result.get("checklist_total_tasks") or 0),
+            "checklist_in_progress_tasks": int(result.get("checklist_in_progress_tasks") or 0),
+            "checklist_recommended_actions": list(result.get("checklist_recommended_actions") or []),
+            "checklist_primary_action": str(result.get("checklist_primary_action") or ""),
+            "checklist_secondary_action": str(result.get("checklist_secondary_action") or ""),
+            "checklist_tertiary_action": str(result.get("checklist_tertiary_action") or ""),
+            "checklist_edit_subject_action": str(result.get("checklist_edit_subject_action") or ""),
+            "checklist_edit_description_action": str(result.get("checklist_edit_description_action") or ""),
+            "checklist_edit_owner_action": str(result.get("checklist_edit_owner_action") or ""),
+            "checklist_edit_active_form_action": str(result.get("checklist_edit_active_form_action") or ""),
+            "checklist_edit_blocks_action": str(result.get("checklist_edit_blocks_action") or ""),
+            "checklist_edit_blocked_by_action": str(result.get("checklist_edit_blocked_by_action") or ""),
+            "checklist_edit_metadata_action": str(result.get("checklist_edit_metadata_action") or ""),
+            "checklist_action_target": str(result.get("checklist_action_target") or ""),
+            "selected_checklist_primary_action": str(result.get("selected_checklist_primary_action") or ""),
+            "selected_checklist_secondary_action": str(result.get("selected_checklist_secondary_action") or ""),
+            "selected_checklist_tertiary_action": str(result.get("selected_checklist_tertiary_action") or ""),
+            "selected_checklist_edit_subject_action": str(result.get("selected_checklist_edit_subject_action") or ""),
+            "selected_checklist_edit_description_action": str(result.get("selected_checklist_edit_description_action") or ""),
+            "selected_checklist_edit_owner_action": str(result.get("selected_checklist_edit_owner_action") or ""),
+            "selected_checklist_edit_active_form_action": str(result.get("selected_checklist_edit_active_form_action") or ""),
+            "selected_checklist_edit_blocks_action": str(result.get("selected_checklist_edit_blocks_action") or ""),
+            "selected_checklist_edit_blocked_by_action": str(result.get("selected_checklist_edit_blocked_by_action") or ""),
+            "selected_checklist_edit_metadata_action": str(result.get("selected_checklist_edit_metadata_action") or ""),
+            "selected_checklist_target": str(result.get("selected_checklist_target") or ""),
+        }
+        if result.get("checklist_duplicate_guard") is not None:
+            detail["checklist_duplicate_guard"] = dict(result.get("checklist_duplicate_guard") or {})
+        if result.get("checklist_duplicate_message") is not None:
+            detail["checklist_duplicate_message"] = str(result.get("checklist_duplicate_message") or "")
+        if result.get("checklist_duplicate_reason") is not None:
+            detail["checklist_duplicate_reason"] = str(result.get("checklist_duplicate_reason") or "")
+        if result.get("checklist_duplicate_matched_task_id") is not None:
+            detail["checklist_duplicate_matched_task_id"] = str(
+                result.get("checklist_duplicate_matched_task_id") or ""
+            )
+        if result.get("checklist_duplicate_recommended_action") is not None:
+            detail["checklist_duplicate_recommended_action"] = str(
+                result.get("checklist_duplicate_recommended_action") or ""
+            )
+        return detail
+
+    def checklist_task_action_bundle(self, task_id: str) -> dict[str, str] | None:
+        detail = self.checklist_task_detail_metadata(task_id)
+        if detail is None:
+            return None
+        return {
+            "primary_action": str(detail.get("checklist_primary_action") or detail.get("selected_checklist_primary_action") or ""),
+            "secondary_action": str(detail.get("checklist_secondary_action") or detail.get("selected_checklist_secondary_action") or ""),
+            "tertiary_action": str(detail.get("checklist_tertiary_action") or detail.get("selected_checklist_tertiary_action") or ""),
+            "edit_subject_action": str(detail.get("checklist_edit_subject_action") or detail.get("selected_checklist_edit_subject_action") or ""),
+            "edit_description_action": str(detail.get("checklist_edit_description_action") or detail.get("selected_checklist_edit_description_action") or ""),
+            "edit_owner_action": str(detail.get("checklist_edit_owner_action") or detail.get("selected_checklist_edit_owner_action") or ""),
+            "edit_active_form_action": str(detail.get("checklist_edit_active_form_action") or detail.get("selected_checklist_edit_active_form_action") or ""),
+            "edit_blocks_action": str(detail.get("checklist_edit_blocks_action") or detail.get("selected_checklist_edit_blocks_action") or ""),
+            "edit_blocked_by_action": str(detail.get("checklist_edit_blocked_by_action") or detail.get("selected_checklist_edit_blocked_by_action") or ""),
+            "edit_metadata_action": str(detail.get("checklist_edit_metadata_action") or detail.get("selected_checklist_edit_metadata_action") or ""),
+            "target": str(detail.get("checklist_action_target") or detail.get("selected_checklist_target") or ""),
+            "checklist_status": str(detail.get("checklist_status") or ""),
+        }
+
+    def describe_task_drift_detail(self, task_id: str) -> str:
+        result = self.client.request(
+            "session.view",
+            {"session_id": self.session_id, "view": "task_drift_detail", "task_id": task_id},
+        )
+        return str(result.get("text", ""))
+
+    def open_active_plan_advisor(self) -> str:
+        return self._action_text("open_active_plan_advisor")
+
+    def show_advisor_status(self) -> str:
+        return self._action_text("show_advisor_status")
+
+    def open_task_detail(self, task_id: str) -> str:
+        return self._action_text("open_task_detail", args=task_id)
+
+    def open_task_detail_advisor(self, task_id: str) -> str:
+        return self._action_text("open_task_detail_advisor", args=task_id)
+
+    def open_task_drift_detail(self, task_id: str) -> str:
+        return self._action_text("open_task_drift_detail", args=task_id)
+
+    def open_phase_local_execution_task(self, task_id: str = "") -> str:
+        return self._action_text("open_phase_local_execution_task", args=task_id)
+
+    def open_phase_local_recent_drift_task(self, task_id: str = "") -> str:
+        return self._action_text("open_phase_local_recent_drift_task", args=task_id)
+
+    def focus_active_plan_timeline_task(self, task_id: str) -> str:
+        return self._action_text("focus_active_plan_timeline_task", args=task_id)
+
+    def clear_active_plan_timeline_focus(self) -> str:
+        return self._action_text("clear_active_plan_timeline_focus")
 
     def describe_provider(self) -> str:
         return self._view_text("provider")
@@ -319,6 +922,26 @@ class RemoteSessionProxy:
         self.state.messages = []
         self.state.context_summary = None
 
+    def clear_session_reset(self) -> str:
+        result = self.client.request(
+            "session.action",
+            {"session_id": self.session_id, "action": "clear_session_reset"},
+        )
+        old_session_id = self.session_id
+        new_session_id = str(result.get("session_id") or old_session_id)
+        self.session_id = new_session_id
+        self.state.session_id = new_session_id
+        self.state.messages = []
+        self.state.context_summary = None
+        self._symbol_surface = None
+        self._working_set_metadata = {}
+        self._task_detail_cache.clear()
+        self._sync_from_describe()
+        text = str(result.get("text", ""))
+        if old_session_id != new_session_id and text:
+            return text
+        return text
+
     def reload_project_context(self) -> str:
         return self._action_text("reload_project_context")
 
@@ -327,6 +950,72 @@ class RemoteSessionProxy:
 
     def redo_last_undo(self, args: str = "") -> str:
         return self._action_text("redo_last_undo", args=args)
+
+    def workspace_cleanup_preview(self) -> str:
+        return self._action_text("workspace_cleanup_preview")
+
+    def symbol_surface_primary_action(self) -> str:
+        return self._action_text("symbol_surface_open_primary")
+
+    def symbol_surface_secondary_action(self) -> str:
+        return self._action_text("symbol_surface_open_secondary")
+
+    def clear_symbol_surface(self) -> str:
+        return self._action_text("clear_symbol_surface")
+
+    def symbol_surface_select_next_match(self) -> str:
+        return self._action_text("symbol_surface_select_next_match")
+
+    def symbol_surface_select_prev_match(self) -> str:
+        return self._action_text("symbol_surface_select_prev_match")
+
+    def symbol_surface_select_next_definition(self) -> str:
+        return self._action_text("symbol_surface_select_next_definition")
+
+    def symbol_surface_select_prev_definition(self) -> str:
+        return self._action_text("symbol_surface_select_prev_definition")
+
+    def symbol_surface_select_next_reference(self) -> str:
+        return self._action_text("symbol_surface_select_next_reference")
+
+    def symbol_surface_select_prev_reference(self) -> str:
+        return self._action_text("symbol_surface_select_prev_reference")
+
+    def workspace_cleanup_apply(self, args: str) -> str:
+        return self._action_text("workspace_cleanup_apply", args=args)
+
+    def workspace_repair(self, args: str) -> str:
+        return self._action_text("workspace_repair", args=args)
+
+    def checklist_mark_in_progress(self, args: str) -> str:
+        return self._action_text("checklist_mark_in_progress", args=args)
+
+    def checklist_mark_completed(self, args: str) -> str:
+        return self._action_text("checklist_mark_completed", args=args)
+
+    def checklist_reopen(self, args: str) -> str:
+        return self._action_text("checklist_reopen", args=args)
+
+    def checklist_set_owner(self, args: str, value: str) -> str:
+        return self._action_text("checklist_set_owner", args=args, value=value)
+
+    def checklist_set_subject(self, args: str, value: str) -> str:
+        return self._action_text("checklist_set_subject", args=args, value=value)
+
+    def checklist_set_description(self, args: str, value: str) -> str:
+        return self._action_text("checklist_set_description", args=args, value=value)
+
+    def checklist_set_metadata(self, args: str, value: str) -> str:
+        return self._action_text("checklist_set_metadata", args=args, value=value)
+
+    def checklist_set_active_form(self, args: str, value: str) -> str:
+        return self._action_text("checklist_set_active_form", args=args, value=value)
+
+    def checklist_set_blocks(self, args: str, value: str) -> str:
+        return self._action_text("checklist_set_blocks", args=args, value=value)
+
+    def checklist_set_blocked_by(self, args: str, value: str) -> str:
+        return self._action_text("checklist_set_blocked_by", args=args, value=value)
 
     def recent_change_entries(self, limit: int = 5) -> list[str]:
         result = self.client.request(
@@ -406,7 +1095,20 @@ class RemoteSessionProxy:
             {"session_id": self.session_id, "action": action, **params},
         )
         self._sync_from_describe()
+        self._task_detail_cache.clear()
         return str(result.get("text", ""))
+
+    def _task_detail_view_result(self, task_id: str, *, force: bool = False) -> dict[str, Any]:
+        if not force:
+            cached = self._task_detail_cache.get(task_id)
+            if cached is not None:
+                return dict(cached)
+        result = self.client.request(
+            "session.view",
+            {"session_id": self.session_id, "view": "task_detail", "task_id": task_id},
+        )
+        self._task_detail_cache[task_id] = dict(result)
+        return dict(result)
 
     def _sync_metadata(self, result: dict[str, Any]) -> None:
         message_count = result.get("message_count")
@@ -414,10 +1116,213 @@ class RemoteSessionProxy:
             self.state.messages = [{} for _ in range(message_count)]
         context_summary = result.get("context_summary")
         self.state.context_summary = str(context_summary) if context_summary else None
+        self._sync_working_set_metadata(result)
 
     def _sync_from_describe(self) -> None:
         described = self.client.request("session.describe", {"session_id": self.session_id})
+        if isinstance(described.get("session_id"), str) and described["session_id"]:
+            self.session_id = str(described["session_id"])
+            self.state.session_id = self.session_id
         self.state.messages = [{} for _ in range(int(described.get("message_count", 0)))]
+        self._sync_workspace_metadata(described)
+        self._sync_execution_contract_metadata(described)
+        self._sync_task_surface_counts(described)
+        self._sync_checklist_duplicate_guard_metadata(described)
+        self._sync_symbol_surface_metadata(described)
+        self._sync_working_set_metadata(described)
+
+    def _sync_workspace_metadata(self, payload: dict[str, Any]) -> None:
+        self.state.original_cwd = (
+            str(payload.get("original_cwd"))
+            if payload.get("original_cwd") is not None
+            else self.state.original_cwd
+        )
+        self.state.effective_cwd = (
+            str(payload.get("effective_cwd"))
+            if payload.get("effective_cwd") is not None
+            else self.state.effective_cwd
+        )
+        if payload.get("workspace_mode") is not None:
+            self.state.workspace_mode = str(payload.get("workspace_mode") or "main")
+        self.state.workspace_label = (
+            str(payload.get("workspace_label"))
+            if payload.get("workspace_label") is not None
+            else None
+        )
+        self.state.workspace_created_at = (
+            str(payload.get("workspace_created_at"))
+            if payload.get("workspace_created_at") is not None
+            else None
+        )
+        self.state.workspace_health = str(payload.get("workspace_health", "healthy") or "healthy")
+        self.state.workspace_cleanup_status = str(payload.get("workspace_cleanup_status", "none") or "none")
+        self.state.workspace_cleanup_error = (
+            str(payload.get("workspace_cleanup_error"))
+            if payload.get("workspace_cleanup_error") is not None
+            else None
+        )
+        self.state.workspace_unavailable = bool(payload.get("workspace_unavailable", False))
+        self.state.workspace_unavailable_reason = (
+            str(payload.get("workspace_unavailable_reason"))
+            if payload.get("workspace_unavailable_reason") is not None
+            else None
+        )
+        self.state.workspace_fallback_cwd = (
+            str(payload.get("workspace_fallback_cwd"))
+            if payload.get("workspace_fallback_cwd") is not None
+            else None
+        )
+        self._workspace_action_bundle = {
+            "primary_action": str(payload.get("workspace_primary_action") or "none"),
+            "secondary_action": str(payload.get("workspace_secondary_action") or "none"),
+            "tertiary_action": str(payload.get("workspace_tertiary_action") or "/workspaces list"),
+            "target": str(payload.get("workspace_action_target") or self.session_id),
+            "workspace_health": self.state.workspace_health,
+        }
+
+    def _sync_symbol_surface_metadata(self, payload: dict[str, Any]) -> None:
+        surface_kind = payload.get("symbol_surface_kind")
+        if surface_kind in {None, "", "none"}:
+            self._symbol_surface = None
+            return
+        self._symbol_surface = {
+            "surface_kind": str(surface_kind),
+            "selected_symbol": str(payload.get("symbol_selected_symbol") or ""),
+            "match_count": int(payload.get("symbol_match_count") or 0),
+            "definition_count": int(payload.get("symbol_definition_count") or 0),
+            "reference_count": int(payload.get("symbol_reference_count") or 0),
+            "selected_match_index": payload.get("symbol_selected_match_index"),
+            "selected_definition_index": payload.get("symbol_selected_definition_index"),
+            "selected_reference_index": payload.get("symbol_selected_reference_index"),
+            "matches": [dict(item) for item in payload.get("symbol_matches", []) if isinstance(item, dict)],
+            "definitions": [
+                dict(item) for item in payload.get("symbol_definitions", []) if isinstance(item, dict)
+            ],
+            "references": [
+                dict(item) for item in payload.get("symbol_references", []) if isinstance(item, dict)
+            ],
+            "selected_definition": (
+                dict(payload.get("symbol_selected_definition"))
+                if isinstance(payload.get("symbol_selected_definition"), dict)
+                else None
+            ),
+            "selected_reference": (
+                dict(payload.get("symbol_selected_reference"))
+                if isinstance(payload.get("symbol_selected_reference"), dict)
+                else None
+            ),
+            "selected_navigation_target": (
+                dict(payload.get("symbol_navigation_target"))
+                if isinstance(payload.get("symbol_navigation_target"), dict)
+                else None
+            ),
+            "symbol_primary_action": str(payload.get("symbol_primary_action") or "none"),
+            "symbol_secondary_action": str(payload.get("symbol_secondary_action") or "none"),
+            "symbol_tertiary_action": str(payload.get("symbol_tertiary_action") or "/symbol clear"),
+            "symbol_action_target": str(payload.get("symbol_action_target") or ""),
+        }
+
+    def _sync_working_set_metadata(self, payload: dict[str, Any]) -> None:
+        self._working_set_metadata = self._extract_file_context_payload(payload)
+
+    def _extract_file_context_payload(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "file_context_scope": str(
+                payload.get("file_context_scope")
+                or payload.get("working_set_scope")
+                or "session"
+            ),
+            "file_context_file_count": int(
+                payload.get("file_context_file_count", payload.get("working_set_file_count", 0)) or 0
+            ),
+            "file_context_sources": [
+                str(item)
+                for item in (
+                    payload.get("file_context_sources")
+                    or payload.get("working_set_sources")
+                    or []
+                )
+                if str(item).strip()
+            ],
+            "file_context_files": [
+                dict(item)
+                for item in (
+                    payload.get("file_context_files")
+                    or payload.get("working_set_files")
+                    or []
+                )
+                if isinstance(item, dict)
+            ],
+            "file_context_primary_path": payload.get(
+                "file_context_primary_path",
+                payload.get("working_set_primary_path"),
+            ),
+            "file_context_primary_target": payload.get(
+                "file_context_primary_target",
+                payload.get("working_set_primary_target"),
+            ),
+            "file_context_primary_diff_targets": payload.get(
+                "file_context_primary_diff_targets",
+                payload.get("working_set_primary_diff_targets"),
+            ),
+        }
+
+    def _sync_execution_contract_metadata(self, payload: dict[str, Any]) -> None:
+        self.state.session_execution_mode = str(
+            payload.get("session_execution_mode", self.state.session_execution_mode or "main") or "main"
+        )
+        self.state.session_command_policy_name = (
+            str(payload.get("session_command_policy_name"))
+            if payload.get("session_command_policy_name") is not None
+            else None
+        )
+        self.state.session_command_policy_source = (
+            str(payload.get("session_command_policy_source"))
+            if payload.get("session_command_policy_source") is not None
+            else None
+        )
+        self.state.session_command_policy_allowed_tool_names = [
+            str(item)
+            for item in payload.get("session_command_policy_allowed_tool_names", [])
+            if item is not None
+        ]
+        self.state.session_command_policy_allowed_bash_prefixes = [
+            str(item)
+            for item in payload.get("session_command_policy_allowed_bash_prefixes", [])
+            if item is not None
+        ]
+        self.state.session_command_policy_require_read_only_subagents = bool(
+            payload.get("session_command_policy_require_read_only_subagents", False)
+        )
+
+    def _sync_checklist_duplicate_guard_metadata(self, payload: dict[str, Any]) -> None:
+        guard = payload.get("checklist_duplicate_guard")
+        if isinstance(guard, dict) and guard:
+            self._checklist_duplicate_guard = dict(guard)
+            return
+        message = str(payload.get("checklist_duplicate_message") or "").strip()
+        matched_task_id = str(payload.get("checklist_duplicate_matched_task_id") or "").strip()
+        recommended_action = str(payload.get("checklist_duplicate_recommended_action") or "").strip()
+        if not any((message, matched_task_id, recommended_action)):
+            self._checklist_duplicate_guard = None
+            return
+        self._checklist_duplicate_guard = {
+            "message": message,
+            "matched_task_id": matched_task_id,
+            "recommended_action": recommended_action,
+        }
+
+    def _sync_task_surface_counts(self, payload: dict[str, Any]) -> None:
+        raw = payload.get("task_surface_counts")
+        if not isinstance(raw, dict):
+            return
+        normalized: dict[str, int] = {}
+        for key, value in raw.items():
+            try:
+                normalized[str(key)] = int(value)
+            except (TypeError, ValueError):
+                continue
+        self._task_surface_counts = normalized
 
     def _handle_notification(self, payload: dict[str, Any]) -> None:
         notification = str(payload.get("notification") or "")
@@ -427,12 +1332,19 @@ class RemoteSessionProxy:
         seq = payload.get("seq")
         if isinstance(seq, int):
             self._event_cursor = seq
-        if notification in {"session.approval_required", "session.approval_resolved"}:
+        if notification in {
+            "session.approval_required",
+            "session.approval_resolved",
+            "session.question_required",
+            "session.question_resolved",
+        }:
             self._ingest_control_event(event_payload)
             return
         event = _runtime_event_from_payload(event_payload)
         if event is None:
             return
+        if event.kind == "task_progress" and event.task_id:
+            self._task_detail_cache.pop(event.task_id, None)
         sinks = []
         with self._sink_lock:
             if self._default_live_sink is not None:
@@ -473,6 +1385,19 @@ class RemoteSessionProxy:
         self.pending_approval = _approval_request_from_payload(approval)
         self.pending_approval_id = int(result.get("approval_id", 0))
 
+    def _sync_pending_question(self) -> None:
+        result = self.client.request(
+            "session.question_status",
+            {"session_id": self.session_id},
+        )
+        if not result.get("pending"):
+            self.pending_question = None
+            self.pending_question_id = None
+            return
+        payload = result.get("question_request") or {}
+        self.pending_question = _question_request_from_payload(payload)
+        self.pending_question_id = int(result.get("question_id", 0))
+
     def _ingest_control_event(self, event_payload: dict[str, Any]) -> None:
         kind = event_payload.get("kind")
         if kind == "approval_required":
@@ -490,6 +1415,22 @@ class RemoteSessionProxy:
             self.pending_approval_id = None
             if self._approval_resolved_handler is not None:
                 self._approval_resolved_handler(result)
+            return
+        if kind == "question_required":
+            payload = event_payload.get("question_request") or {}
+            self.pending_question = _question_request_from_payload(payload)
+            question_id = event_payload.get("question_id")
+            self.pending_question_id = int(question_id) if question_id is not None else None
+            if self._question_requested_handler is not None and self.pending_question is not None:
+                self._question_requested_handler(self.pending_question)
+            return
+        if kind == "question_resolved":
+            payload = event_payload.get("question_response") or {}
+            result = _question_response_from_payload(payload)
+            self.pending_question = None
+            self.pending_question_id = None
+            if self._question_resolved_handler is not None:
+                self._question_resolved_handler(result)
 
     def _handle_local_repl_command(self, prompt: str) -> tuple[bool, str | CommandExecution | None] | None:
         raw = prompt.strip()
@@ -501,6 +1442,8 @@ class RemoteSessionProxy:
             return True, self.resolve_pending_approval(ApprovalResult(decision="allow", scope="session"))
         if raw == "/deny":
             return True, self.resolve_pending_approval(ApprovalResult(decision="deny", scope="once"))
+        if raw == "/cancel-question":
+            return True, self.resolve_pending_question(UserQuestionResponse(canceled=True))
         return None
 
     def _wait_for_pending_approval(self, *, timeout_sec: float) -> None:
@@ -508,6 +1451,14 @@ class RemoteSessionProxy:
         while time() < deadline:
             self._sync_pending_approval()
             if self.pending_approval is not None and self.pending_approval_id is not None:
+                return
+            sleep(0.05)
+
+    def _wait_for_pending_question(self, *, timeout_sec: float) -> None:
+        deadline = time() + timeout_sec
+        while time() < deadline:
+            self._sync_pending_question()
+            if self.pending_question is not None and self.pending_question_id is not None:
                 return
             sleep(0.05)
 
@@ -523,6 +1474,12 @@ def _approval_request_from_payload(payload: dict[str, Any]) -> ApprovalRequest:
             else None
         ),
         details=str(payload.get("details", "")),
+        command=str(payload.get("command", "")),
+        target_paths=tuple(str(item) for item in payload.get("target_paths", []) if isinstance(item, str)),
+        permission_rules=tuple(
+            str(item) for item in payload.get("permission_rules", []) if isinstance(item, str)
+        ),
+        decision_reason=str(payload.get("decision_reason", "")),
     )
 
 
@@ -530,4 +1487,37 @@ def _approval_result_from_payload(payload: dict[str, Any]) -> ApprovalResult:
     return ApprovalResult(
         decision=str(payload.get("decision", "deny")),
         scope=str(payload.get("scope", "once")),
+    )
+
+
+def _question_request_from_payload(payload: dict[str, Any]) -> UserQuestionRequest:
+    questions: list[UserQuestion] = []
+    for item in payload.get("questions", []):
+        if not isinstance(item, dict):
+            continue
+        questions.append(
+            UserQuestion(
+                header=str(item.get("header", "")),
+                question=str(item.get("question", "")),
+                multi_select=bool(item.get("multi_select", False)),
+                options=tuple(
+                    QuestionOption(
+                        label=str(option.get("label", "")),
+                        description=str(option.get("description", "")),
+                    )
+                    for option in item.get("options", [])
+                    if isinstance(option, dict)
+                ),
+            )
+        )
+    return UserQuestionRequest(questions=tuple(questions))
+
+
+def _question_response_from_payload(payload: dict[str, Any]) -> UserQuestionResponse:
+    answers = payload.get("answers") or {}
+    if not isinstance(answers, dict):
+        answers = {}
+    return UserQuestionResponse(
+        answers={str(key): str(value) for key, value in answers.items()},
+        canceled=bool(payload.get("canceled", False)),
     )

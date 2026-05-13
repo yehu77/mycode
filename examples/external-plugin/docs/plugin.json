@@ -1,0 +1,17 @@
+{
+  "name": "docs",
+  "description": "Example project-local external plugin.",
+  "version": "0.1.0",
+  "skills": [
+    {
+      "name": "docs-style",
+      "description": "Use stable user-facing terminology in documentation.",
+      "content": "Prefer stable user-facing terminology. Keep docs concise, concrete, and implementation-aware.",
+      "auto_enable": true,
+      "tags": [
+        "docs",
+        "style"
+      ]
+    }
+  ]
+}

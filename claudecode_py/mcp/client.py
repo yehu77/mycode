@@ -6,10 +6,14 @@ from typing import Any, Protocol
 from .models import (
     McpCallToolResult,
     McpInitializeResult,
+    McpReadResourceResult,
+    McpResource,
     McpServerConfig,
     McpTool,
     parse_call_tool_result,
     parse_initialize_result,
+    parse_mcp_resource,
+    parse_read_resource_result,
     parse_mcp_tool,
 )
 
@@ -69,6 +73,22 @@ class McpClient:
             ),
         )
         return parse_call_tool_result(payload)
+
+    def list_resources(self) -> list[McpResource]:
+        self._require_initialized()
+        payload = _extract_result("resources/list", self.transport.request("resources/list", {}))
+        return [
+            parse_mcp_resource(self.config.name, item)
+            for item in payload.get("resources", [])
+        ]
+
+    def read_resource(self, uri: str) -> McpReadResourceResult:
+        self._require_initialized()
+        payload = _extract_result(
+            "resources/read",
+            self.transport.request("resources/read", {"uri": uri}),
+        )
+        return parse_read_resource_result(payload)
 
     def _require_initialized(self) -> None:
         if not self.initialized:

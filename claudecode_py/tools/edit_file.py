@@ -4,7 +4,7 @@ from difflib import get_close_matches, unified_diff
 
 from ..permissions import ApprovalRequest
 from ..state import WorkspaceFileChange
-from .base import BaseTool, render_diff_preview, render_pending_preview, resolve_workspace_path, truncate_detail_lines
+from .base import BaseTool, render_file_change_preview, resolve_workspace_path, workspace_change_to_approval
 
 
 class EditFileTool(BaseTool):
@@ -46,37 +46,39 @@ class EditFileTool(BaseTool):
             return request
         path = resolve_workspace_path(ctx.cwd, tool_input["path"])
         rel_path = path.relative_to(ctx.cwd).as_posix()
+        request.target_paths = (rel_path,)
         if not path.exists():
-            request.details = render_pending_preview(
-                "Pending file edit",
-                summary_lines=[
-                    f"path: {rel_path}",
-                    f"create_if_missing: {bool(tool_input.get('create_if_missing', False))}",
-                ],
+            change = WorkspaceFileChange(
+                path=rel_path,
+                existed_before=False,
+                before_content="",
+                after_content=None,
+                action_kind="create" if bool(tool_input.get("create_if_missing", False)) else "update",
+                change_mode="create_if_missing" if bool(tool_input.get("create_if_missing", False)) else "",
             )
+            request.details = render_file_change_preview(
+                [workspace_change_to_approval(change)],
+            )
+            request.details = request.details + "\npreview: target file does not exist yet"
             return request
         current = path.read_text(encoding="utf-8")
         try:
             updated, replacements, used_multi_edit = self._compute_updated_content(current, tool_input)
-            action = "multi-edit update" if used_multi_edit else "targeted replace"
-            request.details = render_pending_preview(
-                "Pending file edit",
-                summary_lines=[
-                    f"path: {rel_path}",
-                    f"action: {action}",
-                    f"replacements: {replacements}",
-                ],
-                sections=[("diff", render_diff_preview(rel_path, current, updated))],
+            change = WorkspaceFileChange(
+                path=rel_path,
+                existed_before=True,
+                before_content=current,
+                after_content=updated,
+                action_kind="update",
+                replacement_count=replacements,
+                change_mode="multi-edit update" if used_multi_edit else "targeted replace",
+            )
+            request.details = render_file_change_preview(
+                [workspace_change_to_approval(change)],
                 max_lines=20,
             )
         except Exception as exc:  # noqa: BLE001
-            request.details = render_pending_preview(
-                "Pending file edit",
-                summary_lines=[
-                    f"path: {rel_path}",
-                    f"preview unavailable: {type(exc).__name__}: {exc}",
-                ],
-            )
+            request.details = "Pending file changes\npreview: unavailable: " + f"{type(exc).__name__}: {exc}"
         return request
 
     def execute(self, tool_input: dict, ctx):
@@ -97,17 +99,18 @@ class EditFileTool(BaseTool):
                 raise ValueError("create_if_missing requires new_text for initial file content.")
             path.write_text(top_level_new_text, encoding="utf-8")
             rel_path = path.relative_to(ctx.cwd).as_posix()
+            change = WorkspaceFileChange(
+                path=rel_path,
+                existed_before=False,
+                before_content="",
+                after_content=top_level_new_text,
+                action_kind="create",
+                change_mode="create_if_missing",
+            )
             ctx.session.record_workspace_change(
                 tool_name=self.name,
                 summary=f"Created {rel_path}",
-                file_changes=[
-                    WorkspaceFileChange(
-                        path=rel_path,
-                        existed_before=False,
-                        before_content="",
-                        after_content=top_level_new_text,
-                    )
-                ],
+                file_changes=[change],
             )
             return f"Created {rel_path}"
 
@@ -122,17 +125,19 @@ class EditFileTool(BaseTool):
             replacements=replacements,
             used_multi_edit=used_multi_edit,
         )
+        change = WorkspaceFileChange(
+            path=path.relative_to(ctx.cwd).as_posix(),
+            existed_before=True,
+            before_content=current,
+            after_content=updated,
+            action_kind="update",
+            replacement_count=replacements,
+            change_mode="multi-edit update" if used_multi_edit else "targeted replace",
+        )
         ctx.session.record_workspace_change(
             tool_name=self.name,
             summary=summary.splitlines()[0],
-            file_changes=[
-                WorkspaceFileChange(
-                    path=path.relative_to(ctx.cwd).as_posix(),
-                    existed_before=True,
-                    before_content=current,
-                    after_content=updated,
-                )
-            ],
+            file_changes=[change],
         )
         return summary
 
@@ -207,13 +212,15 @@ class EditFileTool(BaseTool):
         replacements: int,
         used_multi_edit: bool,
     ) -> str:
-        change_label = "Applied edits" if used_multi_edit else "Updated"
+        change_label = "Updated"
         summary = f"{change_label} {rel_path}"
         if replacements:
             summary += f" ({replacements} replacement"
             if replacements != 1:
                 summary += "s"
             summary += ")"
+        if used_multi_edit:
+            summary += " [multi-edit]"
 
         diff_lines = list(
             unified_diff(

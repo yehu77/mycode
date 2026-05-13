@@ -38,6 +38,8 @@ def run_query_loop(
     start_constraint_source = session.state.constraint_source
     start_constraint_reason = session.state.constraint_reason
     start_constraint_trigger_count = session.state.constraint_trigger_count
+    execution_task_id: str | None = None
+    plan_drifted = False
 
     try:
         session.clear_execution_constraint()
@@ -56,6 +58,16 @@ def run_query_loop(
         active_plan = session.active_planning_artifact()
         if active_plan is not None:
             session.begin_plan_execution(active_plan)
+            execution_task_id = session.start_active_plan_execution_task(
+                prompt=prompt,
+                artifact=active_plan,
+            )
+            session.update_execution_task(
+                execution_task_id,
+                "Reviewing user request under active plan",
+                plan_execution_phase="planning",
+                plan_status="on-plan",
+            )
             sink(
                 RuntimeEvent(
                     kind="plan_execution",
@@ -99,6 +111,14 @@ def run_query_loop(
                 )
                 if _should_request_main_model_revision(review):
                     write_constraints_active = True
+                    if execution_task_id is not None:
+                        session.update_execution_task(
+                            execution_task_id,
+                            "Revising initial plan after advisor review",
+                            plan_execution_phase="revising",
+                            plan_status="on-plan",
+                            constraint_source=f"initial_plan_{review.status}",
+                        )
                     session.activate_execution_constraint(
                         mode="read-only",
                         source=f"initial_plan_{review.status}",
@@ -138,7 +158,18 @@ def run_query_loop(
                     active_plan=active_plan,
                 )
                 if _should_request_main_model_revision(review):
+                    plan_drifted = True
                     write_constraints_active = True
+                    if execution_task_id is not None:
+                        session.update_execution_task(
+                            execution_task_id,
+                            "Revising work after plan drift review",
+                            plan_execution_phase="revising",
+                            plan_status="drifted",
+                            drift_status=review.status,
+                            drift_reason=review.reason or "Advisor detected drift from the active plan.",
+                            constraint_source=f"plan_drift_{review.status}",
+                        )
                     session.activate_execution_constraint(
                         mode="read-only",
                         source=f"plan_drift_{review.status}",
@@ -177,6 +208,15 @@ def run_query_loop(
                         assistant_message["content"] = [{"type": "text", "text": revised_text}]
                 if final_text and not streamed_text:
                     sink(RuntimeEvent(kind="assistant_text", message=final_text))
+                if execution_task_id is not None:
+                    session.complete_execution_task(
+                        execution_task_id,
+                        final_text or "(no output)",
+                        plan_execution_phase="completed",
+                        plan_status="drifted" if plan_drifted else "on-plan",
+                        drift_status=session.state.last_plan_drift_status if plan_drifted else None,
+                        constraint_source=session.state.constraint_source,
+                    )
                 return final_text
             if response.text and not streamed_text:
                 sink(RuntimeEvent(kind="assistant_text", message=response.text))
@@ -199,6 +239,14 @@ def run_query_loop(
                 )
                 if _should_request_main_model_revision(review):
                     write_constraints_active = True
+                    if execution_task_id is not None:
+                        session.update_execution_task(
+                            execution_task_id,
+                            "Holding write tools until advisor concerns are resolved",
+                            plan_execution_phase="revising",
+                            plan_status="drifted" if plan_drifted else "on-plan",
+                            constraint_source=f"before_write_{review.status}",
+                        )
                     session.activate_execution_constraint(
                         mode="read-only",
                         source=f"before_write_{review.status}",
@@ -224,6 +272,14 @@ def run_query_loop(
                     continue
                 session.clear_execution_constraint()
                 write_constraints_active = False
+                if execution_task_id is not None:
+                    session.update_execution_task(
+                        execution_task_id,
+                        "Advisor approved tool execution under active plan",
+                        plan_execution_phase="tool_loop",
+                        plan_status="drifted" if plan_drifted else "on-plan",
+                        constraint_source=None,
+                    )
 
             tool_rounds += 1
             if tool_rounds > session.config.max_tool_rounds_per_turn:
@@ -238,6 +294,13 @@ def run_query_loop(
                     message=f"calling {len(response.tool_calls)} tool(s): {tool_names}",
                 )
             )
+            if execution_task_id is not None:
+                session.update_execution_task(
+                    execution_task_id,
+                    f"Running tool round under active plan: {tool_names}",
+                    plan_execution_phase="tool_loop",
+                    plan_status="drifted" if plan_drifted else "on-plan",
+                )
 
             with _turn_execution_scope(session, write_constraints_active=write_constraints_active):
                 tool_result_blocks = session.execute_tool_calls(
@@ -263,7 +326,16 @@ def run_query_loop(
                     message=f"received {len(tool_result_blocks)} tool result block(s); continuing assistant response",
                 )
             )
-    except Exception:
+    except Exception as exc:
+        if execution_task_id is not None:
+            session.fail_execution_task(
+                execution_task_id,
+                f"{type(exc).__name__}: {exc}",
+                plan_execution_phase="failed",
+                plan_status="drifted" if plan_drifted else "on-plan",
+                drift_status=session.state.last_plan_drift_status if plan_drifted else None,
+                constraint_source=session.state.constraint_source,
+            )
         del session.state.messages[start_message_count:]
         session.state.context_summary = start_context_summary
         session.state.plan_execution_count = start_plan_execution_count
@@ -731,6 +803,8 @@ def _turn_execution_scope(session: "Session", *, write_constraints_active: bool)
             "dir",
         ),
         require_read_only_subagents=True,
+        command_policy_name="read-only-turn",
+        command_policy_source="advisor-read-only-scope",
     )
 
 
@@ -748,37 +822,4 @@ def _enforce_message_budget(session: "Session", sink: EventSink) -> None:
 
 
 def _compact_history(session: "Session", sink: EventSink) -> None:
-    keep_last = max(
-        1,
-        min(session.config.history_keep_last_messages, session.config.max_history_messages),
-    )
-    messages = session.state.messages
-    if len(messages) <= keep_last:
-        return
-
-    compacted_messages = messages[:-keep_last]
-    session.state.messages = messages[-keep_last:]
-
-    compacted_lines = []
-    for index, message in enumerate(compacted_messages, start=1):
-        compacted_lines.append(
-            f"- {index}. {message.get('role', 'unknown')}: {session._summarize_message(message)}"
-        )
-    new_summary = "Earlier conversation summary:\n" + "\n".join(compacted_lines)
-
-    existing_summary = session.state.context_summary or ""
-    merged_summary = f"{existing_summary}\n\n{new_summary}".strip() if existing_summary else new_summary
-    max_chars = session.config.max_context_summary_chars
-    if len(merged_summary) > max_chars:
-        kept_tail = max_chars - len("[older compacted context truncated]\n")
-        merged_summary = "[older compacted context truncated]\n" + merged_summary[-kept_tail:]
-    session.state.context_summary = merged_summary
-    sink(
-        RuntimeEvent(
-            kind="context_compacted",
-            message=(
-                f"compacted {len(compacted_messages)} messages into context_summary; "
-                f"kept last {len(session.state.messages)} messages"
-            ),
-        )
-    )
+    session.apply_history_compaction(persist=False, sink=sink)

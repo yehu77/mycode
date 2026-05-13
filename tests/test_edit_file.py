@@ -75,7 +75,7 @@ class EditFileToolTests(unittest.TestCase):
                 ctx,
             )
 
-            self.assertIn("Applied edits demo.txt (3 replacements)", result)
+            self.assertIn("Updated demo.txt (3 replacements) [multi-edit]", result)
             self.assertEqual(target.read_text(encoding="utf-8"), "start B gamma B\n")
         finally:
             if cwd.exists():
@@ -101,11 +101,13 @@ class EditFileToolTests(unittest.TestCase):
                 {"path": "demo.txt", "old_text": "world", "new_text": "agent"},
                 ctx,
             )
-            self.assertIn("Pending file edit", request.details)
-            self.assertIn("path: demo.txt", request.details)
-            self.assertIn("action: targeted replace", request.details)
+            self.assertIn("Pending file changes", request.details)
+            self.assertIn("files: 1", request.details)
+            self.assertIn("update: 1", request.details)
+            self.assertIn("[file demo.txt]", request.details)
+            self.assertIn("action: update", request.details)
+            self.assertIn("mode: targeted replace", request.details)
             self.assertIn("replacements: 1", request.details)
-            self.assertIn("[diff]", request.details)
             self.assertIn("--- a/demo.txt", request.details)
             self.assertIn("+++ b/demo.txt", request.details)
             self.assertIn("-hello world", request.details)

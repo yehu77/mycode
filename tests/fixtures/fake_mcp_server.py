@@ -44,7 +44,7 @@ while True:
                 "result": {
                     "protocolVersion": "2024-11-05",
                     "serverInfo": {"version": "0.0.1"},
-                    "capabilities": {"tools": {}},
+                    "capabilities": {"tools": {}, "resources": {}},
                 },
             }
         )
@@ -64,6 +64,24 @@ while True:
                                 "properties": {"text": {"type": "string"}},
                                 "required": ["text"],
                             },
+                        }
+                    ]
+                },
+            }
+        )
+        continue
+    if method == "resources/list":
+        _write_message(
+            {
+                "jsonrpc": "2.0",
+                "id": msg_id,
+                "result": {
+                    "resources": [
+                        {
+                            "uri": "docs://guide",
+                            "name": "Guide",
+                            "mimeType": "text/plain",
+                            "description": "Example guide text",
                         }
                     ]
                 },

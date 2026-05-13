@@ -6,6 +6,7 @@ from time import perf_counter
 from typing import Any
 
 from ..models import ToolCall
+from ..permission_display import PermissionDisplayContext, render_permission_display_compact
 from ..permissions import PermissionDeniedError
 from ..tools.base import BaseTool, ToolContext, format_tool_output
 from .events import EventSink, RuntimeEvent, null_sink, summarize_tool_input
@@ -80,8 +81,12 @@ class ToolOrchestrator:
             )
         )
         started = perf_counter()
+        request = tool.approval_request(call.input, ctx)
         try:
-            ctx.permission_manager.require_approval(tool.approval_request(call.input, ctx))
+            validator = getattr(ctx.session, "validate_tool_call_policy", None)
+            if validator is not None:
+                validator(tool.name, call.input)
+            ctx.permission_manager.require_approval(request)
             result = tool.execute(call.input, ctx)
             duration_ms = int((perf_counter() - started) * 1000)
             sink(
@@ -96,6 +101,31 @@ class ToolOrchestrator:
             return ToolExecutionResult(call.id, format_tool_output(result))
         except PermissionDeniedError as exc:
             duration_ms = int((perf_counter() - started) * 1000)
+            permission_context = PermissionDisplayContext(
+                decision_reason=request.decision_reason or "",
+                permission_rules=request.permission_rules,
+                command_mode_name=request.command_mode_name or "",
+                command_mode_source=request.command_mode_source or "",
+                command_mode_allowed_prefixes=request.command_mode_allowed_prefixes,
+                command_mode_violating_segment=request.command_mode_violating_segment or "",
+                command_mode_violating_segment_index=request.command_mode_violating_segment_index,
+                command_mode_complex_features=request.command_mode_complex_features,
+            )
+            result_text = str(exc)
+            detail = render_permission_display_compact(permission_context)
+            if detail:
+                result_text += f" [{detail}]"
+            event_kwargs: dict[str, Any] = {
+                "decision_reason": request.decision_reason or None,
+                "permission_rules": request.permission_rules,
+                "command_mode_name": request.command_mode_name or None,
+                "command_mode_allowed_prefixes": request.command_mode_allowed_prefixes,
+                "command_mode_violating_segment": (
+                    request.command_mode_violating_segment or None
+                ),
+                "command_mode_violating_segment_index": request.command_mode_violating_segment_index,
+                "command_mode_complex_features": request.command_mode_complex_features,
+            }
             sink(
                 RuntimeEvent(
                     kind="tool_failed",
@@ -104,9 +134,10 @@ class ToolOrchestrator:
                     tool_call_id=call.id,
                     duration_ms=duration_ms,
                     is_error=True,
+                    **event_kwargs,
                 )
             )
-            return ToolExecutionResult(call.id, str(exc), True)
+            return ToolExecutionResult(call.id, result_text, True)
         except Exception as exc:  # noqa: BLE001
             duration_ms = int((perf_counter() - started) * 1000)
             error_text = f"{type(exc).__name__}: {exc}"

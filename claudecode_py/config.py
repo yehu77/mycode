@@ -24,6 +24,7 @@ class SessionConfig:
     api_key: str | None = None
     base_url: str | None = None
     mcp_config_path: Path | None = None
+    permission_config_path: Path | None = None
     max_agent_depth: int = 2
 
 
@@ -40,6 +41,7 @@ def load_config(
     api_key: str | None = None,
     base_url: str | None = None,
     mcp_config_path: str | None = None,
+    permission_config_path: str | None = None,
     model: str | None = None,
     max_tokens: int | None = None,
     max_turns: int | None = None,
@@ -63,6 +65,11 @@ def load_config(
         or os.getenv("PYCLAUDE_MCP_CONFIG")
         or (resolved_cwd / ".pyclaude" / "mcp_servers.json")
     ).resolve()
+    resolved_permission_config_path = Path(
+        permission_config_path
+        or os.getenv("PYCLAUDE_PERMISSION_CONFIG")
+        or (resolved_cwd / ".pyclaude" / "permissions.json")
+    ).resolve()
     return SessionConfig(
         cwd=resolved_cwd,
         transcript_cwd=resolved_cwd,
@@ -78,6 +85,7 @@ def load_config(
         or os.getenv("PYCLAUDE_BASE_URL")
         or (os.getenv("OPENAI_BASE_URL") if resolved_provider == "openai-compatible" else None),
         mcp_config_path=resolved_mcp_config_path,
+        permission_config_path=resolved_permission_config_path,
         model=resolved_model,
         max_tokens=max_tokens or int(os.getenv("PYCLAUDE_MAX_TOKENS", "4096")),
         max_turns=max_turns or int(os.getenv("PYCLAUDE_MAX_TURNS", "12")),

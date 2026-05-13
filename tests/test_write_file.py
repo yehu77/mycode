@@ -64,7 +64,7 @@ class WriteFileToolTests(unittest.TestCase):
                 ctx,
             )
 
-            self.assertEqual(result, "Overwrote demo.txt")
+            self.assertEqual(result, "Updated demo.txt")
             self.assertEqual(target.read_text(encoding="utf-8"), "new")
         finally:
             if cwd.exists():
@@ -90,10 +90,12 @@ class WriteFileToolTests(unittest.TestCase):
                 {"path": "demo.txt", "content": "new\n"},
                 ctx,
             )
-            self.assertIn("Pending file change", request.details)
-            self.assertIn("action: overwrite file", request.details)
-            self.assertIn("path: demo.txt", request.details)
-            self.assertIn("[diff]", request.details)
+            self.assertIn("Pending file changes", request.details)
+            self.assertIn("files: 1", request.details)
+            self.assertIn("update: 1", request.details)
+            self.assertIn("[file demo.txt]", request.details)
+            self.assertIn("action: update", request.details)
+            self.assertIn("mode: overwrite content", request.details)
             self.assertIn("--- a/demo.txt", request.details)
             self.assertIn("+++ b/demo.txt", request.details)
         finally:

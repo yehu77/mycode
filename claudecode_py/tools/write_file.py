@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from ..permissions import ApprovalRequest
 from ..state import WorkspaceFileChange
-from .base import BaseTool, render_diff_preview, render_pending_preview, resolve_workspace_path
+from .base import BaseTool, render_file_change_preview, resolve_workspace_path, workspace_change_to_approval
 
 
 class WriteFileTool(BaseTool):
@@ -37,11 +37,17 @@ class WriteFileTool(BaseTool):
         before = path.read_text(encoding="utf-8") if path.exists() else ""
         after = tool_input["content"]
         rel_path = path.relative_to(ctx.cwd).as_posix()
-        action = "create file" if not path.exists() else "overwrite file"
-        request.details = render_pending_preview(
-            "Pending file change",
-            summary_lines=[f"action: {action}", f"path: {rel_path}"],
-            sections=[("diff", render_diff_preview(rel_path, before, after))],
+        change = WorkspaceFileChange(
+            path=rel_path,
+            existed_before=path.exists(),
+            before_content=before,
+            after_content=after,
+            action_kind="create" if not path.exists() else "update",
+            change_mode="" if not path.exists() else "overwrite content",
+        )
+        request.target_paths = (rel_path,)
+        request.details = render_file_change_preview(
+            [workspace_change_to_approval(change)],
             max_lines=20,
         )
         return request
@@ -58,18 +64,18 @@ class WriteFileTool(BaseTool):
         before = path.read_text(encoding="utf-8") if existed else ""
         after = tool_input["content"]
         path.write_text(tool_input["content"], encoding="utf-8")
-        action = "Overwrote" if existed else "Created"
         rel_path = path.relative_to(ctx.cwd).as_posix()
+        change = WorkspaceFileChange(
+            path=rel_path,
+            existed_before=existed,
+            before_content=before,
+            after_content=after,
+            action_kind="create" if not existed else "update",
+            change_mode="" if not existed else "overwrite content",
+        )
         ctx.session.record_workspace_change(
             tool_name=self.name,
-            summary=f"{action} {rel_path}",
-            file_changes=[
-                WorkspaceFileChange(
-                    path=rel_path,
-                    existed_before=existed,
-                    before_content=before,
-                    after_content=after,
-                )
-            ],
+            summary=f"{'Created' if not existed else 'Updated'} {rel_path}",
+            file_changes=[change],
         )
-        return f"{action} {rel_path}"
+        return f"{'Created' if not existed else 'Updated'} {rel_path}"

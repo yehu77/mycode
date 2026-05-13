@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 import shutil
 import subprocess
@@ -13,8 +14,36 @@ VOLATILE_PYCLAUDE_DIRS = {"background_sessions", "sessions", "workspaces", "work
 @dataclass(slots=True, frozen=True)
 class IsolatedWorkspace:
     mode: str
+    label: str
     original_cwd: Path
     effective_cwd: Path
+    created_at: str
+
+
+@dataclass(slots=True, frozen=True)
+class OrphanedWorkspaceDiagnostic:
+    mode: str
+    label: str
+    path: Path
+
+
+def derive_workspace_health(
+    *,
+    workspace_mode: str,
+    workspace_cleanup_status: str,
+    workspace_unavailable: bool,
+    orphaned: bool = False,
+) -> str:
+    if orphaned:
+        return "orphaned"
+    if workspace_unavailable:
+        return "unavailable"
+    cleanup_status = str(workspace_cleanup_status or "none")
+    if cleanup_status == "failed":
+        return "cleanup_failed"
+    if cleanup_status == "pending" and workspace_mode in {"snapshot", "worktree"}:
+        return "cleanup_pending"
+    return "healthy"
 
 
 def get_workspace_snapshots_dir(cwd: Path) -> Path:
@@ -25,15 +54,49 @@ def get_workspace_worktrees_dir(cwd: Path) -> Path:
     return cwd / ".pyclaude" / "worktrees"
 
 
+def diagnose_orphaned_workspaces(
+    cwd: Path,
+    *,
+    referenced_paths: set[Path] | None = None,
+) -> list[OrphanedWorkspaceDiagnostic]:
+    root = cwd.resolve()
+    references = {_safe_resolve(path) for path in (referenced_paths or set()) if path is not None}
+    orphans: list[OrphanedWorkspaceDiagnostic] = []
+    for mode, parent in (
+        ("snapshot", get_workspace_snapshots_dir(root)),
+        ("worktree", get_workspace_worktrees_dir(root)),
+    ):
+        if not parent.exists():
+            continue
+        for child in parent.iterdir():
+            if not child.is_dir():
+                continue
+            resolved = _safe_resolve(child)
+            if resolved in references:
+                continue
+            orphans.append(
+                OrphanedWorkspaceDiagnostic(
+                    mode=mode,
+                    label=child.name,
+                    path=resolved,
+                )
+            )
+    orphans.sort(key=lambda item: (item.mode, str(item.path)))
+    return orphans
+
+
 def prepare_isolated_workspace(cwd: Path, *, label: str = "agent") -> IsolatedWorkspace:
     source = cwd.resolve()
     worktree = _create_git_worktree(source, label=label)
     if worktree is not None:
         return worktree
+    snapshot_label = f"{label}-{uuid4().hex[:8]}"
     return IsolatedWorkspace(
         mode="snapshot",
+        label=snapshot_label,
         original_cwd=source,
-        effective_cwd=create_workspace_snapshot(source, label=label),
+        effective_cwd=create_workspace_snapshot(source, label=snapshot_label),
+        created_at=_utc_now_iso(),
     )
 
 
@@ -50,11 +113,51 @@ def cleanup_isolated_workspace(workspace: IsolatedWorkspace) -> None:
         shutil.rmtree(target, ignore_errors=True)
 
 
-def create_workspace_snapshot(cwd: Path, *, label: str = "agent") -> Path:
+def cleanup_orphaned_workspace(original_cwd: Path, orphan: OrphanedWorkspaceDiagnostic) -> None:
+    cleanup_isolated_workspace(
+        IsolatedWorkspace(
+            mode=orphan.mode,
+            label=orphan.label,
+            original_cwd=original_cwd.resolve(),
+            effective_cwd=orphan.path,
+            created_at="",
+        )
+    )
+
+
+def repair_isolated_workspace(
+    original_cwd: Path,
+    *,
+    label: str,
+    preferred_mode: str,
+) -> IsolatedWorkspace:
+    source = original_cwd.resolve()
+    if preferred_mode == "worktree":
+        repaired_worktree = _create_git_worktree(source, label=label, preserve_label=True)
+        if repaired_worktree is not None:
+            return repaired_worktree
+    return IsolatedWorkspace(
+        mode="snapshot",
+        label=label,
+        original_cwd=source,
+        effective_cwd=create_workspace_snapshot(source, label=label, preserve_label=True),
+        created_at=_utc_now_iso(),
+    )
+
+
+def create_workspace_snapshot(
+    cwd: Path,
+    *,
+    label: str = "agent",
+    preserve_label: bool = False,
+) -> Path:
     source = cwd.resolve()
     snapshots_dir = get_workspace_snapshots_dir(source)
     snapshots_dir.mkdir(parents=True, exist_ok=True)
-    target = snapshots_dir / f"{label}-{uuid4().hex[:8]}"
+    target_name = label if preserve_label else f"{label}-{uuid4().hex[:8]}"
+    target = snapshots_dir / target_name
+    if target.exists():
+        shutil.rmtree(target, ignore_errors=True)
     shutil.copytree(
         source,
         target,
@@ -63,21 +166,31 @@ def create_workspace_snapshot(cwd: Path, *, label: str = "agent") -> Path:
     return target
 
 
-def _create_git_worktree(cwd: Path, *, label: str) -> IsolatedWorkspace | None:
+def _create_git_worktree(
+    cwd: Path,
+    *,
+    label: str,
+    preserve_label: bool = False,
+) -> IsolatedWorkspace | None:
     git_root = _git_root_for_workspace(cwd)
     if git_root is None or not _git_workspace_clean(git_root):
         return None
     worktrees_dir = get_workspace_worktrees_dir(cwd.resolve())
     worktrees_dir.mkdir(parents=True, exist_ok=True)
-    target = worktrees_dir / f"{label}-{uuid4().hex[:8]}"
+    worktree_label = label if preserve_label else f"{label}-{uuid4().hex[:8]}"
+    target = worktrees_dir / worktree_label
+    if target.exists():
+        shutil.rmtree(target, ignore_errors=True)
     result = _run_git(git_root, "worktree", "add", "--detach", str(target), "HEAD")
     if result.returncode != 0 or not target.exists():
         return None
     _copy_workspace_support_files(cwd.resolve(), target.resolve())
     return IsolatedWorkspace(
         mode="worktree",
+        label=worktree_label,
         original_cwd=cwd.resolve(),
         effective_cwd=target.resolve(),
+        created_at=_utc_now_iso(),
     )
 
 
@@ -174,3 +287,14 @@ def _is_workspace_target_safe(original_cwd: Path, target: Path, *, mode: str) ->
     except ValueError:
         return False
     return True
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(UTC).isoformat()
+
+
+def _safe_resolve(path: Path) -> Path:
+    try:
+        return path.resolve()
+    except OSError:
+        return path.absolute()

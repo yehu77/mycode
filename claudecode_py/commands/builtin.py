@@ -2,7 +2,25 @@ from __future__ import annotations
 
 import json
 
-from .local_commands import handle_plan_command
+from .local_commands import (
+    handle_add_dir_command,
+    handle_changes_command,
+    handle_compact_command,
+    handle_config_command,
+    handle_context_command,
+    handle_diff_command,
+    handle_files_command,
+    handle_history_command,
+    handle_model_command,
+    handle_permissions_command,
+    handle_plan_command,
+    handle_project_context_command,
+    handle_sessions_command,
+    handle_status_command,
+    handle_symbol_command,
+    handle_tasks_command,
+    handle_workspaces_command,
+)
 
 from .registry import CommandRegistry, ReplCommand
 
@@ -14,37 +32,92 @@ def build_core_commands() -> list[ReplCommand]:
         ReplCommand(
             "/model",
             "Show provider/model capability summary",
-            lambda session, args: session.describe_provider(),
+            lambda session, args: handle_model_command(session, args),
         ),
         ReplCommand(
             "/config",
             "Show current session configuration",
-            lambda session, args: session.describe_config(),
+            lambda session, args: handle_config_command(session, args),
         ),
         ReplCommand(
             "/history",
             "Show recent conversation history",
-            lambda session, args: session.describe_history(),
+            lambda session, args: handle_history_command(session, args),
+        ),
+        ReplCommand(
+            "/compact",
+            "Compact older conversation history into context summary, optionally with instructions",
+            lambda session, args: handle_compact_command(session, args),
+        ),
+        ReplCommand(
+            "/status",
+            "Show current local session overview",
+            lambda session, args: handle_status_command(session, args),
+        ),
+        ReplCommand(
+            "/context",
+            "Show current context usage",
+            lambda session, args: handle_context_command(session, args),
+        ),
+        ReplCommand(
+            "/add-dir",
+            "Add or inspect explicit local context paths",
+            lambda session, args: handle_add_dir_command(session, args),
+        ),
+        ReplCommand(
+            "/files",
+            "Inspect current file/workingset context",
+            lambda session, args: handle_files_command(session, args),
+        ),
+        ReplCommand(
+            "/diff",
+            "Inspect current diff-backed local work",
+            lambda session, args: handle_diff_command(session, args),
+        ),
+        ReplCommand(
+            "/project-context",
+            "Inspect current project memory, skills, plugins, and reload state",
+            lambda session, args: handle_project_context_command(session, args),
         ),
         ReplCommand(
             "/changes",
             "Show recent workspace changes recorded for undo",
-            lambda session, args: session.describe_recent_changes(),
+            lambda session, args: handle_changes_command(session, args),
         ),
         ReplCommand(
             "/sessions",
             "Show saved sessions in the workspace",
-            lambda session, args: session.describe_saved_sessions(),
+            lambda session, args: handle_sessions_command(session, args),
         ),
         ReplCommand(
             "/tasks",
             "Show background tasks",
-            lambda session, args: session.describe_tasks(),
+            lambda session, args: handle_tasks_command(session, args),
+        ),
+        ReplCommand(
+            "/workspaces",
+            "Inspect isolated workspace health, cleanup, or repair actions",
+            lambda session, args: handle_workspaces_command(session, args),
+        ),
+        ReplCommand(
+            "/symbol",
+            "Inspect current symbol surface or resolve locate/references/actions targets",
+            lambda session, args: handle_symbol_command(session, args),
+        ),
+        ReplCommand(
+            "/task",
+            "Show task detail: /task show <id>",
+            _task_command,
         ),
         ReplCommand(
             "/plan",
             "Inspect or manage planning artifacts",
             lambda session, args: handle_plan_command(session, args),
+        ),
+        ReplCommand(
+            "/permissions",
+            "Inspect or manage permission rules",
+            lambda session, args: handle_permissions_command(session, args),
         ),
         ReplCommand(
             "/mcp",
@@ -123,8 +196,8 @@ def build_core_commands() -> list[ReplCommand]:
         ),
         ReplCommand(
             "/clear",
-            "Clear in-memory conversation history for this session",
-            _clear_history,
+            "Clear local session state or start a fresh local session: /clear [history|changes|symbol|plan|session]",
+            _clear_command,
         ),
         ReplCommand(
             "/undo",
@@ -173,9 +246,57 @@ def _bind_help_command(commands: list[ReplCommand], registry: CommandRegistry) -
     return bound
 
 
-def _clear_history(session: "Session", _args: str) -> str:
-    session.clear_history()
-    return "Cleared in-memory conversation history for this session."
+def _clear_command(session: "Session", args: str) -> str:
+    raw = args.strip().lower()
+    if not raw or raw == "history":
+        session.clear_history()
+        return "Cleared conversation history only for this session."
+    if raw == "changes":
+        return session.clear_change_history()
+    if raw == "symbol":
+        return session.clear_symbol_surface()
+    if raw == "plan":
+        return session.clear_active_plan()
+    if raw == "session":
+        return str(session.clear_session_reset().get("text", ""))
+    return "Usage: /clear [history|changes|symbol|plan|session]"
+
+
+def _task_command(session: "Session", args: str) -> str:
+    raw = args.strip()
+    tokens = raw.split()
+    if len(tokens) < 2:
+        return "Usage: /task show <id> [file <n>] | /task advisor <id> | /task drift <id>"
+    verb = tokens[0].lower()
+    target = tokens[1].strip()
+    if not target:
+        return "Usage: /task show <id> [file <n>] | /task advisor <id> | /task drift <id>"
+    if verb == "show":
+        if len(tokens) == 2:
+            session.remember_task_context_focus(target, file_index=0, preserve_current_focus=True)
+            return session.describe_task_detail(target, preserve_current_focus=True)
+        if len(tokens) == 4 and tokens[2].lower() == "file" and tokens[3].isdigit() and int(tokens[3]) > 0:
+            task = session.resolve_task(target)
+            checklist_task = session.resolve_checklist_task(target) if task is None else None
+            if task is None and checklist_task is None:
+                return session.describe_task_detail(target)
+            payload = session.task_file_context_payload(target)
+            file_count = int(payload.get("file_context_file_count") or 0) if isinstance(payload, dict) else 0
+            selected_index = int(tokens[3]) - 1
+            if file_count <= 0 or selected_index >= file_count:
+                return "Usage: /task show <id> [file <n>] | /task advisor <id> | /task drift <id>"
+            session.remember_task_context_focus(target, file_index=selected_index, preserve_current_focus=False)
+            return session.describe_task_detail(target, file_index=selected_index, preserve_current_focus=False)
+        return "Usage: /task show <id> [file <n>] | /task advisor <id> | /task drift <id>"
+    if len(tokens) != 2:
+        return "Usage: /task show <id> [file <n>] | /task advisor <id> | /task drift <id>"
+    if verb == "advisor":
+        session.remember_task_context_focus(target, file_index=0, preserve_current_focus=True)
+        return session.open_task_detail_advisor(target)
+    if verb == "drift":
+        session.remember_task_context_focus(target, file_index=0, preserve_current_focus=True)
+        return session.open_task_drift_detail(target)
+    return "Usage: /task show <id> [file <n>] | /task advisor <id> | /task drift <id>"
 
 
 def _enable_skill(session: "Session", args: str) -> str:

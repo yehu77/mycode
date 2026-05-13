@@ -168,6 +168,114 @@ class QueryLoopTests(unittest.TestCase):
         self.assertLessEqual(len(session.state.messages), 4)
         self.assertTrue(any(event.kind == "context_compacted" for event in events))
 
+    def test_query_loop_injects_session_checklist_into_provider_prompt(self) -> None:
+        session = Session(
+            SessionConfig(
+                cwd=Path(__file__).resolve().parent,
+                interactive=False,
+            )
+        )
+        session.create_checklist_task(
+            subject="Inspect runtime",
+            description="Inspect session.py",
+            active_form="Inspecting runtime",
+            status="in_progress",
+        )
+
+        class FakeProvider:
+            def __init__(self) -> None:
+                self.capabilities = ProviderCapabilities(
+                    provider="fake",
+                    model="fake-model",
+                    supports_tool_calling=True,
+                    supports_streaming=False,
+                    supports_structured_output=False,
+                )
+                self.system_prompt = ""
+                self.user_text = ""
+
+            def create_message(self, *, messages, tools, system_prompt):
+                self.system_prompt = system_prompt
+                self.user_text = str(messages[-1]["content"][0]["text"])
+                return AssistantResponse(
+                    content=[{"type": "text", "text": "done"}],
+                    text="done",
+                    tool_calls=[],
+                )
+
+        provider = FakeProvider()
+        session.provider = provider
+
+        result = run_query_loop(session, "Fix the runtime")
+
+        self.assertEqual(result, "done")
+        self.assertIn("Session checklist guidance:", provider.system_prompt)
+        self.assertIn("Current session checklist:", provider.system_prompt)
+        self.assertIn("subject=Inspect runtime", provider.system_prompt)
+        self.assertIn("call session_task_list", provider.system_prompt)
+        self.assertIn("call session_task_get", provider.system_prompt)
+        self.assertIn("Session checklist to treat as active execution context:", provider.user_text)
+        self.assertIn("Call session_task_list before creating new checklist tasks", provider.user_text)
+        self.assertIn("Call session_task_get before updating a specific checklist task", provider.user_text)
+        self.assertIn("Current user request:", provider.user_text)
+        self.assertIn("Fix the runtime", provider.user_text)
+
+    def test_query_loop_injects_recent_checklist_duplicate_guard_into_provider_prompt(self) -> None:
+        session = Session(
+            SessionConfig(
+                cwd=Path(__file__).resolve().parent,
+                interactive=False,
+            )
+        )
+        created = session.create_checklist_task(
+            subject="Inspect runtime",
+            description="Inspect session.py",
+            active_form="Inspecting runtime",
+            status="in_progress",
+        )
+        duplicate = session.create_checklist_task(
+            subject="Inspect runtime",
+            description="Inspect session.py",
+            active_form="Inspecting runtime",
+        )
+        self.assertFalse(duplicate["created"])
+
+        class FakeProvider:
+            def __init__(self) -> None:
+                self.capabilities = ProviderCapabilities(
+                    provider="fake",
+                    model="fake-model",
+                    supports_tool_calling=True,
+                    supports_streaming=False,
+                    supports_structured_output=False,
+                )
+                self.system_prompt = ""
+                self.user_text = ""
+
+            def create_message(self, *, messages, tools, system_prompt):
+                self.system_prompt = system_prompt
+                self.user_text = str(messages[-1]["content"][0]["text"])
+                return AssistantResponse(
+                    content=[{"type": "text", "text": "done"}],
+                    text="done",
+                    tool_calls=[],
+                )
+
+        provider = FakeProvider()
+        session.provider = provider
+
+        result = run_query_loop(session, "Continue the runtime task")
+
+        self.assertEqual(result, "done")
+        self.assertIn("Recent checklist duplicate guard:", provider.system_prompt)
+        self.assertIn(f"matched_task_id={created['id']}", provider.system_prompt)
+        self.assertIn(
+            f"recommended_action=Call session_task_get for task {created['id']}, then use session_task_update to continue or revise it.",
+            provider.system_prompt,
+        )
+        self.assertIn("Use session_task_get", provider.user_text)
+        self.assertIn("do not create another checklist task", provider.user_text)
+
     def test_query_loop_rolls_back_failed_turn_state(self) -> None:
         session = Session(
             SessionConfig(
@@ -715,6 +823,15 @@ class QueryLoopTests(unittest.TestCase):
         self.assertTrue(any(event.kind == "plan_execution" for event in events))
         self.assertEqual(session.state.plan_execution_count, 1)
         self.assertIsNone(session.state.active_execution_plan_id)
+        self.assertEqual(len(session.task_manager.list()), 1)
+        task = session.task_manager.list()[0]
+        self.assertEqual(task.status, "completed")
+        self.assertEqual(task.kind, "plan_execution")
+        self.assertEqual(task.metadata["task_role"], "execution")
+        self.assertEqual(task.metadata["plan_execution_mode"], "interactive_turn")
+        self.assertEqual(task.metadata["plan_execution_phase"], "completed")
+        self.assertEqual(task.metadata["plan_status"], "on-plan")
+        self.assertEqual(task.metadata["active_plan_id"], session.planning_artifacts()[-1].artifact_id)
 
     def test_query_loop_does_not_reuse_plan_after_clear(self) -> None:
         session = Session(
@@ -758,6 +875,38 @@ class QueryLoopTests(unittest.TestCase):
 
         self.assertEqual(result, "done")
         self.assertEqual(session.provider.seen_prompt, "implement the refactor")
+
+    def test_query_loop_without_active_plan_does_not_create_execution_task(self) -> None:
+        session = Session(
+            SessionConfig(
+                cwd=Path(__file__).resolve().parent,
+                interactive=False,
+            )
+        )
+
+        class FakeProvider:
+            def __init__(self) -> None:
+                self.capabilities = ProviderCapabilities(
+                    provider="fake",
+                    model="fake-model",
+                    supports_tool_calling=True,
+                    supports_streaming=False,
+                    supports_structured_output=False,
+                )
+
+            def create_message(self, *, messages, tools, system_prompt):
+                del messages, tools, system_prompt
+                return AssistantResponse(
+                    content=[{"type": "text", "text": "done"}],
+                    text="done",
+                    tool_calls=[],
+                )
+
+        session.provider = FakeProvider()
+        result = run_query_loop(session, "plain ask")
+
+        self.assertEqual(result, "done")
+        self.assertEqual(session.task_manager.list(), [])
 
     def test_query_loop_enforces_read_only_toolset_after_before_write_revision(self) -> None:
         session = Session(
@@ -987,6 +1136,12 @@ class QueryLoopTests(unittest.TestCase):
         self.assertIsNone(session.state.constraint_source)
         self.assertIsNone(session.state.constraint_reason)
         self.assertEqual(session.state.constraint_trigger_count, 1)
+        self.assertEqual(len(session.task_manager.list()), 1)
+        task = session.task_manager.list()[0]
+        self.assertEqual(task.metadata["plan_execution_mode"], "interactive_turn")
+        self.assertEqual(task.metadata["plan_execution_phase"], "completed")
+        self.assertEqual(task.metadata["plan_status"], "drifted")
+        self.assertEqual(task.metadata["drift_status"], "block")
 
 
 if __name__ == "__main__":

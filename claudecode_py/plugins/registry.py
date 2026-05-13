@@ -18,11 +18,15 @@ class PluginSkillDefinition:
     description: str = ""
     auto_enable: bool = False
     tags: tuple[str, ...] = ()
+    path: Path | None = None
 
     def to_loaded_skill(self, *, cwd: Path, plugin_name: str) -> LoadedSkill:
         return LoadedSkill(
             name=self.name,
-            path=(cwd / ".pyclaude" / "plugins" / plugin_name / f"{self.name}.md").resolve(),
+            path=(
+                self.path
+                or (cwd / ".pyclaude" / "plugins" / plugin_name / f"{self.name}.md").resolve()
+            ),
             content=self.content,
             description=self.description,
             auto_enable=self.auto_enable,
@@ -74,6 +78,7 @@ class PluginDefinition:
     version: str = "0.1.0"
     default_enabled: bool = True
     source: str = "builtin"
+    path: Path | None = None
     commands: tuple[ReplCommand, ...] = field(default_factory=tuple)
     skills: tuple[PluginSkillDefinition, ...] = field(default_factory=tuple)
     mcp_servers: tuple[PluginMcpServerDefinition, ...] = field(default_factory=tuple)
@@ -84,14 +89,32 @@ class PluginDefinition:
         return f"{self.name}@{self.source}"
 
 
+@dataclass(slots=True, frozen=True)
+class PluginLoadDiagnostic:
+    name: str
+    source: str
+    path: Path
+    error: str
+
+
 class PluginRegistry:
-    def __init__(self, plugins: list[PluginDefinition] | None = None) -> None:
+    def __init__(
+        self,
+        plugins: list[PluginDefinition] | None = None,
+        diagnostics: list[PluginLoadDiagnostic] | None = None,
+    ) -> None:
         self._plugins: dict[str, PluginDefinition] = {}
+        self._diagnostics: dict[str, PluginLoadDiagnostic] = {}
         for plugin in plugins or []:
             self.add_plugin(plugin)
+        for diagnostic in diagnostics or []:
+            self.add_diagnostic(diagnostic)
 
     def add_plugin(self, plugin: PluginDefinition) -> None:
         self._plugins[plugin.name] = plugin
+
+    def add_diagnostic(self, diagnostic: PluginLoadDiagnostic) -> None:
+        self._diagnostics[diagnostic.name] = diagnostic
 
     def get_plugin(self, name: str) -> PluginDefinition | None:
         resolved = self._resolve_name(name)
@@ -104,6 +127,15 @@ class PluginRegistry:
 
     def list_plugins(self) -> list[PluginDefinition]:
         return [self._plugins[name] for name in sorted(self._plugins)]
+
+    def list_diagnostics(self) -> list[PluginLoadDiagnostic]:
+        return [self._diagnostics[name] for name in sorted(self._diagnostics)]
+
+    def get_diagnostic(self, name: str) -> PluginLoadDiagnostic | None:
+        resolved = self._resolve_name(name)
+        if resolved is None:
+            return None
+        return self._diagnostics.get(resolved)
 
     def enabled_plugins(self, state: "SessionState") -> list[PluginDefinition]:
         return [plugin for plugin in self.list_plugins() if self.is_enabled(plugin.name, state)]
@@ -166,23 +198,41 @@ class PluginRegistry:
 
     def describe_plugins(self, state: "SessionState") -> str:
         plugins = self.list_plugins()
-        if not plugins:
+        diagnostics = self.list_diagnostics()
+        if not plugins and not diagnostics:
             return "No plugins registered."
         lines = []
         for plugin in plugins:
             status = "enabled" if self.is_enabled(plugin.name, state) else "disabled"
             default = "default=enabled" if plugin.default_enabled else "default=disabled"
+            path_text = f" path={plugin.path}" if plugin.path is not None else ""
             lines.append(
                 f"{plugin.name}: status={status} source={plugin.source} "
                 f"version={plugin.version} {default} commands={len(plugin.commands)} "
                 f"skills={len(plugin.skills)} mcp_servers={len(plugin.mcp_servers)} hooks={len(plugin.hooks)} "
-                f"description={plugin.description}"
+                f"description={plugin.description}{path_text}"
+            )
+        for diagnostic in diagnostics:
+            lines.append(
+                f"{diagnostic.name}: status=invalid source={diagnostic.source} "
+                f"path={diagnostic.path} error={diagnostic.error}"
             )
         return "\n".join(lines)
 
     def describe_plugin(self, name: str, state: "SessionState") -> str:
         plugin = self.get_plugin(name)
         if plugin is None:
+            diagnostic = self.get_diagnostic(name)
+            if diagnostic is not None:
+                return "\n".join(
+                    [
+                        f"name: {diagnostic.name}",
+                        "status: invalid",
+                        f"source: {diagnostic.source}",
+                        f"path: {diagnostic.path}",
+                        f"error: {diagnostic.error}",
+                    ]
+                )
             return f'Unknown plugin "{name.strip()}".'
         status = "enabled" if self.is_enabled(plugin.name, state) else "disabled"
         default = "enabled" if plugin.default_enabled else "disabled"
@@ -194,6 +244,7 @@ class PluginRegistry:
             f"version: {plugin.version}",
             f"source: {plugin.source}",
             f"description: {plugin.description}",
+            "path: " + (str(plugin.path) if plugin.path is not None else "none"),
             f"commands: {len(plugin.commands)}",
             f"skills: {len(plugin.skills)}",
             f"mcp_servers: {len(plugin.mcp_servers)}",
@@ -223,3 +274,28 @@ class PluginRegistry:
             if candidate in self._plugins:
                 return candidate
         return raw
+
+
+def merge_plugin_registries(*registries: PluginRegistry) -> PluginRegistry:
+    merged = PluginRegistry()
+    for registry in registries:
+        for plugin in registry.list_plugins():
+            existing = merged.get_plugin(plugin.name)
+            if existing is None:
+                merged.add_plugin(plugin)
+                continue
+            if existing.name == plugin.name:
+                merged.add_diagnostic(
+                    PluginLoadDiagnostic(
+                        name=plugin.name,
+                        source=plugin.source,
+                        path=plugin.path or Path(plugin.name),
+                        error=(
+                            f'Plugin name conflicts with already-registered plugin '
+                            f'"{existing.name}" from source={existing.source}.'
+                        ),
+                    )
+                )
+        for diagnostic in registry.list_diagnostics():
+            merged.add_diagnostic(diagnostic)
+    return merged

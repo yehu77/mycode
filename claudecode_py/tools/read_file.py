@@ -31,3 +31,11 @@ class ReadFileTool(BaseTool):
             numbered = [f"{idx + start + 1:>4}: {line}" for idx, line in enumerate(sliced)]
             return "\n".join(numbered)
         return text
+
+    def approval_request(self, tool_input: dict, ctx=None):
+        request = super().approval_request(tool_input, ctx)
+        if ctx is None:
+            return request
+        path = resolve_workspace_path(ctx.cwd, tool_input["path"])
+        request.target_paths = (path.relative_to(ctx.cwd).as_posix(),)
+        return request

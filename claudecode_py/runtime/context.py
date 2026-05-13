@@ -26,6 +26,7 @@ from ..state import SessionState
 from ..tasks import TaskManager
 from ..tools import (
     AgentTool,
+    AskUserQuestionTool,
     ApplyPatchTool,
     BaseTool,
     BashTool,
@@ -37,15 +38,23 @@ from ..tools import (
     FindSymbolTool,
     GlobTool,
     GrepTool,
+    ListMcpResourcesTool,
     ListDirTool,
     McpToolAdapter,
     OutlineFileTool,
     OutlineProjectTool,
     ReadFileTool,
+    ReadMcpResourceTool,
+    SessionTaskCreateTool,
+    SessionTaskGetTool,
+    SessionTaskListTool,
+    SessionTaskUpdateTool,
     TaskGetTool,
     TaskListTool,
     TaskStopTool,
     TaskWaitTool,
+    TodoWriteTool,
+    ToolSearchTool,
     ToolContext,
     WriteFileTool,
 )
@@ -66,6 +75,8 @@ class SessionRuntimeContext:
     project_context: ProjectContext
     base_system_prompt: str
     tools: list[BaseTool]
+    default_tools: list[BaseTool]
+    deferred_tools: list[BaseTool]
     orchestrator: ToolOrchestrator
     owns_mcp_registry: bool = True
     _python_symbol_index: PythonProjectIndex | None = None
@@ -140,6 +151,11 @@ class SessionRuntimeContext:
     def describe_plugins(self, state: SessionState) -> str:
         return self.plugin_registry.describe_plugins(state)
 
+    def replace_plugin_registry(self, plugin_registry: PluginRegistry, state: SessionState) -> None:
+        self.plugin_registry = plugin_registry
+        self.reload_project_context(state)
+        self.refresh_command_registry(state)
+
     def replace_mcp_registry(
         self,
         mcp_registry: McpRegistry | None,
@@ -153,6 +169,8 @@ class SessionRuntimeContext:
         self.mcp_registry = mcp_registry
         self.owns_mcp_registry = owns_registry
         self.tools = _build_tools(mcp_registry)
+        self.default_tools = [tool for tool in self.tools if not tool.is_deferred()]
+        self.deferred_tools = [tool for tool in self.tools if tool.is_deferred()]
         self.orchestrator = ToolOrchestrator(self.tools)
         if previous is not None and previous is not mcp_registry and previous_owned:
             previous.close()
@@ -230,6 +248,8 @@ def build_session_runtime_context(
         base_commands=build_core_commands(),
     )
     tools = _build_tools(mcp_registry)
+    default_tools = [tool for tool in tools if not tool.is_deferred()]
+    deferred_tools = [tool for tool in tools if tool.is_deferred()]
     base_project_context = load_project_context(config.cwd)
     return SessionRuntimeContext(
         config=config,
@@ -248,6 +268,8 @@ def build_session_runtime_context(
             workspace_name=config.cwd.name,
         ),
         tools=tools,
+        default_tools=default_tools,
+        deferred_tools=deferred_tools,
         orchestrator=ToolOrchestrator(tools),
         owns_mcp_registry=owns_mcp_registry,
     )
@@ -269,10 +291,19 @@ def _build_tools(mcp_registry: McpRegistry | None) -> list[BaseTool]:
         ApplyPatchTool(),
         BashTool(),
         AgentTool(),
+        TodoWriteTool(),
+        SessionTaskCreateTool(),
+        SessionTaskListTool(),
+        SessionTaskGetTool(),
+        SessionTaskUpdateTool(),
         TaskListTool(),
         TaskGetTool(),
         TaskStopTool(),
         TaskWaitTool(),
+        ToolSearchTool(),
+        AskUserQuestionTool(),
+        ListMcpResourcesTool(),
+        ReadMcpResourceTool(),
     ]
     if mcp_registry is not None:
         for reference in mcp_registry.list_tool_references():

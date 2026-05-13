@@ -48,7 +48,7 @@ class ApplyPatchToolTests(unittest.TestCase):
 
             result = tool.execute({"patch": patch}, ctx)
 
-            self.assertIn("Added notes.txt", result)
+            self.assertIn("Created notes.txt", result)
             self.assertIn("Updated demo.txt", result)
             self.assertIn("Deleted old.txt", result)
             self.assertEqual((cwd / "notes.txt").read_text(encoding="utf-8"), "hello\nworld")
@@ -85,7 +85,7 @@ class ApplyPatchToolTests(unittest.TestCase):
 
             result = tool.execute({"patch": patch}, ctx)
 
-            self.assertIn("Updated before.txt -> after.txt", result)
+            self.assertIn("Moved before.txt -> after.txt", result)
             self.assertFalse((cwd / "before.txt").exists())
             self.assertEqual((cwd / "after.txt").read_text(encoding="utf-8"), "ONE\ntwo")
         finally:
@@ -116,10 +116,11 @@ alpha
 gamma
 *** End Patch"""
             request = ApplyPatchTool().approval_request({"patch": patch}, ctx)
-            self.assertIn("Pending patch change set", request.details)
+            self.assertIn("Pending file changes", request.details)
             self.assertIn("files: 1", request.details)
             self.assertIn("update: 1", request.details)
-            self.assertIn("[update demo.txt]", request.details)
+            self.assertIn("[file demo.txt]", request.details)
+            self.assertIn("action: update", request.details)
             self.assertIn("--- a/demo.txt", request.details)
             self.assertIn("+++ b/demo.txt", request.details)
             self.assertIn("-beta", request.details)
@@ -196,12 +197,12 @@ gamma
  gamma
 *** End Patch"""
             request = ApplyPatchTool().approval_request({"patch": patch}, ctx)
-            self.assertIn("Pending patch change set", request.details)
+            self.assertIn("Pending file changes", request.details)
             self.assertIn("files: 2", request.details)
             self.assertIn("create: 1", request.details)
             self.assertIn("update: 1", request.details)
-            self.assertIn("[create notes.txt]", request.details)
-            self.assertIn("[update demo.txt]", request.details)
+            self.assertIn("[file notes.txt]", request.details)
+            self.assertIn("[file demo.txt]", request.details)
         finally:
             if cwd.exists():
                 shutil.rmtree(cwd)

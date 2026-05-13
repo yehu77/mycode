@@ -75,6 +75,7 @@ class CommandRegistryTests(unittest.TestCase):
             self.assertIn("PR number or selector: 123", output.prompt)
             self.assertIn("bash", output.allowed_tool_names)
             self.assertIn("gh pr diff", output.allowed_bash_command_prefixes)
+            self.assertEqual(output.metadata["command_policy_name"], "review")
         finally:
             session.close()
 
@@ -98,6 +99,7 @@ class CommandRegistryTests(unittest.TestCase):
                 output.allowed_bash_command_prefixes,
                 ("git add", "git status", "git commit"),
             )
+            self.assertEqual(output.metadata["command_policy_name"], "commit")
         finally:
             session.close()
 
@@ -135,6 +137,7 @@ class CommandRegistryTests(unittest.TestCase):
             self.assertIn("diff", output.prompt)
             self.assertIn("read_file", output.allowed_tool_names)
             self.assertIn("git diff", output.allowed_bash_command_prefixes)
+            self.assertEqual(output.metadata["command_policy_name"], "security-review")
         finally:
             session.close()
 
@@ -155,6 +158,7 @@ class CommandRegistryTests(unittest.TestCase):
             self.assertIn("task_wait", output.allowed_tool_names)
             self.assertIn("git diff", output.allowed_bash_command_prefixes)
             self.assertTrue(output.require_read_only_subagents)
+            self.assertEqual(output.metadata["command_policy_name"], "ultraplan")
         finally:
             session.close()
 
@@ -209,6 +213,101 @@ class CommandRegistryTests(unittest.TestCase):
                 result = session.run_command(execution)
 
             self.assertEqual(result, "done")
+        finally:
+            session.close()
+
+    def test_review_mode_rejects_non_matching_segment(self) -> None:
+        session = Session(
+            SessionConfig(cwd=Path(__file__).resolve().parent, interactive=False),
+            persist_transcript=False,
+        )
+        execution = CommandExecution(
+            prompt="Review the diff",
+            allowed_tool_names=("bash",),
+            allowed_bash_command_prefixes=("git diff", "git show"),
+            metadata={
+                "command_policy_name": "review",
+                "command_policy_source": "repl:/review",
+            },
+        )
+
+        try:
+            def fake_run_query_loop(active_session, prompt: str, sink=None):
+                del sink
+                self.assertEqual(prompt, "Review the diff")
+                allowed = active_session.evaluate_bash_command_policy("git diff | Set-Content out.txt")
+                self.assertFalse(allowed.allowed)
+                self.assertIn('segment 2 "Set-Content out.txt"', allowed.reason)
+                self.assertIn('command mode "review"', allowed.reason)
+                return "blocked"
+
+            with patch("claudecode_py.session.run_query_loop", side_effect=fake_run_query_loop):
+                result = session.run_command(execution)
+
+            self.assertEqual(result, "blocked")
+        finally:
+            session.close()
+
+    def test_commit_mode_allows_git_segments_but_rejects_non_git_write_segment(self) -> None:
+        session = Session(
+            SessionConfig(cwd=Path(__file__).resolve().parent, interactive=False),
+            persist_transcript=False,
+        )
+        execution = CommandExecution(
+            prompt="Create a commit",
+            allowed_tool_names=("bash",),
+            allowed_bash_command_prefixes=("git add", "git status", "git commit"),
+            metadata={
+                "command_policy_name": "commit",
+                "command_policy_source": "repl:/commit",
+            },
+        )
+
+        try:
+            def fake_run_query_loop(active_session, prompt: str, sink=None):
+                del sink
+                self.assertEqual(prompt, "Create a commit")
+                self.assertTrue(
+                    active_session.evaluate_bash_command_policy(
+                        "git add demo.txt && git commit -m test"
+                    ).allowed
+                )
+                rejected = active_session.evaluate_bash_command_policy(
+                    "git add demo.txt && powershell Set-Content out.txt hi"
+                )
+                self.assertFalse(rejected.allowed)
+                self.assertIn('segment 2 "powershell Set-Content out.txt hi"', rejected.reason)
+                return "done"
+
+            with patch("claudecode_py.session.run_query_loop", side_effect=fake_run_query_loop):
+                result = session.run_command(execution)
+
+            self.assertEqual(result, "done")
+        finally:
+            session.close()
+
+    def test_read_only_turn_policy_rejects_complex_write_syntax(self) -> None:
+        session = Session(
+            SessionConfig(cwd=Path(__file__).resolve().parent, interactive=False),
+            persist_transcript=False,
+        )
+
+        try:
+            with session._command_execution_scope(
+                allowed_tool_names=("bash",),
+                allowed_bash_command_prefixes=("git diff",),
+                require_read_only_subagents=True,
+                command_policy_name="read-only-turn",
+                command_policy_source="advisor-read-only-scope",
+            ):
+                result = session.evaluate_bash_command_policy(
+                    "git diff $(Join-Path $PWD demo.txt)",
+                )
+
+            self.assertFalse(result.allowed)
+            self.assertIn('command mode "read-only-turn"', result.reason)
+            self.assertEqual(result.violating_features, ("command_substitution",))
+            self.assertIn("complex_feature=command_substitution", result.reason)
         finally:
             session.close()
 

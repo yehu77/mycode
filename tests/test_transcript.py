@@ -51,6 +51,7 @@ class TranscriptTests(unittest.TestCase):
                                 existed_before=False,
                                 before_content="",
                                 after_content="hello",
+                                action_kind="create",
                             )
                         ],
                     )
@@ -65,6 +66,9 @@ class TranscriptTests(unittest.TestCase):
                                 existed_before=True,
                                 before_content="hello",
                                 after_content="HELLO",
+                                action_kind="update",
+                                replacement_count=1,
+                                change_mode="targeted replace",
                             )
                         ],
                     )
@@ -86,6 +90,9 @@ class TranscriptTests(unittest.TestCase):
             self.assertEqual(loaded_state.messages[0]["role"], "user")
             self.assertEqual(len(loaded_state.recent_change_sets), 1)
             self.assertEqual(len(loaded_state.undone_change_sets), 1)
+            self.assertEqual(loaded_state.recent_change_sets[0].files[0].action_kind, "create")
+            self.assertEqual(loaded_state.undone_change_sets[0].files[0].replacement_count, 1)
+            self.assertEqual(loaded_state.undone_change_sets[0].files[0].change_mode, "targeted replace")
             self.assertEqual(loaded_path, path)
         finally:
             if cwd.exists():
@@ -130,6 +137,79 @@ class TranscriptTests(unittest.TestCase):
             if cwd.exists():
                 shutil.rmtree(cwd)
 
+    def test_list_transcripts_discovers_same_repo_isolated_workspaces_and_dedupes(self) -> None:
+        cwd = Path(__file__).resolve().parent / "_tmp_transcript_same_repo"
+        if cwd.exists():
+            shutil.rmtree(cwd)
+        cwd.mkdir(parents=True)
+
+        try:
+            root_config = SessionConfig(cwd=cwd, interactive=False)
+            workspace_cwd = cwd / ".pyclaude" / "workspaces" / "agent-demo"
+            workspace_cwd.mkdir(parents=True)
+            workspace_config = SessionConfig(cwd=workspace_cwd, transcript_cwd=workspace_cwd, interactive=False)
+
+            save_transcript(
+                root_config,
+                SessionState(
+                    session_id="root-session",
+                    created_at="2026-01-01T00:00:00+00:00",
+                    messages=[{"role": "user", "content": [{"type": "text", "text": "root"}]}],
+                ),
+            )
+            save_transcript(
+                workspace_config,
+                SessionState(
+                    session_id="child-session",
+                    created_at="2026-01-02T00:00:00+00:00",
+                    original_cwd=str(cwd.resolve()),
+                    effective_cwd=str(workspace_cwd.resolve()),
+                    workspace_mode="snapshot",
+                    workspace_label="agent-demo",
+                    workspace_created_at="2026-01-02T00:00:00+00:00",
+                    workspace_cleanup_status="pending",
+                    messages=[{"role": "assistant", "content": [{"type": "text", "text": "child"}]}],
+                ),
+            )
+            save_transcript(
+                workspace_config,
+                SessionState(
+                    session_id="root-session",
+                    created_at="2026-01-03T00:00:00+00:00",
+                    original_cwd=str(cwd.resolve()),
+                    effective_cwd=str(workspace_cwd.resolve()),
+                    workspace_mode="worktree",
+                    workspace_label="agent-replay",
+                    workspace_created_at="2026-01-03T00:00:00+00:00",
+                    workspace_cleanup_status="completed",
+                    messages=[{"role": "assistant", "content": [{"type": "text", "text": "duplicate"}]}],
+                ),
+            )
+
+            summaries = list_transcripts(cwd)
+            self.assertEqual(len(summaries), 2)
+            self.assertEqual([item.session_id for item in summaries], ["root-session", "child-session"])
+            self.assertEqual(summaries[0].workspace_mode, "worktree")
+            self.assertEqual(summaries[0].workspace_label, "agent-replay")
+            self.assertEqual(summaries[0].original_cwd, str(cwd.resolve()))
+            self.assertEqual(summaries[0].effective_cwd, str(workspace_cwd.resolve()))
+            self.assertEqual(summaries[0].workspace_cleanup_status, "completed")
+            self.assertEqual(summaries[1].workspace_mode, "snapshot")
+
+            loaded_state, loaded_path = load_transcript_by_session_id(cwd, "child-session")
+            self.assertIsNotNone(loaded_state)
+            assert loaded_state is not None
+            self.assertEqual(loaded_state.workspace_label, "agent-demo")
+            self.assertEqual(loaded_state.original_cwd, str(cwd.resolve()))
+            self.assertEqual(loaded_state.effective_cwd, str(workspace_cwd.resolve()))
+            self.assertEqual(
+                loaded_path,
+                get_session_path(workspace_cwd, "child-session"),
+            )
+        finally:
+            if cwd.exists():
+                shutil.rmtree(cwd)
+
     def test_save_and_load_advisor_and_planning_state(self) -> None:
         cwd = Path(__file__).resolve().parent / "_tmp_transcript_advisor_planning"
         if cwd.exists():
@@ -143,6 +223,10 @@ class TranscriptTests(unittest.TestCase):
                 original_cwd=str(cwd),
                 effective_cwd=str(cwd / ".pyclaude" / "worktrees" / "agent-demo"),
                 workspace_mode="worktree",
+                workspace_label="agent-demo",
+                workspace_created_at="2026-01-03T00:00:00+00:00",
+                workspace_cleanup_status="pending",
+                workspace_cleanup_error="PermissionError: cleanup blocked",
                 advisor_model="claude-3-opus-latest",
                 advisor_mode="interactive-review",
                 advisor_last_result=AdvisorReviewSummary(
@@ -209,6 +293,10 @@ class TranscriptTests(unittest.TestCase):
             self.assertEqual(loaded_state.workspace_mode, "worktree")
             self.assertEqual(loaded_state.original_cwd, str(cwd))
             self.assertEqual(loaded_state.effective_cwd, str(cwd / ".pyclaude" / "worktrees" / "agent-demo"))
+            self.assertEqual(loaded_state.workspace_label, "agent-demo")
+            self.assertEqual(loaded_state.workspace_created_at, "2026-01-03T00:00:00+00:00")
+            self.assertEqual(loaded_state.workspace_cleanup_status, "pending")
+            self.assertEqual(loaded_state.workspace_cleanup_error, "PermissionError: cleanup blocked")
             self.assertEqual(loaded_state.active_execution_constraint, "read-only")
             self.assertEqual(loaded_state.constraint_source, "before_write_block")
             self.assertEqual(loaded_state.constraint_reason, "unsafe")
@@ -232,6 +320,61 @@ class TranscriptTests(unittest.TestCase):
                 loaded_state.active_planning_artifact_id,
                 loaded_state.recent_planning_artifacts[0].artifact_id,
             )
+        finally:
+            if cwd.exists():
+                shutil.rmtree(cwd)
+
+    def test_transcript_summary_includes_plan_and_task_surfaces(self) -> None:
+        cwd = Path(__file__).resolve().parent / "_tmp_transcript_summary_surfaces"
+        if cwd.exists():
+            shutil.rmtree(cwd)
+        cwd.mkdir(parents=True)
+
+        try:
+            config = SessionConfig(cwd=cwd, interactive=False)
+            artifact = PlanningArtifact(
+                kind="plan",
+                goal="resume coding flow",
+                summary="Continue from prior state",
+            )
+            state = SessionState(
+                session_id="session-surfaces",
+                messages=[{"role": "user", "content": [{"type": "text", "text": "resume"}]}],
+                active_planning_artifact_id=artifact.artifact_id,
+                planning_artifact_history=[artifact],
+                recent_planning_artifacts=[artifact],
+                saved_task_records=[
+                    {
+                        "id": "task-bg",
+                        "kind": "agent",
+                        "description": "Background work",
+                        "status": "completed",
+                        "metadata": {"task_role": "background"},
+                    }
+                ],
+                saved_task_surface_counts={
+                    "checklist": 2,
+                    "workspace_maintenance": 0,
+                    "child_execution": 0,
+                    "background_execution": 1,
+                    "active_plan_execution": 0,
+                    "other_task": 0,
+                },
+            )
+
+            save_transcript(config, state)
+            loaded_state, _ = load_latest_transcript(cwd)
+            summaries = list_transcripts(cwd)
+
+            self.assertIsNotNone(loaded_state)
+            assert loaded_state is not None
+            self.assertEqual(loaded_state.active_planning_artifact_id, artifact.artifact_id)
+            self.assertEqual(len(loaded_state.saved_task_records), 1)
+            self.assertEqual(loaded_state.saved_task_surface_counts["background_execution"], 1)
+            self.assertEqual(summaries[0].active_planning_artifact_id, artifact.artifact_id)
+            self.assertEqual(summaries[0].planning_artifact_count, 1)
+            self.assertEqual(summaries[0].task_surface_counts["checklist"], 2)
+            self.assertEqual(summaries[0].task_surface_counts["background_execution"], 1)
         finally:
             if cwd.exists():
                 shutil.rmtree(cwd)

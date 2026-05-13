@@ -8,7 +8,7 @@ if str(ROOT) not in sys.path:
 
 from claudecode_py.permissions import ApprovalRequest
 from claudecode_py.runtime.events import RuntimeEvent
-from claudecode_py.tui.state import PendingApproval, TuiState
+from claudecode_py.tui.state import PendingApproval, TuiState, TurnErrorDetails
 
 
 class TuiStateTests(unittest.TestCase):
@@ -51,6 +51,35 @@ class TuiStateTests(unittest.TestCase):
         rendered = state.render_chat()
 
         self.assertIn("[Assistant]\nHere is claudecode_py overview", rendered)
+
+    def test_turn_rendering_includes_structured_error_block(self) -> None:
+        state = TuiState()
+
+        state.start_turn("Review pending diff")
+        state.fail_turn_with_details(
+            TurnErrorDetails(
+                message='Bash command is not allowed in command mode "review".',
+                decision_reason='Matched ask rules: ask:shell:git diff [segment 1: git diff]',
+                permission_rules=("ask:shell:git diff [segment 1: git diff]",),
+                command_mode_name="review",
+                command_mode_allowed_prefixes=("git diff", "git show"),
+                command_mode_violating_segment="Set-Content out.txt",
+                command_mode_violating_segment_index=2,
+                command_mode_complex_features=("command_substitution",),
+            )
+        )
+
+        rendered = state.render_chat()
+
+        self.assertIn("[Error]\nturn_error:", rendered)
+        self.assertIn('- message: Bash command is not allowed in command mode "review".', rendered)
+        self.assertIn("- policy: Matched ask rules: ask:shell:git diff [segment 1: git diff]", rendered)
+        self.assertIn("- matched_rules:", rendered)
+        self.assertIn("  - ask:shell:git diff [segment 1: git diff]", rendered)
+        self.assertIn("  - mode: review", rendered)
+        self.assertIn("  - allowed_prefixes: git diff, git show", rendered)
+        self.assertIn("  - violating_segment: segment 2: Set-Content out.txt", rendered)
+        self.assertIn("  - complex_features: command_substitution", rendered)
 
     def test_input_history_supports_prev_and_next_navigation(self) -> None:
         state = TuiState()
@@ -218,6 +247,231 @@ class TuiStateTests(unittest.TestCase):
         self.assertIn("[provider:retry] retrying in 0.5s", rendered)
         self.assertIn("[context] compacted 10 messages", rendered)
 
+    def test_task_detail_panel_renders_file_context_hint_lines(self) -> None:
+        state = TuiState(selected_task_id="task-123")
+        state.set_task_detail(
+            task_id="task-123",
+            text="task detail body",
+            file_context_metadata={
+                "file_context_scope": "task",
+                "file_context_file_count": 2,
+                "file_context_sources": ["checklist", "change"],
+                "file_context_files": [
+                    {
+                        "path": "claudecode_py/session.py",
+                        "source": "checklist",
+                        "target": {
+                            "action": "open_file",
+                            "path": "claudecode_py/session.py",
+                            "line": 12,
+                            "label": "task file",
+                        },
+                        "diff_targets": {
+                            "hunks": [
+                                {
+                                    "action": "open_diff",
+                                    "path": "claudecode_py/session.py",
+                                    "line": 20,
+                                    "label": "task diff",
+                                }
+                            ]
+                        },
+                        "target_summary": "open_file claudecode_py/session.py:12",
+                        "diff_target_count": 1,
+                    }
+                    ,
+                    {
+                        "path": "claudecode_py/cli.py",
+                        "source": "change",
+                        "change_id": "abc12345",
+                        "target": {
+                            "action": "open_file",
+                            "path": "claudecode_py/cli.py",
+                            "line": 44,
+                            "label": "cli file",
+                        },
+                        "diff_targets": {
+                            "hunks": [
+                                {
+                                    "action": "open_diff",
+                                    "path": "claudecode_py/cli.py",
+                                    "line": 47,
+                                    "label": "cli diff",
+                                }
+                            ]
+                        },
+                        "target_summary": "open_file claudecode_py/cli.py:44",
+                        "diff_target_count": 1,
+                    },
+                ],
+                "file_context_primary_path": "claudecode_py/session.py",
+                "file_context_primary_target": {
+                    "action": "open_file",
+                    "path": "claudecode_py/session.py",
+                    "line": 12,
+                    "label": "task file",
+                },
+                "file_context_primary_diff_targets": {
+                    "hunks": [
+                        {
+                            "action": "open_diff",
+                            "path": "claudecode_py/session.py",
+                            "line": 20,
+                            "label": "task diff",
+                        }
+                    ]
+                },
+            },
+        )
+        state.task_detail_file_context_index = 1
+
+        rendered = state.render_task_detail_panel("task detail body")
+
+        self.assertIn("Task Detail [detail] [task-123] [file 2/2 claudecode_py/cli.py]", rendered)
+        self.assertIn("Focused file", rendered)
+        self.assertIn("file_focus: 2/2", rendered)
+        self.assertIn("focused_file: claudecode_py/cli.py", rendered)
+        self.assertIn("source: change", rendered)
+        self.assertIn("related change: abc12345", rendered)
+        self.assertIn("diff hunks: 1", rendered)
+        self.assertIn("context-only: no", rendered)
+        self.assertIn("primary target: open_file claudecode_py/cli.py:44 cli file", rendered)
+        self.assertIn("secondary target: open_diff claudecode_py/cli.py:47 cli diff", rendered)
+        self.assertIn("navigation: F9 primary target, F10 secondary target", rendered)
+        self.assertIn("navigation_f9: open_file claudecode_py/cli.py:44 cli file", rendered)
+        self.assertIn("navigation_f10: open_diff claudecode_py/cli.py:47 cli diff", rendered)
+        self.assertIn("file_inventory:", rendered)
+        self.assertIn("> 2. claudecode_py/cli.py [change] related_change=abc12345", rendered)
+
+    def test_plan_panel_renders_file_focus_in_header(self) -> None:
+        state = TuiState()
+        state.plan_file_context_index = 1
+
+        rendered = state.render_plan_panel(
+            "plan detail body",
+            file_context_metadata={
+                "file_context_scope": "plan",
+                "file_context_file_count": 2,
+                "file_context_sources": ["recent_change", "symbol_surface"],
+                "file_context_files": [
+                    {
+                        "path": "claudecode_py/runtime/query_loop.py",
+                        "source": "recent_change",
+                        "change_id": "def67890",
+                        "target": {
+                            "action": "open_file",
+                            "path": "claudecode_py/runtime/query_loop.py",
+                            "line": 33,
+                            "label": "plan file",
+                        },
+                        "target_summary": "open_file claudecode_py/runtime/query_loop.py:33",
+                    },
+                    {
+                        "path": "claudecode_py/runtime/context.py",
+                        "source": "symbol_surface",
+                        "target": {
+                            "action": "open_file",
+                            "path": "claudecode_py/runtime/context.py",
+                            "line": 18,
+                            "label": "context file",
+                        },
+                        "diff_targets": {
+                            "hunks": [
+                                {
+                                    "action": "open_diff",
+                                    "path": "claudecode_py/runtime/context.py",
+                                    "line": 22,
+                                    "label": "context diff",
+                                }
+                            ]
+                        },
+                        "target_summary": "open_file claudecode_py/runtime/context.py:18",
+                        "diff_target_count": 1,
+                    },
+                ],
+            },
+        )
+
+        self.assertIn(
+            "Active Plan [summary] [file 2/2 claudecode_py/runtime/context.py]",
+            rendered,
+        )
+        self.assertIn("Focused file", rendered)
+        self.assertIn("file_focus: 2/2", rendered)
+        self.assertIn("focused_file: claudecode_py/runtime/context.py", rendered)
+        self.assertIn("source: symbol_surface", rendered)
+        self.assertIn("diff hunks: 1", rendered)
+        self.assertIn("context-only: no", rendered)
+        self.assertIn("primary target: open_file claudecode_py/runtime/context.py:18 context file", rendered)
+        self.assertIn("secondary target: open_diff claudecode_py/runtime/context.py:22 context diff", rendered)
+        self.assertIn("navigation: F9 primary target, F10 secondary target", rendered)
+        self.assertIn("navigation_f9: open_file claudecode_py/runtime/context.py:18 context file", rendered)
+        self.assertIn("navigation_f10: open_diff claudecode_py/runtime/context.py:22 context diff", rendered)
+        self.assertIn("file_inventory:", rendered)
+
+    def test_changes_panel_renders_file_focus_in_header(self) -> None:
+        state = TuiState(selected_change_stack="redo")
+
+        rendered = state.render_changes_panel(
+            selected_file_context_metadata={
+                "file_context_scope": "change",
+                "file_context_file_count": 2,
+                "file_context_files": [
+                    {
+                        "path": "demo.py",
+                        "source": "selected_change",
+                        "change_id": "9876abcd",
+                        "target": {
+                            "action": "open_file",
+                            "path": "demo.py",
+                            "line": 4,
+                            "label": "demo file",
+                        },
+                        "target_summary": "open_file demo.py:4",
+                    },
+                    {
+                        "path": "alt.py",
+                        "source": "selected_change",
+                        "change_id": "9876abcd",
+                        "target": {
+                            "action": "open_file",
+                            "path": "alt.py",
+                            "line": 8,
+                            "label": "alt file",
+                        },
+                        "diff_targets": {
+                            "hunks": [
+                                {
+                                    "action": "open_diff",
+                                    "path": "alt.py",
+                                    "line": 11,
+                                    "label": "alt diff",
+                                }
+                            ]
+                        },
+                        "target_summary": "open_file alt.py:8",
+                        "diff_target_count": 1,
+                    },
+                ],
+            },
+            selected_file_index=1,
+        )
+
+        self.assertIn("Changes [redo file 2/2 alt.py]", rendered)
+        self.assertIn("Focused file", rendered)
+        self.assertIn("source: selected_change", rendered)
+        self.assertIn("related change: 9876abcd", rendered)
+        self.assertIn("file_focus: 2/2", rendered)
+        self.assertIn("focused_file: alt.py", rendered)
+        self.assertIn("diff hunks: 1", rendered)
+        self.assertIn("context-only: no", rendered)
+        self.assertIn("primary target: open_file alt.py:8 alt file", rendered)
+        self.assertIn("secondary target: open_diff alt.py:11 alt diff", rendered)
+        self.assertIn("navigation: F9 primary target, F10 secondary target", rendered)
+        self.assertIn("navigation_f9: open_file alt.py:8 alt file", rendered)
+        self.assertIn("navigation_f10: open_diff alt.py:11 alt diff", rendered)
+        self.assertIn("file_inventory:", rendered)
+
     def test_status_panel_renders_planning_lifecycle_fields(self) -> None:
         state = TuiState()
 
@@ -240,6 +494,85 @@ class TuiStateTests(unittest.TestCase):
                 "recent_change_sets: 2\n"
                 "redo_change_sets: 0\n"
             ),
+            focused_file_context_metadata={
+                "file_context_scope": "task",
+                "file_context_file_count": 2,
+                "file_context_files": [
+                    {
+                        "path": "claudecode_py/session.py",
+                        "target": {
+                            "action": "open_file",
+                            "path": "claudecode_py/session.py",
+                            "line": 12,
+                            "label": "task file",
+                        },
+                    },
+                    {
+                        "path": "claudecode_py/cli.py",
+                        "change_id": "abc12345",
+                        "target": {
+                            "action": "open_file",
+                            "path": "claudecode_py/cli.py",
+                            "line": 44,
+                            "label": "cli file",
+                        },
+                        "diff_targets": {
+                            "hunks": [
+                                {
+                                    "action": "open_diff",
+                                    "path": "claudecode_py/cli.py",
+                                    "line": 47,
+                                    "label": "cli diff",
+                                }
+                            ]
+                        },
+                    },
+                ],
+            },
+            working_set_metadata={
+                "file_context_scope": "session",
+                "file_context_file_count": 2,
+                "file_context_files": [
+                    {
+                        "path": "claudecode_py/session.py",
+                        "scope_reasons": ["active task"],
+                        "is_context_only": True,
+                        "target": {
+                            "action": "open_file",
+                            "path": "claudecode_py/session.py",
+                            "line": 12,
+                            "label": "task file",
+                        },
+                    },
+                    {
+                        "path": "claudecode_py/cli.py",
+                        "change_id": "abc12345",
+                        "scope_reasons": ["active task", "recent change"],
+                        "target": {
+                            "action": "open_file",
+                            "path": "claudecode_py/cli.py",
+                            "line": 44,
+                            "label": "cli file",
+                        },
+                        "diff_targets": {
+                            "hunks": [
+                                {
+                                    "action": "open_diff",
+                                    "path": "claudecode_py/cli.py",
+                                    "line": 47,
+                                    "label": "cli diff",
+                                }
+                            ]
+                        },
+                        "diff_target_count": 1,
+                        "has_related_change": True,
+                        "has_diff_hunks": True,
+                        "is_context_only": False,
+                    },
+                ],
+            },
+            focused_file_context_source="task",
+            focused_file_context_index=1,
         )
 
         self.assertIn("constraints: read-only", rendered)
@@ -249,6 +582,166 @@ class TuiStateTests(unittest.TestCase):
         self.assertIn("last_plan_drift: pending_tools: write_file", rendered)
         self.assertIn("active_plan_kind: ultraplan", rendered)
         self.assertIn("active_plan_goal: map runtime", rendered)
+        self.assertIn("Focused file context", rendered)
+        self.assertIn("source: task", rendered)
+        self.assertIn("shortcuts: Ctrl+Left/Right focus task files", rendered)
+        self.assertIn("focused_file: 2/2", rendered)
+        self.assertIn("focused_file_path: claudecode_py/cli.py", rendered)
+        self.assertIn("related change: abc12345", rendered)
+        self.assertIn("diff hunks: 1", rendered)
+        self.assertIn("context-only: no", rendered)
+        self.assertIn(
+            "secondary target: open_diff claudecode_py/cli.py:47 cli diff",
+            rendered,
+        )
+        self.assertIn(
+            "navigation: F9 primary target, F10 secondary target",
+            rendered,
+        )
+        self.assertIn(
+            "navigation_f9: open_file claudecode_py/cli.py:44 cli file",
+            rendered,
+        )
+        self.assertIn(
+            "navigation_f10: open_diff claudecode_py/cli.py:47 cli diff",
+            rendered,
+        )
+        self.assertIn("Working Set", rendered)
+        self.assertIn("> 2. claudecode_py/cli.py", rendered)
+        self.assertIn("in scope because: active task, recent change", rendered)
+        self.assertIn("related change: abc12345", rendered)
+        self.assertIn("context-only: yes", rendered)
+
+    def test_status_panel_renders_workspace_section_for_unavailable_workspace(self) -> None:
+        state = TuiState()
+
+        rendered = state.render_status_panel(
+            provider_text="provider: openai-compatible\nmodel: demo",
+            config_text=(
+                "provider: openai-compatible\n"
+                "model: demo\n"
+                "session_id: session-1\n"
+                "workspace_mode: snapshot\n"
+                "workspace_label: scout-agent\n"
+                "effective_cwd: C:/tmp/.pyclaude/workspaces/scout-agent\n"
+                "workspace_effective_cwd_exists: no\n"
+                "workspace_health: unavailable\n"
+                "workspace_cleanup_status: failed\n"
+                "workspace_unavailable_reason: isolated workspace path is missing\n"
+                "workspace_fallback_cwd: C:/repo\n"
+                "workspace_recommended_actions: /workspaces list, /workspaces repair scout-agent, /workspaces cleanup\n"
+                "selected_workspace_primary_action: workspace_repair session-1\n"
+                "selected_workspace_secondary_action: workspace_cleanup_preview\n"
+                "selected_workspace_tertiary_action: /workspaces list\n"
+                "selected_workspace_target: session-1\n"
+            ),
+        )
+
+        self.assertIn("Workspace", rendered)
+        self.assertIn("workspace_mode: snapshot", rendered)
+        self.assertIn("workspace_health: unavailable", rendered)
+        self.assertIn("workspace_label: scout-agent", rendered)
+        self.assertIn("effective_cwd: C:/tmp/.pyclaude/workspaces/scout-agent", rendered)
+        self.assertIn("workspace_effective_cwd_exists: no", rendered)
+        self.assertIn("workspace_cleanup_status: failed", rendered)
+        self.assertIn(
+            "workspace_expected_effective_cwd: C:/tmp/.pyclaude/workspaces/scout-agent",
+            rendered,
+        )
+        self.assertIn("workspace_fallback_cwd: C:/repo", rendered)
+        self.assertIn("workspace_unavailable_reason: isolated workspace path is missing", rendered)
+        self.assertIn(
+            "workspace_recommended_actions: /workspaces list, /workspaces repair scout-agent, /workspaces cleanup",
+            rendered,
+        )
+        self.assertIn("selected_workspace_primary_action: workspace_repair session-1", rendered)
+        self.assertIn("selected_workspace_secondary_action: workspace_cleanup_preview", rendered)
+        self.assertIn("selected_workspace_tertiary_action: /workspaces list", rendered)
+        self.assertIn("selected_workspace_target: session-1", rendered)
+
+    def test_status_panel_renders_structured_symbol_section(self) -> None:
+        state = TuiState()
+
+        rendered = state.render_status_panel(
+            provider_text="provider: fake\nmodel: demo",
+            config_text="provider: openai-compatible\nmodel: gpt-test\nsession_id: session-1\n",
+            symbol_surface_metadata={
+                "surface_kind": "symbol_actions",
+                "selected_symbol": "build",
+                "match_count": 1,
+                "definition_count": 1,
+                "reference_count": 1,
+                "selected_match_index": 0,
+                "selected_definition_index": 0,
+                "selected_reference_index": 0,
+                "selected_definition": {
+                    "action": "open_symbol",
+                    "path": "demo.py",
+                    "line": 1,
+                    "label": "function build",
+                },
+                "selected_reference": {
+                    "action": "open_reference",
+                    "path": "demo.py",
+                    "line": 4,
+                    "label": "value = build()",
+                },
+                "navigation_target": {
+                    "action": "open_symbol",
+                    "path": "demo.py",
+                    "line": 1,
+                    "label": "function build",
+                },
+                "symbol_primary_action": "/symbol open primary",
+                "symbol_secondary_action": "/symbol open secondary",
+                "symbol_tertiary_action": "/symbol clear",
+                "symbol_action_target": "build",
+                "definitions": [
+                    {
+                        "action": "open_symbol",
+                        "path": "demo.py",
+                        "line": 1,
+                        "label": "function build",
+                    },
+                    {
+                        "action": "open_symbol",
+                        "path": "demo.py",
+                        "line": 10,
+                        "label": "function build backup",
+                    },
+                ],
+                "references": [
+                    {
+                        "action": "open_reference",
+                        "path": "demo.py",
+                        "line": 4,
+                        "label": "value = build()",
+                    }
+                ],
+            },
+            symbol_focus_group="definitions",
+            symbol_focus_index=0,
+        )
+
+        self.assertIn("Symbol", rendered)
+        self.assertIn("symbol_surface_kind: symbol_actions", rendered)
+        self.assertIn("symbol_selected_symbol: build", rendered)
+        self.assertIn("symbol_selected_match_index: 1/1", rendered)
+        self.assertIn("symbol_selected_definition_index: 1/1", rendered)
+        self.assertIn("symbol_selected_reference_index: 1/1", rendered)
+        self.assertIn("symbol_selected_definition: open_symbol demo.py:1 (function build)", rendered)
+        self.assertIn("symbol_selected_reference: open_reference demo.py:4 (value = build())", rendered)
+        self.assertIn("symbol_selected_navigation_target: open_symbol demo.py:1 (function build)", rendered)
+        self.assertIn("symbol_definitions:", rendered)
+        self.assertIn("> 1. open_symbol demo.py:1 (function build)", rendered)
+        self.assertIn("- 2. open_symbol demo.py:10 (function build backup)", rendered)
+        self.assertIn("symbol_references:", rendered)
+        self.assertIn("Symbol focus", rendered)
+        self.assertIn("symbol_focus_group: definitions", rendered)
+        self.assertIn("symbol_focus_index: 1", rendered)
+        self.assertIn("symbol_focus_target: open_symbol demo.py:1 (function build)", rendered)
+        self.assertIn("symbol_primary_action: /symbol open primary", rendered)
+        self.assertIn("symbol_secondary_action: /symbol open secondary", rendered)
 
     def test_task_panel_renders_existing_tasks(self) -> None:
         state = TuiState()
@@ -261,6 +754,502 @@ class TuiStateTests(unittest.TestCase):
         self.assertIn("status=running", rendered)
         self.assertIn("Analyze repository", rendered)
 
+    def test_task_panel_renders_workspace_maintenance_hints(self) -> None:
+        state = TuiState()
+
+        rendered = state.render_task_panel(
+            "task-1  status=completed  kind=workspace  description=Repair isolated workspace  "
+            "workspace_action=repair workspace_target=scout-agent health_before=unavailable health_after=cleanup_pending"
+        )
+
+        self.assertIn("Workspace hints", rendered)
+        self.assertIn("task: task-1", rendered)
+        self.assertIn("workspace_action: repair", rendered)
+        self.assertIn("workspace_target: scout-agent", rendered)
+        self.assertIn("health_before: unavailable", rendered)
+        self.assertIn("health_after: cleanup_pending", rendered)
+
+    def test_task_panel_renders_execution_focus_hints_for_child_task(self) -> None:
+        state = TuiState(selected_task_id="task-123")
+
+        rendered = state.render_task_panel(
+            "task-123  status=running  kind=agent  description=Analyze repository",
+            selected_task_id=state.selected_task_id,
+            task_execution_metadata={
+                "task_surface": "child_execution",
+                "execution_mode": "read-only-subagent",
+                "execution_policy": "review",
+                "execution_policy_source": "session_execution_contract",
+                "allowed_tools": ["read_file", "find_in_files"],
+                "allowed_bash_prefixes": ["git diff", "git show"],
+                "read_only_subagents": True,
+                "workspace_mode": "snapshot",
+                "workspace_health": "healthy",
+            },
+        )
+
+        self.assertIn("Execution focus", rendered)
+        self.assertIn("task: task-123", rendered)
+        self.assertIn("task_surface: child_execution", rendered)
+        self.assertIn("execution_mode: read-only-subagent", rendered)
+        self.assertIn("execution_policy: review", rendered)
+        self.assertIn("execution_policy_source: session_execution_contract", rendered)
+        self.assertIn("allowed_tools: read_file, find_in_files", rendered)
+        self.assertIn("allowed_bash_prefixes: git diff, git show", rendered)
+        self.assertIn("read_only_subagents: yes", rendered)
+        self.assertIn("workspace_mode: snapshot", rendered)
+        self.assertIn("workspace_health: healthy", rendered)
+
+    def test_task_panel_renders_checklist_hints(self) -> None:
+        state = TuiState()
+
+        rendered = state.render_task_panel(
+            "session_checklist:\n"
+            "session_checklist_tasks: 1\n"
+            "session_checklist_in_progress: 1\n"
+            "- check-123  status=in_progress  subject=Inspect runtime  "
+            "selected_checklist_primary_action=checklist_mark_completed check-123  "
+            "selected_checklist_secondary_action=checklist_reopen check-123  "
+            "selected_checklist_target=check-123"
+        )
+
+        self.assertIn("Checklist hints", rendered)
+        self.assertIn("task: check-123", rendered)
+        self.assertIn("status: in_progress", rendered)
+        self.assertIn("subject: Inspect runtime", rendered)
+        self.assertIn("selected_checklist_primary_action: checklist_mark_completed check-123", rendered)
+        self.assertIn("selected_checklist_secondary_action: checklist_reopen check-123", rendered)
+
+    def test_task_panel_renders_checklist_duplicate_guard_block(self) -> None:
+        state = TuiState()
+
+        rendered = state.render_task_panel(
+            "No background tasks.",
+            checklist_duplicate_metadata={
+                "checklist_duplicate_message": "Possible duplicate checklist task.",
+                "checklist_duplicate_matched_task_id": "check-123",
+                "checklist_duplicate_recommended_action": "Call session_task_get check-123, then session_task_update check-123.",
+            },
+        )
+
+        self.assertIn("Checklist duplicate guard", rendered)
+        self.assertIn("message: Possible duplicate checklist task.", rendered)
+        self.assertIn("matched_task_id: check-123", rendered)
+        self.assertIn("recommended_action: Call session_task_get check-123, then session_task_update check-123.", rendered)
+
+    def test_task_panel_prefers_structured_checklist_section(self) -> None:
+        state = TuiState(selected_checklist_task_id="check-456")
+
+        rendered = state.render_task_panel(
+            "session_checklist:\n"
+            "session_checklist_tasks: 2\n"
+            "session_checklist_in_progress: 1\n"
+            "- check-123  status=pending  subject=Inspect runtime\n"
+            "- check-456  status=in_progress  subject=Patch runtime\n\n"
+            "No background tasks.",
+            selected_checklist_task_id=state.selected_checklist_task_id,
+            checklist_tasks=[
+                {
+                    "id": "check-123",
+                    "subject": "Inspect runtime",
+                    "status": "pending",
+                    "owner": "",
+                    "active_form": "Inspecting runtime",
+                    "blocks": [],
+                    "blocked_by": [],
+                    "selected_checklist_primary_action": "checklist_mark_in_progress check-123",
+                    "selected_checklist_secondary_action": "checklist_mark_completed check-123",
+                    "selected_checklist_edit_subject_action": "checklist_set_subject check-123",
+                    "selected_checklist_edit_description_action": "checklist_set_description check-123",
+                    "selected_checklist_edit_owner_action": "checklist_set_owner check-123",
+                    "selected_checklist_edit_active_form_action": "checklist_set_active_form check-123",
+                    "selected_checklist_edit_blocks_action": "checklist_set_blocks check-123",
+                    "selected_checklist_edit_blocked_by_action": "checklist_set_blocked_by check-123",
+                    "selected_checklist_edit_metadata_action": "checklist_set_metadata check-123",
+                    "selected_checklist_target": "check-123",
+                },
+                {
+                    "id": "check-456",
+                    "subject": "Patch runtime",
+                    "status": "in_progress",
+                    "owner": "assistant",
+                    "active_form": "Patching runtime",
+                    "blocks": ["check-123"],
+                    "blocked_by": [],
+                    "selected_checklist_primary_action": "checklist_mark_completed check-456",
+                    "selected_checklist_secondary_action": "checklist_reopen check-456",
+                    "selected_checklist_edit_subject_action": "checklist_set_subject check-456",
+                    "selected_checklist_edit_description_action": "checklist_set_description check-456",
+                    "selected_checklist_edit_owner_action": "checklist_set_owner check-456",
+                    "selected_checklist_edit_active_form_action": "checklist_set_active_form check-456",
+                    "selected_checklist_edit_blocks_action": "checklist_set_blocks check-456",
+                    "selected_checklist_edit_blocked_by_action": "checklist_set_blocked_by check-456",
+                    "selected_checklist_edit_metadata_action": "checklist_set_metadata check-456",
+                    "selected_checklist_target": "check-456",
+                },
+            ],
+        )
+
+        self.assertIn("Session Checklist", rendered)
+        self.assertIn("filter: all", rendered)
+        self.assertIn("sort: recent_updated", rendered)
+        self.assertIn("total: 2", rendered)
+        self.assertIn("in_progress: 1", rendered)
+        self.assertIn("in_progress (1):", rendered)
+        self.assertIn("pending (1):", rendered)
+        self.assertIn("  check-123 [pending] Inspect runtime", rendered)
+        self.assertIn("> check-456 [in_progress] Patch runtime", rendered)
+        self.assertIn("  owner: assistant", rendered)
+        self.assertIn("  active_form: Patching runtime", rendered)
+        self.assertIn("  dependencies: blocks=1 blocked_by=0", rendered)
+        self.assertIn("Checklist focus", rendered)
+        self.assertIn("> check-456  status=in_progress  subject=Patch runtime", rendered)
+        self.assertIn("Checklist hints", rendered)
+        self.assertIn("selected_checklist_edit_metadata_action: checklist_set_metadata check-456", rendered)
+        self.assertNotIn("session_checklist:", rendered)
+
+    def test_task_panel_renders_filtered_structured_checklist_section(self) -> None:
+        state = TuiState(selected_checklist_task_id="check-456", checklist_filter="in_progress")
+
+        rendered = state.render_task_panel(
+            "No background tasks.",
+            selected_checklist_task_id=state.selected_checklist_task_id,
+            checklist_tasks=[
+                {
+                    "id": "check-123",
+                    "subject": "Inspect runtime",
+                    "status": "pending",
+                    "owner": "",
+                    "active_form": "Inspecting runtime",
+                    "blocks": [],
+                    "blocked_by": [],
+                },
+                {
+                    "id": "check-456",
+                    "subject": "Patch runtime",
+                    "status": "in_progress",
+                    "owner": "assistant",
+                    "active_form": "Patching runtime",
+                    "blocks": ["check-123"],
+                    "blocked_by": [],
+                    "selected_checklist_primary_action": "checklist_mark_completed check-456",
+                    "selected_checklist_secondary_action": "checklist_reopen check-456",
+                    "selected_checklist_target": "check-456",
+                },
+            ],
+            checklist_filter=state.checklist_filter,
+        )
+
+        self.assertIn("filter: in_progress", rendered)
+        self.assertIn("sort: recent_updated", rendered)
+        self.assertIn("in_progress (1):", rendered)
+        self.assertNotIn("pending (1):", rendered)
+        self.assertNotIn("check-123 [pending]", rendered)
+        self.assertIn("> check-456 [in_progress] Patch runtime", rendered)
+
+    def test_task_panel_renders_owner_sorted_checklist_section(self) -> None:
+        state = TuiState(selected_checklist_task_id="check-2", checklist_sort="owner")
+
+        rendered = state.render_task_panel(
+            "No background tasks.",
+            selected_checklist_task_id=state.selected_checklist_task_id,
+            checklist_filter=state.checklist_filter,
+            checklist_sort=state.checklist_sort,
+            checklist_tasks=[
+                {
+                    "id": "check-1",
+                    "subject": "Beta",
+                    "status": "pending",
+                    "owner": "zoe",
+                    "active_form": "Doing beta",
+                    "blocks": [],
+                    "blocked_by": [],
+                },
+                {
+                    "id": "check-2",
+                    "subject": "Alpha",
+                    "status": "pending",
+                    "owner": "alice",
+                    "active_form": "Doing alpha",
+                    "blocks": [],
+                    "blocked_by": [],
+                },
+            ],
+        )
+
+        self.assertIn("sort: owner", rendered)
+        alpha_index = rendered.index("> check-2 [pending] Alpha")
+        beta_index = rendered.index("  check-1 [pending] Beta")
+        self.assertLess(alpha_index, beta_index)
+
+    def test_task_panel_renders_selected_checklist_focus(self) -> None:
+        state = TuiState(selected_checklist_task_id="check-456")
+
+        rendered = state.render_task_panel(
+            "session_checklist:\n"
+            "session_checklist_tasks: 2\n"
+            "session_checklist_in_progress: 1\n"
+            "- check-123  status=pending  subject=Inspect runtime\n"
+            "- check-456  status=in_progress  subject=Patch runtime\n\n"
+            "No background tasks.",
+            selected_checklist_task_id=state.selected_checklist_task_id,
+        )
+
+        self.assertIn("Checklist focus", rendered)
+        self.assertIn("  check-123  status=pending  subject=Inspect runtime", rendered)
+        self.assertIn("> check-456  status=in_progress  subject=Patch runtime", rendered)
+
+    def test_task_detail_panel_renders_selected_task(self) -> None:
+        state = TuiState()
+        state.set_task_detail(task_id="task-123", text="task_id: task-123\nstatus: running")
+
+        rendered = state.render_task_detail_panel(state.task_detail_text)
+
+        self.assertIn("Task Detail [detail] [task-123]", rendered)
+        self.assertIn("status: running", rendered)
+
+    def test_task_detail_panel_prefers_structured_workspace_metadata(self) -> None:
+        state = TuiState()
+        state.set_task_detail(
+            task_id="task-123",
+            text="task_id: task-123\nstatus: completed",
+            workspace_metadata={
+                "workspace_action": "cleanup",
+                "workspace_target": "orphan-agent",
+                "workspace_health_before": "orphaned",
+                "workspace_health_after": "healthy",
+                "workspace_recommended_actions": [
+                    "/workspaces list",
+                    "/workspaces cleanup",
+                    "/workspaces cleanup apply orphan-agent",
+                ],
+                "workspace_planned_paths": ["C:/tmp/orphan-agent"],
+                "workspace_applied_paths": ["C:/tmp/orphan-agent"],
+                "workspace_failure_reason": "cleanup backend failed",
+            },
+        )
+
+        rendered = state.render_task_detail_panel(state.task_detail_text)
+
+        self.assertIn("Workspace", rendered)
+        self.assertIn("workspace_action: cleanup", rendered)
+        self.assertIn("workspace_target: orphan-agent", rendered)
+        self.assertIn("workspace_health_before: orphaned", rendered)
+        self.assertIn("workspace_health_after: healthy", rendered)
+        self.assertIn("workspace_recommended_actions:", rendered)
+        self.assertIn("- /workspaces list", rendered)
+        self.assertIn("- /workspaces cleanup", rendered)
+        self.assertIn("- /workspaces cleanup apply orphan-agent", rendered)
+        self.assertIn("workspace_planned_paths:", rendered)
+        self.assertIn("workspace_applied_paths:", rendered)
+        self.assertIn("workspace_failure_reason: cleanup backend failed", rendered)
+
+    def test_task_detail_panel_prefers_structured_execution_metadata(self) -> None:
+        state = TuiState()
+        state.set_task_detail(
+            task_id="task-123",
+            text="task_id: task-123\nstatus: completed",
+            execution_metadata={
+                "task_surface": "child_execution",
+                "execution_mode": "read-only-subagent",
+                "execution_policy": "review",
+                "execution_policy_source": "session_execution_contract",
+                "allowed_tools": ["read_file", "find_in_files"],
+                "allowed_bash_prefixes": ["git diff", "git show"],
+                "read_only_subagents": True,
+                "workspace_mode": "snapshot",
+                "workspace_health": "healthy",
+            },
+        )
+
+        rendered = state.render_task_detail_panel(state.task_detail_text)
+
+        self.assertIn("Execution", rendered)
+        self.assertIn("task_surface: child_execution", rendered)
+        self.assertIn("execution_mode: read-only-subagent", rendered)
+        self.assertIn("execution_policy: review", rendered)
+        self.assertIn("execution_policy_source: session_execution_contract", rendered)
+        self.assertIn("allowed_tools: read_file, find_in_files", rendered)
+        self.assertIn("allowed_bash_prefixes: git diff, git show", rendered)
+        self.assertIn("read_only_subagents: yes", rendered)
+        self.assertIn("workspace_mode: snapshot", rendered)
+        self.assertIn("workspace_health: healthy", rendered)
+
+    def test_task_detail_panel_prefers_structured_checklist_metadata(self) -> None:
+        state = TuiState()
+        state.set_task_detail(
+            task_id="check-123",
+            text="task_id: check-123\nstatus: in_progress",
+            checklist_metadata={
+                "checklist_task_id": "check-123",
+                "checklist_task_list_id": "session-1",
+                "checklist_subject": "Inspect runtime",
+                "checklist_description": "Inspect session.py",
+                "checklist_active_form": "Inspecting runtime",
+                "checklist_status": "in_progress",
+                "checklist_owner": "assistant",
+                "checklist_blocks": ["task-b"],
+                "checklist_blocked_by": ["task-a"],
+                "checklist_metadata": {"area": "runtime"},
+                "checklist_created_at": "2026-05-01T00:00:00+00:00",
+                "checklist_updated_at": "2026-05-02T00:00:00+00:00",
+                "checklist_total_tasks": 2,
+                "checklist_in_progress_tasks": 1,
+                "checklist_recommended_actions": [
+                    "session_task_get check-123",
+                    "session_task_update check-123 status=completed",
+                    "session_task_list",
+                ],
+                "checklist_duplicate_message": "Possible duplicate checklist task.",
+                "checklist_duplicate_reason": "Matched existing checklist task by subject, description, and active_form.",
+                "checklist_duplicate_matched_task_id": "check-123",
+                "checklist_duplicate_recommended_action": "Call session_task_get check-123, then session_task_update check-123.",
+                "selected_checklist_primary_action": "checklist_mark_completed check-123",
+                "selected_checklist_secondary_action": "checklist_reopen check-123",
+                "selected_checklist_edit_subject_action": "checklist_set_subject check-123",
+                "selected_checklist_edit_description_action": "checklist_set_description check-123",
+                "selected_checklist_edit_owner_action": "checklist_set_owner check-123",
+                "selected_checklist_edit_active_form_action": "checklist_set_active_form check-123",
+                "selected_checklist_edit_blocks_action": "checklist_set_blocks check-123",
+                "selected_checklist_edit_blocked_by_action": "checklist_set_blocked_by check-123",
+                "selected_checklist_edit_metadata_action": "checklist_set_metadata check-123",
+                "selected_checklist_tertiary_action": "session_task_list",
+                "selected_checklist_target": "check-123",
+            },
+        )
+
+        rendered = state.render_task_detail_panel(state.task_detail_text)
+
+        self.assertIn("Checklist", rendered)
+        self.assertIn("checklist_task_id: check-123", rendered)
+        self.assertIn("checklist_subject: Inspect runtime", rendered)
+        self.assertIn("checklist_description: Inspect session.py", rendered)
+        self.assertIn("checklist_active_form: Inspecting runtime", rendered)
+        self.assertIn("checklist_status: in_progress", rendered)
+        self.assertIn("checklist_owner: assistant", rendered)
+        self.assertIn("checklist_blocks:", rendered)
+        self.assertIn("- task-b", rendered)
+        self.assertIn("checklist_blocked_by:", rendered)
+        self.assertIn("- task-a", rendered)
+        self.assertIn("checklist_metadata:", rendered)
+        self.assertIn("- area: runtime", rendered)
+        self.assertIn("checklist_recommended_actions:", rendered)
+        self.assertIn("- session_task_get check-123", rendered)
+        self.assertIn("checklist_duplicate_guard:", rendered)
+        self.assertIn("checklist_duplicate_matched_task_id: check-123", rendered)
+        self.assertIn("checklist_duplicate_recommended_action: Call session_task_get check-123, then session_task_update check-123.", rendered)
+        self.assertIn("selected_checklist_primary_action: checklist_mark_completed check-123", rendered)
+        self.assertIn("selected_checklist_secondary_action: checklist_reopen check-123", rendered)
+        self.assertIn("selected_checklist_edit_subject_action: checklist_set_subject check-123", rendered)
+        self.assertIn(
+            "selected_checklist_edit_description_action: checklist_set_description check-123",
+            rendered,
+        )
+        self.assertIn("selected_checklist_edit_owner_action: checklist_set_owner check-123", rendered)
+        self.assertIn("selected_checklist_edit_active_form_action: checklist_set_active_form check-123", rendered)
+        self.assertIn("selected_checklist_edit_blocks_action: checklist_set_blocks check-123", rendered)
+        self.assertIn(
+            "selected_checklist_edit_blocked_by_action: checklist_set_blocked_by check-123",
+            rendered,
+        )
+        self.assertIn(
+            "selected_checklist_edit_metadata_action: checklist_set_metadata check-123",
+            rendered,
+        )
+
+    def test_task_detail_panel_renders_workspace_hint_block(self) -> None:
+        state = TuiState()
+        state.set_task_detail(
+            task_id="task-123",
+            text=(
+                "task_id: task-123\n"
+                "status: completed\n"
+                "workspace_action: cleanup\n"
+                "workspace_target: orphan-agent\n"
+                "workspace_health_before: orphaned\n"
+                "workspace_health_after: healthy\n"
+                "workspace_health: healthy\n"
+                "workspace_recommended_actions: /workspaces list\n"
+                "workspace_planned_paths:\n"
+                "- C:/tmp/orphan-agent\n"
+                "workspace_applied_paths:\n"
+                "- C:/tmp/orphan-agent\n"
+                "workspace_failure_reason: cleanup backend failed\n"
+                "selected_workspace_primary_action: workspace_cleanup_preview\n"
+                "selected_workspace_secondary_action: workspace_cleanup_apply orphan-agent\n"
+                "selected_workspace_tertiary_action: /workspaces list\n"
+                "selected_workspace_target: orphan-agent\n"
+            ),
+        )
+
+        rendered = state.render_task_detail_panel(state.task_detail_text)
+
+        self.assertIn("Task Detail [detail] [task-123]", rendered)
+        self.assertIn("Workspace", rendered)
+        self.assertIn("workspace_action: cleanup", rendered)
+        self.assertIn("workspace_target: orphan-agent", rendered)
+        self.assertIn("workspace_health_before: orphaned", rendered)
+        self.assertIn("workspace_health_after: healthy", rendered)
+        self.assertIn("workspace_recommended_actions: /workspaces list", rendered)
+        self.assertIn("workspace_planned_paths:", rendered)
+        self.assertIn("- C:/tmp/orphan-agent", rendered)
+        self.assertIn("workspace_applied_paths:", rendered)
+        self.assertIn("workspace_failure_reason: cleanup backend failed", rendered)
+        self.assertIn("selected_workspace_primary_action: workspace_cleanup_preview", rendered)
+        self.assertIn("selected_workspace_secondary_action: workspace_cleanup_apply orphan-agent", rendered)
+        self.assertIn("selected_workspace_target: orphan-agent", rendered)
+
+    def test_task_detail_panel_renders_execution_hint_block_from_text(self) -> None:
+        state = TuiState()
+        state.set_task_detail(
+            task_id="task-123",
+            text=(
+                "task_id: task-123\n"
+                "status: running\n"
+                "execution_contract:\n"
+                "- task_surface: background_execution\n"
+                "- execution_mode: background\n"
+                "- execution_policy: review\n"
+                "- execution_policy_source: session_execution_contract\n"
+                "- allowed_tools: read_file, find_in_files\n"
+                "- allowed_bash_prefixes: git diff, git show\n"
+                "- read_only_subagents: yes\n"
+                "- workspace_mode: snapshot\n"
+                "- workspace_health: healthy\n"
+            ),
+        )
+
+        rendered = state.render_task_detail_panel(state.task_detail_text)
+
+        self.assertIn("Execution", rendered)
+        self.assertIn("task_surface: background_execution", rendered)
+        self.assertIn("execution_mode: background", rendered)
+        self.assertIn("allowed_tools: read_file, find_in_files", rendered)
+        self.assertIn("allowed_bash_prefixes: git diff, git show", rendered)
+        self.assertIn("read_only_subagents: yes", rendered)
+
+    def test_task_detail_panel_can_switch_subviews(self) -> None:
+        state = TuiState()
+        state.set_task_detail(
+            task_id="task-123",
+            text="task detail",
+            execution_metadata={"task_surface": "child_execution", "execution_mode": "scout"},
+        )
+        state.set_task_advisor_detail(task_id="task-123", text="advisor detail")
+        rendered_advisor = state.render_task_detail_panel(state.task_advisor_text)
+        state.set_task_drift_detail(task_id="task-123", text="drift detail")
+        rendered_drift = state.render_task_detail_panel(state.task_drift_text)
+        state.set_task_detail_view("detail")
+        rendered_detail = state.render_task_detail_panel(state.task_detail_text)
+
+        self.assertIn("Task Detail [advisor] [task-123]", rendered_advisor)
+        self.assertIn("advisor detail", rendered_advisor)
+        self.assertIn("Task Detail [drift] [task-123]", rendered_drift)
+        self.assertIn("drift detail", rendered_drift)
+        self.assertIn("Task Detail [detail] [task-123]", rendered_detail)
+        self.assertNotIn("Execution", rendered_advisor)
+        self.assertNotIn("Execution", rendered_drift)
+
     def test_plan_panel_renders_active_plan_detail(self) -> None:
         state = TuiState()
 
@@ -272,6 +1261,103 @@ class TuiStateTests(unittest.TestCase):
         self.assertIn("artifact_id: plan-1", rendered)
         self.assertIn("advisor_review:", rendered)
         self.assertIn("scout_outputs:", rendered)
+
+    def test_plan_panel_can_switch_subviews(self) -> None:
+        state = TuiState()
+
+        state.set_plan_panel_view("scouts")
+        rendered_scouts = state.render_plan_panel("scout_outputs:\n- scout-1: status=completed")
+        state.set_plan_panel_view("execution")
+        rendered_execution = state.render_plan_panel("execution_tasks:\n- exec-1: status=running")
+        state.set_plan_panel_view("lineage")
+        rendered_lineage = state.render_plan_panel("lineage:\n- plan-1 (current, active)")
+        state.set_plan_panel_view("audit")
+        rendered_audit = state.render_plan_panel("lineage_audit_summary:\n- artifacts: 2")
+        state.set_plan_panel_view("advisor")
+        rendered_advisor = state.render_plan_panel("advisor_review:\n- status: block")
+        state.set_plan_panel_view("timeline")
+        rendered_timeline = state.render_plan_panel("timeline:\n- 2026-01-01T00:00:00Z [plan] created")
+
+        self.assertIn("Active Plan [scouts]", rendered_scouts)
+        self.assertIn("scout_outputs:", rendered_scouts)
+        self.assertIn("Active Plan [execution]", rendered_execution)
+        self.assertIn("execution_tasks:", rendered_execution)
+        self.assertIn("Active Plan [lineage]", rendered_lineage)
+        self.assertIn("lineage:", rendered_lineage)
+        self.assertIn("Active Plan [audit]", rendered_audit)
+        self.assertIn("lineage_audit_summary:", rendered_audit)
+        self.assertIn("Active Plan [advisor]", rendered_advisor)
+        self.assertIn("advisor_review:", rendered_advisor)
+        self.assertIn("Active Plan [timeline]", rendered_timeline)
+        self.assertIn("timeline:", rendered_timeline)
+
+    def test_plan_panel_tracks_selected_scout_index(self) -> None:
+        state = TuiState()
+
+        state.move_plan_scout_selection(1)
+        state.move_plan_scout_selection(1)
+        state.move_plan_scout_selection(-1)
+        state.move_plan_scout_selection(-5)
+
+        self.assertEqual(state.selected_plan_scout_index, 0)
+
+    def test_plan_panel_tracks_scout_detail_mode(self) -> None:
+        state = TuiState()
+
+        state.set_plan_scout_detail_mode("full")
+        self.assertEqual(state.plan_scout_detail_mode, "full")
+        state.set_plan_scout_detail_mode("compact")
+        self.assertEqual(state.plan_scout_detail_mode, "compact")
+
+    def test_plan_panel_tracks_selected_execution_index(self) -> None:
+        state = TuiState()
+
+        state.move_plan_execution_selection(1)
+        state.move_plan_execution_selection(1)
+        state.move_plan_execution_selection(-1)
+        state.move_plan_execution_selection(-5)
+
+        self.assertEqual(state.selected_plan_execution_index, 0)
+
+    def test_plan_panel_tracks_selected_lineage_index(self) -> None:
+        state = TuiState()
+
+        state.move_plan_lineage_selection(1)
+        state.move_plan_lineage_selection(1)
+        state.move_plan_lineage_selection(-1)
+        state.move_plan_lineage_selection(-5)
+
+        self.assertEqual(state.selected_plan_lineage_index, 0)
+
+    def test_plan_panel_tracks_selected_timeline_index(self) -> None:
+        state = TuiState()
+
+        state.move_plan_timeline_selection(1)
+        state.move_plan_timeline_selection(1)
+        state.move_plan_timeline_selection(-1)
+        state.move_plan_timeline_selection(-5)
+
+        self.assertEqual(state.selected_plan_timeline_index, 0)
+
+    def test_plan_panel_cycles_timeline_filter(self) -> None:
+        state = TuiState()
+
+        state.cycle_plan_timeline_filter()
+        self.assertEqual(state.plan_timeline_filter, "plan")
+        state.cycle_plan_timeline_filter()
+        self.assertEqual(state.plan_timeline_filter, "scout")
+
+    def test_plan_panel_cycles_timeline_delta_and_focus_modes(self) -> None:
+        state = TuiState()
+
+        state.cycle_plan_timeline_delta_mode()
+        self.assertEqual(state.plan_timeline_delta_mode, "before-drift")
+        state.cycle_plan_timeline_delta_mode()
+        self.assertEqual(state.plan_timeline_delta_mode, "after-drift")
+        state.cycle_plan_timeline_focus_mode()
+        self.assertEqual(state.plan_timeline_focus_mode, "scout")
+        state.cycle_plan_timeline_compare_mode()
+        self.assertEqual(state.plan_timeline_compare_mode, "after-drift-vs-all")
 
     def test_advisor_panel_renders_status_detail(self) -> None:
         state = TuiState()
@@ -333,20 +1419,127 @@ class TuiStateTests(unittest.TestCase):
             request=ApprovalRequest(
                 tool_name="bash",
                 reason="Run a shell command in the workspace.",
-                risk_level="dangerous_shell",
-                approval_key="dangerous_shell",
+                risk_level="shell_dangerous",
+                approval_key="shell_dangerous",
                 details='command="Remove-Item demo.txt"',
+                command="Remove-Item demo.txt",
+                target_paths=("demo.txt",),
+                permission_rules=("ask:path:demo",),
+                decision_reason="Matched ask rules: ask:path:demo",
+                command_mode_name="review",
+                command_mode_source="repl:/review",
+                command_mode_allowed_prefixes=("git diff", "git show"),
             )
         )
 
         rendered = state.render_approval_panel()
 
         self.assertIn("Approval", rendered)
-        self.assertIn("risk: dangerous_shell", rendered)
+        self.assertIn("risk: shell_dangerous", rendered)
+        self.assertIn("policy: Matched ask rules: ask:path:demo", rendered)
+        self.assertIn("command_mode:", rendered)
+        self.assertIn("- mode: review", rendered)
+        self.assertIn("- source: repl:/review", rendered)
+        self.assertIn("- allowed_prefixes: git diff, git show", rendered)
+        self.assertIn("matched_rules:", rendered)
+        self.assertIn("- ask:path:demo", rendered)
+        self.assertIn("paths:", rendered)
+        self.assertIn("- demo.txt", rendered)
+        self.assertIn("command: Remove-Item demo.txt", rendered)
         self.assertIn("Preview mirrored in Changes panel.", rendered)
-        self.assertNotIn('command="Remove-Item demo.txt"', rendered)
         self.assertIn("Ctrl+O allow once", rendered)
         self.assertNotIn("Recent changes", rendered)
+
+    def test_approval_panel_renders_workspace_cleanup_request_with_details(self) -> None:
+        state = TuiState()
+        state.pending_approval = PendingApproval(
+            request=ApprovalRequest(
+                tool_name="workspace_cleanup",
+                reason="Delete orphaned isolated workspaces from the local .pyclaude directory.",
+                risk_level="delete",
+                approval_key="workspace_cleanup_delete:orphan-agent",
+                details=(
+                    "Delete orphaned isolated workspaces.\n"
+                    "selector: orphan-agent\n"
+                    "planned_deletions: 1\n"
+                    "planned_targets:\n"
+                        "- workspace=snapshot health=orphaned label=orphan-agent origin=C:/tmp cwd=C:/tmp/orphan-agent cleanup=none session_refs=0 background_refs=0"
+                ),
+                target_paths=(".pyclaude/workspaces/orphan-agent",),
+            )
+        )
+
+        rendered = state.render_approval_panel()
+
+        self.assertIn("Approval", rendered)
+        self.assertIn("risk: delete", rendered)
+        self.assertIn("tool: workspace_cleanup", rendered)
+        self.assertIn("paths:", rendered)
+        self.assertIn("- .pyclaude/workspaces/orphan-agent", rendered)
+        self.assertIn("details:", rendered)
+        self.assertIn("- selector: orphan-agent", rendered)
+        self.assertIn("- planned_deletions: 1", rendered)
+        self.assertNotIn("Preview mirrored in Changes panel.", rendered)
+
+    def test_failed_bash_tool_event_renders_command_mode_context(self) -> None:
+        state = TuiState()
+
+        state.record_runtime_event(
+            RuntimeEvent(
+                kind="tool_started",
+                message='{"command":"git diff | Set-Content out.txt"}',
+                tool_name="bash",
+                tool_call_id="tool-9",
+            )
+        )
+        state.record_runtime_event(
+            RuntimeEvent(
+                kind="tool_failed",
+                message='Bash command is not allowed in command mode "review".',
+                tool_name="bash",
+                tool_call_id="tool-9",
+                duration_ms=8,
+                is_error=True,
+                command_mode_name="review",
+                command_mode_allowed_prefixes=("git diff", "git show"),
+                command_mode_violating_segment="Set-Content out.txt",
+                command_mode_violating_segment_index=2,
+            )
+        )
+
+        rendered = state.render_tool_logs()
+
+        self.assertIn("[ERROR] bash (8ms)", rendered)
+        self.assertIn("detail: Bash command is not allowed in command mode \"review\".", rendered)
+        self.assertIn("command_mode:", rendered)
+        self.assertIn("- mode: review", rendered)
+        self.assertIn("- allowed_prefixes: git diff, git show", rendered)
+        self.assertIn("- violating_segment: segment 2: Set-Content out.txt", rendered)
+
+    def test_failed_permission_tool_event_is_reflected_in_chat_error_block(self) -> None:
+        state = TuiState()
+        state.start_turn("Try restricted command")
+
+        state.record_runtime_event(
+            RuntimeEvent(
+                kind="tool_failed",
+                message='Tool "bash" is denied by session permission rules: deny:path:secrets.',
+                tool_name="bash",
+                tool_call_id="tool-10",
+                duration_ms=5,
+                is_error=True,
+                decision_reason="Matched deny rules: deny:path:secrets [path: secrets.txt]",
+                permission_rules=("deny:path:secrets [path: secrets.txt]",),
+            )
+        )
+
+        rendered = state.render_chat()
+
+        self.assertIn("[Error]\nturn_error:", rendered)
+        self.assertIn('- message: Tool "bash" is denied by session permission rules: deny:path:secrets.', rendered)
+        self.assertIn("- policy: Matched deny rules: deny:path:secrets [path: secrets.txt]", rendered)
+        self.assertIn("- matched_rules:", rendered)
+        self.assertIn("  - deny:path:secrets [path: secrets.txt]", rendered)
 
     def test_changes_panel_renders_recent_changes_and_shortcuts(self) -> None:
         state = TuiState(selected_change_stack="redo", selected_redo_index=0)
@@ -370,7 +1563,7 @@ class TuiStateTests(unittest.TestCase):
         self.assertIn("* 1. 12345678  [edit_file] Updated demo.py (1 file)", rendered)
         self.assertIn("> 1. 87654321  [write_file] Created notes.txt (1 file)", rendered)
         self.assertNotIn("Focused undo", rendered)
-        self.assertIn("Focused redo (1/1):", rendered)
+        self.assertIn("Selected change [redo 1/1]", rendered)
         self.assertIn("Ctrl+Z undo", rendered)
         self.assertIn("Ctrl+Y redo", rendered)
         self.assertIn("Shift+Left/Right focus stack", rendered)
