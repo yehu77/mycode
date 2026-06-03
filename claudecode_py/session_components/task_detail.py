@@ -180,6 +180,33 @@ class TaskDetailSessionComponent:
             "other_task": "other tasks:",
         }.get(surface_kind, f"{surface_kind}:")
 
+    def _background_reverse_hint_lines(self, metadata: dict[str, Any]) -> list[str]:
+        background_session_id = str(metadata.get("background_session_id") or "").strip()
+        background_reverse_hint = str(metadata.get("background_reverse_hint") or "").strip()
+        parent_session_id = str(metadata.get("parent_session_id") or "").strip()
+        task_role = str(metadata.get("task_role") or "").strip()
+        plan_execution_mode = str(metadata.get("plan_execution_mode") or "").strip()
+        child_execution_mode = str(metadata.get("child_execution_mode") or "").strip()
+        is_background_linked = (
+            task_role in {"background", "execution"}
+            or plan_execution_mode == "background_agent"
+            or child_execution_mode == "background-agent"
+        )
+        if not is_background_linked:
+            return []
+        lines = ["background_linkage:"]
+        lines.append(f"- background_session_id: {background_session_id or 'none'}")
+        if background_reverse_hint:
+            lines.append(f"- background_reverse_hint: {background_reverse_hint}")
+        elif parent_session_id:
+            lines.append(
+                "- background_reverse_hint: "
+                + f"owning_session={parent_session_id}; actions=/tasks active | /status workflow"
+            )
+        else:
+            lines.append("- background_reverse_hint: /tasks active | /status workflow")
+        return lines
+
     def _task_surface_counts_payload(self) -> dict[str, int]:
         session = self._session
         counts = {
@@ -411,6 +438,9 @@ class TaskDetailSessionComponent:
     def _task_workflow_entry(self, task: Any) -> dict[str, Any]:
         session = self._session
         metadata = task.metadata or {}
+        background_linkage_lines = self._background_reverse_hint_lines(metadata)
+        background_session_id = str(metadata.get("background_session_id") or "").strip()
+        background_reverse_hint = str(metadata.get("background_reverse_hint") or "").strip()
         context_selection = session.resolve_task_file_context(  # noqa: SLF001
             task.id,
             file_index=0,
@@ -460,6 +490,9 @@ class TaskDetailSessionComponent:
             "diff_hunks": diff_hunks,
             "has_diff_hunks": diff_hunks > 0,
             "is_context_only": context_only,
+            "background_session_id": background_session_id,
+            "background_reverse_hint": background_reverse_hint,
+            "background_linked": bool(background_linkage_lines),
             "action_groups": {
                 "go_to_task": session._dedupe_action_commands(task_actions),  # noqa: SLF001
                 "go_to_change": session._dedupe_action_commands(change_actions),  # noqa: SLF001
@@ -561,6 +594,11 @@ class TaskDetailSessionComponent:
                         ("related change", related_change or None),
                         ("diff hunks", int(entry.get("diff_hunks") or 0)),
                         ("context-only", "yes" if bool(entry.get("is_context_only")) else "no"),
+                        ("background session", str(entry.get("background_session_id") or "").strip() or None),
+                        (
+                            "background reverse hint",
+                            str(entry.get("background_reverse_hint") or "").strip() or None,
+                        ),
                     ],
                     action_groups=action_groups if isinstance(action_groups, dict) and action_groups else None,
                     action_order=("go_to_task", "go_to_change", "go_to_plan", "stay_on_surface"),
@@ -713,6 +751,9 @@ class TaskDetailSessionComponent:
             for key in sorted(task.metadata):
                 value = task.metadata.get(key)
                 lines.append(f"- {key}: {value}")
+        reverse_hint_lines = self._background_reverse_hint_lines(task.metadata or {})
+        if reverse_hint_lines:
+            lines.extend(reverse_hint_lines)
         execution_context_lines = self._render_task_detail_execution_context(task)
         if execution_context_lines:
             lines.append("execution_context:")
@@ -1049,6 +1090,10 @@ class TaskDetailSessionComponent:
             lines.extend(drift_lines)
         else:
             lines.append("(none)")
+        reverse_hint_lines = self._background_reverse_hint_lines(metadata)
+        if reverse_hint_lines:
+            lines.append("")
+            lines.extend(reverse_hint_lines)
         advisor_lines = self._render_task_detail_advisor_context(
             self._task_execution_planning_artifact(metadata),
             metadata,
@@ -1130,6 +1175,10 @@ class TaskDetailSessionComponent:
                 preserve_current_focus=False,
             )
         ]
+        reverse_hint_lines = self._background_reverse_hint_lines(metadata)
+        if reverse_hint_lines:
+            lines.append("")
+            lines.extend(reverse_hint_lines)
         file_context_payload = task_context["payload"]
         file_context_sections = self._session.render_resolved_file_context_sections(task_context)  # noqa: SLF001
         if file_context_sections:

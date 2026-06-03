@@ -12,6 +12,17 @@ class LoadedSkill:
     description: str = ""
     auto_enable: bool = False
     tags: tuple[str, ...] = ()
+    source: str = "project-local"
+    source_owner: str = "workspace"
+
+
+@dataclass(slots=True, frozen=True)
+class SkillLoadDiagnostic:
+    name: str
+    source: str
+    path: Path
+    error: str
+    source_owner: str = "workspace"
 
 
 @dataclass(slots=True, frozen=True)
@@ -19,6 +30,7 @@ class ProjectContext:
     memory_path: Path | None = None
     memory_content: str = ""
     skills: list[LoadedSkill] = field(default_factory=list)
+    skill_diagnostics: list[SkillLoadDiagnostic] = field(default_factory=list)
 
 
 def load_project_context(cwd: Path) -> ProjectContext:
@@ -60,6 +72,8 @@ def _load_skills(cwd: Path) -> list[LoadedSkill]:
                 description=metadata.get("description", ""),
                 auto_enable=_parse_bool(metadata.get("auto_enable", "false")),
                 tags=_parse_tags(metadata.get("tags", "")),
+                source="project-local",
+                source_owner="workspace",
             )
         )
     return loaded

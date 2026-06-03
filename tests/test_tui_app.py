@@ -13,6 +13,9 @@ from claudecode_py.commands import CommandExecution
 from claudecode_py.config import SessionConfig
 from claudecode_py.runtime.events import RuntimeEvent
 from claudecode_py.session import Session
+from claudecode_py.state import SessionState
+from claudecode_py.storage.background_sessions import create_background_session, update_background_session
+from claudecode_py.storage.transcript import save_transcript
 
 if find_spec("textual") is None:
     raise unittest.SkipTest("textual is not installed")
@@ -2098,6 +2101,170 @@ class TuiAppTests(unittest.TestCase):
             app._finish_prompt()
             self.assertFalse(app._follow_active_lineage_after_turn)
             self.assertEqual(captured[0][0], "expanded prompt")
+        finally:
+            session.close()
+            if cwd.exists():
+                shutil.rmtree(cwd)
+
+    def test_background_registry_selection_cycles_in_tui(self) -> None:
+        cwd = Path(__file__).resolve().parent / "_tmp_tui_app_background_selection"
+        if cwd.exists():
+            shutil.rmtree(cwd)
+        cwd.mkdir(parents=True)
+        session = Session(SessionConfig(cwd=cwd, interactive=False))
+        app = PyClaudeTui(session)
+        app._render = lambda: None  # type: ignore[method-assign]
+        session.background_registry_payload = lambda: {  # type: ignore[method-assign]
+            "background_registry_count": 2,
+            "background_registry_selected_bg_id": "bg-123",
+            "background_registry_entries": [
+                {
+                    "background_session_id": "bg-123",
+                    "status": "running",
+                    "background_continuation_category": "live attachable",
+                    "background_primary_action": "pyclaude attach bg-123",
+                },
+                {
+                    "background_session_id": "bg-456",
+                    "status": "completed",
+                    "background_continuation_category": "saved resumable",
+                    "background_primary_action": "pyclaude --resume-session session-456 repl",
+                },
+            ],
+        }  # type: ignore[assignment]
+
+        try:
+            app.action_select_next_background_session()
+            self.assertEqual(app.state.selected_background_registry_index, 1)
+            self.assertEqual(app.state.selected_background_registry_bg_id, "bg-456")
+            self.assertIn("background selection: bg-456", app.state.events)
+        finally:
+            session.close()
+            if cwd.exists():
+                shutil.rmtree(cwd)
+
+    def test_execute_background_primary_action_resumes_saved_session(self) -> None:
+        cwd = Path(__file__).resolve().parent / "_tmp_tui_app_background_resume"
+        if cwd.exists():
+            shutil.rmtree(cwd)
+        cwd.mkdir(parents=True)
+        save_transcript(
+            SessionConfig(cwd=cwd, interactive=False),
+            SessionState(
+                session_id="saved-bg-session",
+                messages=[{"role": "user", "content": [{"type": "text", "text": "resume"}]}],
+            ),
+        )
+        record = create_background_session(
+            cwd,
+            prompt="saved background task",
+            provider="openai-compatible",
+            model="gpt-test",
+            status="completed",
+        )
+        update_background_session(cwd, record.bg_id, session_id="saved-bg-session")
+        session = Session(SessionConfig(cwd=cwd, interactive=False))
+        app = PyClaudeTui(session)
+        app._render = lambda: None  # type: ignore[method-assign]
+        resumed: list[str] = []
+        app._resume_background_session = lambda session_id: resumed.append(session_id)  # type: ignore[method-assign]
+
+        try:
+            app.action_execute_background_primary_action()
+            self.assertEqual(resumed, ["saved-bg-session"])
+        finally:
+            session.close()
+            if cwd.exists():
+                shutil.rmtree(cwd)
+
+    def test_queue_background_followup_uses_pending_input_flow(self) -> None:
+        cwd = Path(__file__).resolve().parent / "_tmp_tui_app_background_followup"
+        if cwd.exists():
+            shutil.rmtree(cwd)
+        cwd.mkdir(parents=True)
+        session = Session(SessionConfig(cwd=cwd, interactive=False))
+        app = PyClaudeTui(session)
+        app._render = lambda: None  # type: ignore[method-assign]
+        queued: list[tuple[str, str]] = []
+        session.background_registry_payload = lambda: {  # type: ignore[method-assign]
+            "background_registry_count": 1,
+            "background_registry_selected_bg_id": "bg-123",
+            "background_registry_entries": [
+                {
+                    "background_session_id": "bg-123",
+                    "status": "running",
+                    "background_live_attachable": True,
+                    "background_continuation_category": "live attachable",
+                    "background_primary_action": "pyclaude attach bg-123",
+                }
+            ],
+        }  # type: ignore[assignment]
+        session.queue_background_message = (  # type: ignore[method-assign]
+            lambda bg_id, prompt: queued.append((bg_id, prompt)) or f"queued {bg_id}: {prompt}"
+        )
+
+        try:
+            app.action_queue_background_followup()
+            self.assertIsNotNone(app.state.pending_background_followup)
+            app._submit_pending_background_followup("please continue")
+            self.assertEqual(queued, [("bg-123", "please continue")])
+            self.assertIsNone(app.state.pending_background_followup)
+        finally:
+            session.close()
+            if cwd.exists():
+                shutil.rmtree(cwd)
+
+    def test_rewind_boundary_selection_cycles_in_tui(self) -> None:
+        cwd = Path(__file__).resolve().parent / "_tmp_tui_app_rewind_selection"
+        if cwd.exists():
+            shutil.rmtree(cwd)
+        cwd.mkdir(parents=True)
+        session = Session(SessionConfig(cwd=cwd, interactive=False))
+        app = PyClaudeTui(session)
+        app._render = lambda: None  # type: ignore[method-assign]
+        session.memory_surface_payload = lambda: {  # type: ignore[method-assign]
+            "memory_rewindable_boundary_count": 2,
+        }  # type: ignore[assignment]
+        session.rewind_boundary_preview_payload = lambda selector="1": {  # type: ignore[method-assign]
+            "selector_index": int(selector),
+            "boundary_id": f"hb-{selector}",
+            "show_action": f"/rewind show {selector}",
+            "apply_action": f"/rewind apply {selector}",
+        }
+
+        try:
+            app.action_select_next_rewind_boundary()
+            self.assertEqual(app.state.selected_rewind_boundary_index, 1)
+            self.assertIn("rewind boundary selection: hb-2", app.state.events)
+        finally:
+            session.close()
+            if cwd.exists():
+                shutil.rmtree(cwd)
+
+    def test_preview_and_apply_selected_rewind_boundary_use_navigation_commands(self) -> None:
+        cwd = Path(__file__).resolve().parent / "_tmp_tui_app_rewind_actions"
+        if cwd.exists():
+            shutil.rmtree(cwd)
+        cwd.mkdir(parents=True)
+        session = Session(SessionConfig(cwd=cwd, interactive=False))
+        app = PyClaudeTui(session)
+        app._render = lambda: None  # type: ignore[method-assign]
+        executed: list[str] = []
+        session.memory_surface_payload = lambda: {  # type: ignore[method-assign]
+            "memory_rewindable_boundary_count": 1,
+        }  # type: ignore[assignment]
+        session.rewind_boundary_preview_payload = lambda selector="1": {  # type: ignore[method-assign]
+            "selector_index": int(selector),
+            "boundary_id": "hb-1",
+            "show_action": "/rewind show 1",
+            "apply_action": "/rewind apply 1",
+        }
+        app._execute_navigation_command = lambda command: executed.append(command)  # type: ignore[method-assign]
+
+        try:
+            app.action_preview_selected_rewind_boundary()
+            app.action_apply_selected_rewind_boundary()
+            self.assertEqual(executed, ["/rewind show 1", "/rewind apply 1"])
         finally:
             session.close()
             if cwd.exists():

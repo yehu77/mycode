@@ -3,6 +3,12 @@ from __future__ import annotations
 from dataclasses import replace
 from pathlib import Path
 
+from .agents import (
+    AgentDefinitionRegistry,
+    build_builtin_agent_registry,
+    load_project_local_agent_registry,
+    merge_agent_registries,
+)
 from .config import SessionConfig
 from .mcp import McpRegistry, default_mcp_config_path, load_mcp_registry_from_payloads, load_mcp_server_payloads
 from .plugins import (
@@ -12,7 +18,7 @@ from .plugins import (
     merge_plugin_registries,
 )
 from .runtime.context import SessionRuntimeContext, build_session_runtime_context
-from .state import SessionState
+from .state import HistoryBoundary, SessionState
 from .storage.transcript import load_latest_transcript, load_transcript_by_session_id
 from .tasks import TaskManager
 from .workspace import cleanup_isolated_workspace, prepare_isolated_workspace
@@ -27,14 +33,22 @@ class SessionFactory:
         *,
         load_mcp_from_config: bool = False,
         plugin_registry: PluginRegistry | None = None,
+        agent_registry: AgentDefinitionRegistry | None = None,
     ) -> None:
         self.load_mcp_from_config = load_mcp_from_config
         self.plugin_registry = plugin_registry or build_builtin_plugin_registry()
+        self.agent_registry = agent_registry or build_builtin_agent_registry()
 
     def resolve_plugin_registry(self, cwd: Path) -> PluginRegistry:
         return merge_plugin_registries(
             self.plugin_registry,
             load_project_local_plugin_registry(cwd),
+        )
+
+    def resolve_agent_registry(self, cwd: Path) -> AgentDefinitionRegistry:
+        return merge_agent_registries(
+            self.agent_registry,
+            load_project_local_agent_registry(cwd),
         )
 
     def create_runtime_context(
@@ -134,13 +148,29 @@ class SessionFactory:
             if restored_state is None:
                 raise FileNotFoundError(f'No saved session found for id "{resume_session_id}".')
             self._resolve_restored_workspace_state(restored_state, cwd)
+            self._record_resume_boundary(restored_state)
             return restored_state, restored_from
         if restore_latest:
             restored_state, restored_from = load_latest_transcript(cwd)
             if restored_state is not None:
                 self._resolve_restored_workspace_state(restored_state, cwd)
+                self._record_resume_boundary(restored_state)
             return restored_state, restored_from
         return None, None
+
+    def _record_resume_boundary(self, state: SessionState) -> None:
+        state.history_boundaries.append(
+            HistoryBoundary(
+                kind="resume",
+                trigger="saved_resume",
+                summary="Restored saved session state from transcript.",
+                message_count_before=len(state.messages),
+                message_count_after=len(state.messages),
+                context_summary_chars_before=len(state.context_summary or ""),
+                context_summary_chars_after=len(state.context_summary or ""),
+                new_session_id=state.session_id,
+            )
+        )
 
     def create_child_session(
         self,

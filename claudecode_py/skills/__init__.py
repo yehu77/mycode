@@ -1,3 +1,3 @@
-from .loader import LoadedSkill, ProjectContext, load_project_context
+from .loader import LoadedSkill, ProjectContext, SkillLoadDiagnostic, load_project_context
 
-__all__ = ["LoadedSkill", "ProjectContext", "load_project_context"]
+__all__ = ["LoadedSkill", "ProjectContext", "SkillLoadDiagnostic", "load_project_context"]

@@ -5,13 +5,15 @@ from typing import Any
 import json
 import os
 
-from ..models import AssistantResponse, ProviderStreamEvent, ToolCall
+from ..models import AssistantResponse, ProviderStreamEvent, TokenUsage, ToolCall
 from .capabilities import ProviderCapabilities
 from .errors import (
     ProviderCapabilityError,
     ProviderConfigurationError,
+    ProviderContextLimitError,
     ProviderNetworkError,
     ProviderTimeoutError,
+    classify_context_limit_error,
     classify_status_error,
 )
 
@@ -80,7 +82,11 @@ class OpenAICompatibleProvider:
         except Exception as exc:  # noqa: BLE001
             raise self._wrap_error(exc) from exc
         choice = response.choices[0]
-        return self._parse_message_response(choice.message, choice.finish_reason)
+        return self._parse_message_response(
+            choice.message,
+            choice.finish_reason,
+            usage=self._extract_usage(response),
+        )
 
     def stream_message(
         self,
@@ -105,9 +111,13 @@ class OpenAICompatibleProvider:
         text_parts: list[str] = []
         tool_buffers: dict[int, dict[str, Any]] = {}
         finish_reason: str | None = None
+        stream_usage: TokenUsage | None = None
 
         try:
             for chunk in stream:
+                chunk_usage = self._extract_usage(chunk)
+                if chunk_usage is not None:
+                    stream_usage = chunk_usage
                 choices = getattr(chunk, "choices", None) or []
                 if not choices:
                     continue
@@ -162,6 +172,7 @@ class OpenAICompatibleProvider:
                     if item.get("name")
                 ],
                 stop_reason=finish_reason,
+                usage=stream_usage,
             ),
         )
 
@@ -253,6 +264,9 @@ class OpenAICompatibleProvider:
     def _wrap_error(self, exc: Exception):
         status_code = getattr(exc, "status_code", None)
         message = str(exc)
+        context_limit_error = classify_context_limit_error(status_code, message)
+        if context_limit_error is not None:
+            return context_limit_error
         if status_code is not None:
             return classify_status_error(status_code, message)
 
@@ -263,9 +277,17 @@ class OpenAICompatibleProvider:
             return ProviderNetworkError(f"Provider network error: {message}")
         if "tool" in message.lower() and "support" in message.lower():
             return ProviderCapabilityError(f"Provider capability mismatch: {message}")
+        if classify_context_limit_error(None, message) is not None:
+            return ProviderContextLimitError(f"OpenAI-compatible provider call failed: {message}")
         return ProviderNetworkError(f"OpenAI-compatible provider call failed: {message}")
 
-    def _parse_message_response(self, message: Any, stop_reason: str | None) -> AssistantResponse:
+    def _parse_message_response(
+        self,
+        message: Any,
+        stop_reason: str | None,
+        *,
+        usage: TokenUsage | None = None,
+    ) -> AssistantResponse:
         raw_tool_calls = []
         for tool_call in getattr(message, "tool_calls", None) or []:
             function = getattr(tool_call, "function", None)
@@ -282,6 +304,7 @@ class OpenAICompatibleProvider:
             text=(getattr(message, "content", None) or ""),
             raw_tool_calls=raw_tool_calls,
             stop_reason=stop_reason,
+            usage=usage,
         )
 
     def _build_response(
@@ -290,6 +313,7 @@ class OpenAICompatibleProvider:
         text: str,
         raw_tool_calls: list[dict[str, str]],
         stop_reason: str | None,
+        usage: TokenUsage | None = None,
     ) -> AssistantResponse:
         content: list[dict[str, Any]] = []
         tool_calls: list[ToolCall] = []
@@ -321,6 +345,22 @@ class OpenAICompatibleProvider:
             text=stripped_text,
             tool_calls=tool_calls,
             stop_reason=stop_reason,
+            usage=usage,
+        )
+
+    def _extract_usage(self, payload: Any) -> TokenUsage | None:
+        usage = getattr(payload, "usage", None)
+        if usage is None:
+            return None
+        prompt_tokens = getattr(usage, "prompt_tokens", None)
+        completion_tokens = getattr(usage, "completion_tokens", None)
+        total_tokens = getattr(usage, "total_tokens", None)
+        if prompt_tokens is None and completion_tokens is None and total_tokens is None:
+            return None
+        return TokenUsage(
+            prompt_tokens=int(prompt_tokens) if prompt_tokens is not None else None,
+            completion_tokens=int(completion_tokens) if completion_tokens is not None else None,
+            total_tokens=int(total_tokens) if total_tokens is not None else None,
         )
 
     def _parse_tool_input(self, raw_arguments: str) -> dict[str, Any]:

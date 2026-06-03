@@ -22,7 +22,14 @@ from claudecode_py.permission_config import load_permission_rules
 from claudecode_py.permissions import ApprovalRequest, ApprovalResult, PermissionDeniedError, PermissionManager
 from claudecode_py.runtime.events import RuntimeEvent
 from claudecode_py.session import Session
-from claudecode_py.state import AdvisorReviewSummary, PlanningArtifact, SessionState, WorkspaceFileChange
+from claudecode_py.state import (
+    AdvisorReviewSummary,
+    HistoryBoundary,
+    PlanningArtifact,
+    SessionState,
+    WorkspaceChangeSet,
+    WorkspaceFileChange,
+)
 from claudecode_py.storage.background_sessions import (
     create_background_session,
     get_background_session_path,
@@ -205,7 +212,7 @@ class CliCommandTests(unittest.TestCase):
             assert output_invalid is not None
             self.assertIn("recent changes:", output_history)
             self.assertIn("Working set:", output_history)
-            self.assertIn("current session:", output_config)
+            self.assertIn("workspace state:", output_config)
             self.assertIn("primary action:", output_config)
             self.assertIn("advisor_relationship:", output_model)
             self.assertIn("runtime model: gpt-test", output_model)
@@ -258,16 +265,71 @@ class CliCommandTests(unittest.TestCase):
             self.assertIn("history compaction status:", output_status)
             self.assertIn("compaction mode: local estimated summary", output_status)
             self.assertIn("would compact: yes", output_status)
+            self.assertIn("boundary kind: compact", output_status)
             self.assertIn("history compaction preview:", output_preview)
             self.assertIn("- 1. user: one", output_preview)
             self.assertIn("compact instruction: keep only decisions and pending TODOs", output_preview_instruction)
             self.assertIn("history compacted:", output_apply)
             self.assertIn("compact instruction: keep only decisions and pending TODOs", output_apply)
+            self.assertIn("boundary kind: compact", output_apply)
             self.assertEqual(len(session.state.messages), 2)
             self.assertIsNotNone(session.state.context_summary)
             self.assertEqual(
                 output_invalid,
                 "Usage: /compact [status|preview [instructions...]|<instructions...>]",
+            )
+        finally:
+            session.close()
+            _cleanup_dir(cwd)
+
+    def test_rewind_command_lists_shows_and_applies_boundaries(self) -> None:
+        cwd = _make_tmp_dir("cli_rewind_surface")
+        session = Session(
+            SessionConfig(
+                cwd=cwd,
+                interactive=False,
+                max_history_messages=4,
+                history_keep_last_messages=2,
+            )
+        )
+        try:
+            session.state.context_summary = "Earlier summary"
+            session.state.messages = [
+                {"role": "user", "content": [{"type": "text", "text": "one"}]},
+                {"role": "assistant", "content": [{"type": "text", "text": "two"}]},
+                {"role": "user", "content": [{"type": "text", "text": "three"}]},
+                {"role": "assistant", "content": [{"type": "text", "text": "four"}]},
+            ]
+            _handle_repl_command(session, "/compact keep only decisions")
+
+            handled_list, output_list = _handle_repl_command(session, "/rewind")
+            handled_show, output_show = _handle_repl_command(session, "/rewind show 1")
+            handled_apply, output_apply = _handle_repl_command(session, "/rewind apply 1")
+            handled_invalid, output_invalid = _handle_repl_command(session, "/rewind nope")
+
+            self.assertTrue(handled_list)
+            self.assertTrue(handled_show)
+            self.assertTrue(handled_apply)
+            self.assertTrue(handled_invalid)
+            assert output_list is not None
+            assert output_show is not None
+            assert output_apply is not None
+            assert output_invalid is not None
+            self.assertIn("rewind boundaries:", output_list)
+            self.assertIn("snapshot_messages=4", output_list)
+            self.assertIn("recommended flow:", output_list)
+            self.assertIn("rewind boundary:", output_show)
+            self.assertIn("kind: compact", output_show)
+            self.assertIn("boundary kind: compact boundary", output_show)
+            self.assertIn("timeline compare:", output_show)
+            self.assertIn("pre-compact restore point", output_show)
+            self.assertIn("restore effect:", output_show)
+            self.assertIn("conversation rewound:", output_apply)
+            self.assertIn("target boundary kind: compact", output_apply)
+            self.assertEqual(len(session.state.messages), 4)
+            self.assertEqual(
+                output_invalid,
+                "Usage: /rewind [list|show <n|boundary-id>|apply <n|boundary-id>]",
             )
         finally:
             session.close()
@@ -321,19 +383,21 @@ class CliCommandTests(unittest.TestCase):
             assert output_workflow is not None
             assert output_resume is not None
             assert output_invalid is not None
-            self.assertIn("current session:", output_default)
-            self.assertIn("workspace health:", output_default)
+            self.assertIn("session identity:", output_default)
+            self.assertIn("workspace state:", output_default)
             self.assertIn("next actions:", output_default)
             self.assertIn("Current workspace", output_workspace)
-            self.assertIn("workflow status:", output_workflow)
+            self.assertIn("session identity:", output_workflow)
             self.assertIn("Working set", output_workflow)
             self.assertIn("next_actions:", output_workflow)
             self.assertIn("go_to_change: /changes show", output_workflow)
             self.assertIn("go_to_task: /task show " + task.id, output_workflow)
             self.assertIn("go_to_plan: /plan", output_workflow)
             self.assertIn("stay_on_surface: /status workflow | /files focused | /diff focused", output_workflow)
-            self.assertIn("resume status:", output_resume)
+            self.assertIn("session identity:", output_resume)
             self.assertIn("continuation category: saved resumable", output_resume)
+            self.assertIn("memory preservation semantics:", output_resume)
+            self.assertIn("- operation: resume", output_resume)
             self.assertIn("go_to_saved_resume: pyclaude --resume-session", output_resume)
             self.assertEqual(output_invalid, "Usage: /status [summary|workspace|workflow|resume]")
         finally:
@@ -359,6 +423,17 @@ class CliCommandTests(unittest.TestCase):
                     workspace_fallback_cwd=str(cwd.resolve()),
                     advisor_mode="interactive-review",
                     advisor_review_history=[AdvisorReviewSummary(checkpoint="final", status="approve", reason="ok")],
+                    history_boundaries=[
+                        HistoryBoundary(
+                            kind="compact",
+                            trigger="manual",
+                            summary="Compacted older turns",
+                            compaction_mode="local_estimated_summary",
+                            compacted_count=3,
+                            kept_count=2,
+                            context_summary_chars_after=120,
+                        )
+                    ],
                     messages=[{"role": "user", "content": [{"type": "text", "text": "hello"}]}],
                 ),
             )
@@ -378,12 +453,26 @@ class CliCommandTests(unittest.TestCase):
                 self.assertIn("continuation category: saved resumable", output_summary)
                 self.assertIn("active message history: yes", output_summary)
                 self.assertIn("compacted context summary: no", output_summary)
+                self.assertIn("history lifecycle:", output_summary)
+                self.assertIn("- history boundaries: 1", output_summary)
+                self.assertIn("- latest boundary: compact boundary", output_summary)
+                self.assertIn("- latest rewindable boundary: none", output_summary)
+                self.assertIn("- latest compact trigger: manual", output_summary)
                 self.assertIn("next actions:", output_summary)
                 self.assertIn("saved session workspace:", output_workspace)
+                self.assertIn("workspace state: mode=snapshot health=unavailable", output_workspace)
+                self.assertIn("workspace anomaly:", output_workspace)
+                self.assertIn("- workspace anomaly: unavailable, cleanup failed, fallback active", output_workspace)
+                self.assertIn("workspace recovery:", output_workspace)
                 self.assertIn("primary action:", output_workspace)
                 self.assertIn("resume path: pyclaude --resume-session session-demo repl", output_detail)
                 self.assertIn("go_to_saved_resume: pyclaude --resume-session session-demo repl", output_detail)
+                self.assertIn("workspace state: mode=snapshot health=unavailable", output_detail)
                 self.assertIn("advisor activity: 1 review(s)", output_detail)
+                self.assertIn("history lifecycle:", output_detail)
+                self.assertIn("history boundaries:", output_detail)
+                self.assertIn("compact boundary | trigger=manual", output_detail)
+                self.assertIn("- latest compact trigger: manual", output_detail)
             finally:
                 session.close()
         finally:
@@ -518,8 +607,17 @@ class CliCommandTests(unittest.TestCase):
             assert output_current is not None
             assert output_show is not None
             self.assertIn("Current workspace", output_current)
+            self.assertIn("workspace state:", output_current)
+            self.assertIn("workspace anomaly:", output_current)
+            self.assertIn("workspace recovery:", output_current)
+            self.assertIn("next actions:", output_current)
             self.assertIn("mode: snapshot", output_current)
             self.assertIn("health: unavailable", output_current)
+            self.assertIn("workspace anomaly: unavailable, cleanup pending, fallback active", output_current)
+            self.assertIn(
+                "workspace_recommended_actions: /workspaces list, /workspaces repair workspace-detail-session, /workspaces cleanup",
+                output_current,
+            )
             self.assertIn("fallback_cwd:", output_current)
             self.assertIn("unavailable_reason: Workspace missing on disk.", output_current)
             self.assertIn("primary action: workspace_repair workspace-detail-session", output_current)
@@ -529,6 +627,8 @@ class CliCommandTests(unittest.TestCase):
             self.assertIn("Isolated workspace detail", output_show)
             self.assertIn("selected: detail-agent", output_show)
             self.assertIn("matched_workspaces: 1", output_show)
+            self.assertIn("workspace anomaly:", output_show)
+            self.assertIn("workspace recovery:", output_show)
             self.assertIn("label: detail-agent", output_show)
             self.assertIn("session_ids: workspace-detail-session", output_show)
             self.assertIn("primary action: workspace_repair workspace-detail-session", output_show)
@@ -825,7 +925,8 @@ class CliCommandTests(unittest.TestCase):
             self.assertIn("- focused file: b.py", output_task_show)
             self.assertIn("stay_on_surface: /task show " + task.id + " file 2", output_task_show)
             self.assertIn("> 2. updated b.py", output_change_show)
-            self.assertIn("go_to_task: /task show " + task.id + " file 2", output_change_show)
+            self.assertIn("inspect_focused_file: /files show 2", output_change_show)
+            self.assertIn("inspect_task: /task show " + task.id + " file 2", output_change_show)
         finally:
             session.close()
             _cleanup_dir(cwd)
@@ -869,6 +970,8 @@ class CliCommandTests(unittest.TestCase):
                 drift_status="block",
                 drift_reason="Need a narrower runtime-only pass.",
                 constraint_source="plan_drift_block",
+                background_session_id="bg-123",
+                background_reverse_hint="pyclaude ps bg-123 | pyclaude logs bg-123 summary",
             )
             session.state.constraint_reason = "Need a safer read-only pass first."
             session.state.last_plan_drift_context = "pending_tools: apply_patch"
@@ -893,6 +996,9 @@ class CliCommandTests(unittest.TestCase):
             self.assertIn("go_to_plan: /plan execution 1 file 1 | /plan execution | /plan advisor", output_advisor)
             self.assertIn("stay_on_surface: /task show " + task.id + " file 1", output_advisor)
             self.assertIn("/task advisor " + task.id, output_advisor)
+            self.assertIn("background_linkage:", output_advisor)
+            self.assertIn("- background_session_id: bg-123", output_advisor)
+            self.assertIn("- background_reverse_hint: pyclaude ps bg-123 | pyclaude logs bg-123 summary", output_advisor)
             self.assertIn("drift_detail:", output_drift)
             self.assertIn("constraint_source: plan_drift_block", output_drift)
             self.assertIn("pending_tools: apply_patch", output_drift)
@@ -901,6 +1007,9 @@ class CliCommandTests(unittest.TestCase):
             self.assertIn("go_to_plan: /plan execution 1 file 1 | /plan execution | /plan advisor", output_drift)
             self.assertIn("stay_on_surface: /task show " + task.id + " file 1", output_drift)
             self.assertIn("/task drift " + task.id, output_drift)
+            self.assertIn("background_linkage:", output_drift)
+            self.assertIn("- background_session_id: bg-123", output_drift)
+            self.assertIn("- background_reverse_hint: pyclaude ps bg-123 | pyclaude logs bg-123 summary", output_drift)
         finally:
             session.close()
             _cleanup_dir(cwd)
@@ -987,6 +1096,13 @@ class CliCommandTests(unittest.TestCase):
                 "Review context file",
                 workspace_planned_paths=["docs/context.md"],
             )
+            background_task = session.task_manager.create(
+                "agent",
+                "Background runtime review",
+                task_role="background",
+                background_session_id="bg-123",
+                background_reverse_hint="pyclaude ps bg-123 | pyclaude logs bg-123 summary",
+            )
             completed_task = session.task_manager.create("agent", "Done task")
             session.task_manager.complete(completed_task.id, "done")
             checklist = session.create_checklist_task(
@@ -1027,8 +1143,11 @@ class CliCommandTests(unittest.TestCase):
             self.assertIn("filter: active", output_active)
             self.assertIn(change_task.id, output_active)
             self.assertIn(context_task.id, output_active)
+            self.assertIn(background_task.id, output_active)
             self.assertIn(str(checklist["id"]), output_active)
             self.assertNotIn(completed_task.id, output_active)
+            self.assertIn("background session: bg-123", output_active)
+            self.assertIn("background reverse hint: pyclaude ps bg-123 | pyclaude logs bg-123 summary", output_active)
             self.assertIn("filter: changes", output_changes)
             self.assertIn(change_task.id, output_changes)
             self.assertNotIn(context_task.id, output_changes)
@@ -1165,8 +1284,11 @@ class CliCommandTests(unittest.TestCase):
 
         self.assertTrue(handled)
         assert output is not None
-        self.assertIn("review: status=enabled", output)
-        self.assertIn("commit: status=enabled", output)
+        self.assertIn("plugin registry:", output)
+        self.assertIn("registered plugins:", output)
+        self.assertIn("review: plugin_status=enabled plugin_source=builtin", output)
+        self.assertIn("commit: plugin_status=enabled plugin_source=builtin", output)
+        self.assertIn("plugin diagnostics:", output)
 
     def test_plugin_command_returns_plugin_detail(self) -> None:
         session = Session(SessionConfig(cwd=Path(__file__).resolve().parent, interactive=False))
@@ -1177,6 +1299,8 @@ class CliCommandTests(unittest.TestCase):
         assert output is not None
         self.assertIn("name: review", output)
         self.assertIn("plugin_id: review@builtin", output)
+        self.assertIn("plugin source: builtin", output)
+        self.assertIn("plugin contributions: commands", output)
         self.assertIn("command_names: /review", output)
 
     def test_install_command_returns_install_guidance(self) -> None:
@@ -2184,7 +2308,10 @@ class CliCommandTests(unittest.TestCase):
         handled, output = _handle_repl_command(session, "/clear")
 
         self.assertTrue(handled)
-        self.assertEqual(output, "Cleared conversation history only for this session.")
+        assert output is not None
+        self.assertIn("Cleared conversation history only for this session.", output)
+        self.assertIn("- task/plan/file focus: preserved", output)
+        self.assertIn("- advisor review state: preserved", output)
         self.assertEqual(session.state.messages, [])
         self.assertIsNone(session.state.context_summary)
 
@@ -2446,9 +2573,11 @@ class CliCommandTests(unittest.TestCase):
             self.assertTrue(handled_show)
             assert output_show is not None
             self.assertIn("next_actions:", output_show)
-            self.assertIn("go_to_task: /task show " + task.id, output_show)
+            self.assertIn("inspect_focused_file: /files show 1", output_show)
+            self.assertIn("inspect_focused_diff: /changes show ", output_show)
+            self.assertIn("inspect_task: /task show " + task.id, output_show)
             self.assertIn("/task show " + execution.id, output_show)
-            self.assertIn("go_to_plan: /plan file 1", output_show)
+            self.assertIn("inspect_active_plan: /plan file 1", output_show)
             self.assertIn("/plan execution 1 file 1", output_show)
             self.assertIn("stay_on_surface: /changes show ", output_show)
             self.assertIn("/changes working-set", output_show)
@@ -2596,15 +2725,26 @@ class CliCommandTests(unittest.TestCase):
             self.assertIn("explicit context entries:", output_list)
             self.assertIn("unresolved entry count: 0", output_list)
             self.assertIn("explicit-context-contributed files: 2", output_list)
+            self.assertIn("explicit-only files: 0", output_list)
+            self.assertIn("automatic-only files: 1", output_list)
+            self.assertIn("overlapping files: 2", output_list)
             self.assertIn("contributes_files=1", output_list)
+            self.assertIn("inspect_automatic_context=/files auto", output_list)
+            self.assertIn("cleanup_explicit_context=/add-dir remove <n> | /add-dir clear", output_list)
             self.assertIn("filter: explicit", output_explicit)
+            self.assertIn("explicit-only files: 0", output_explicit)
+            self.assertIn("automatic-only files: 1", output_explicit)
+            self.assertIn("overlapping files: 2", output_explicit)
             self.assertIn("src/app.py", output_explicit)
             self.assertIn("notes.md", output_explicit)
             self.assertNotIn("todo.md", output_explicit)
             self.assertIn("filter: auto", output_auto)
+            self.assertIn("explicit-only files: 0", output_auto)
+            self.assertIn("automatic-only files: 1", output_auto)
+            self.assertIn("overlapping files: 2", output_auto)
             self.assertIn("todo.md", output_auto)
             self.assertNotIn("src/unused.py", output_auto)
-            self.assertIn("go_to_context=/files", output_files)
+            self.assertIn("inspect_explicit_context=/files context", output_files)
             self.assertIn("Removed explicit context entry:", output_remove)
             self.assertEqual(output_clear, "Cleared explicit context entries for this session.")
             self.assertEqual(output_invalid, "Usage: /add-dir <path>|list|clear|remove <n>")
@@ -2682,9 +2822,10 @@ class CliCommandTests(unittest.TestCase):
             assert output_diff_focused is not None
             assert output_diff_working is not None
             assert output_diff_change is not None
-            self.assertIn("working set files:", output_files)
-            self.assertIn("working set files:", output_files_working)
-            self.assertIn("go_to_change=/changes show", output_files)
+            self.assertIn("working set:", output_files)
+            self.assertIn("working set:", output_files_working)
+            self.assertIn("inspect_focused_file=/files show 1", output_files)
+            self.assertIn("inspect_change=/changes show", output_files)
             self.assertIn("focused file:", output_files_focused)
             self.assertIn("app.py", output_files_changes)
             self.assertNotIn("notes.md", output_files_changes)
@@ -2693,10 +2834,12 @@ class CliCommandTests(unittest.TestCase):
             self.assertIn("filter: plan", output_files_plan)
             self.assertIn("notes.md", output_files_plan)
             self.assertIn("- focused file: notes.md", output_files_show)
+            self.assertIn("- inspect_focused_diff: /diff focused", output_files_show)
             self.assertIn("diff summary:", output_diff)
-            self.assertIn("diff-backed working-set files: 1", output_diff)
+            self.assertIn("working set diff-backed files: 1", output_diff)
             self.assertIn("focused file:", output_diff_focused)
-            self.assertIn("diff-backed working set:", output_diff_working)
+            self.assertIn("- inspect_focused_file: /files focused", output_diff_focused)
+            self.assertIn("working set diff:", output_diff_working)
             self.assertIn("change:", output_diff_change)
             self.assertEqual(
                 output_invalid_files,
@@ -3124,6 +3267,11 @@ class CliCommandTests(unittest.TestCase):
             self.assertIn("prompt: review pending changes", rendered)
             self.assertIn("workspace mode: worktree", rendered)
             self.assertIn("workspace cleanup status: failed", rendered)
+            self.assertIn("background workflow:", rendered)
+            self.assertIn("current workflow: inactive background record for inspection", rendered)
+            self.assertIn("next_actions:", rendered)
+            self.assertIn(f"go_to_logs: pyclaude logs {record.bg_id} summary | pyclaude logs {record.bg_id}", rendered)
+            self.assertIn("go_to_sessions_show: pyclaude sessions --limit 10", rendered)
             self.assertIn("go_to_live_attach: none", rendered)
             self.assertIn("stay_on_surface: pyclaude ps | pyclaude logs", rendered)
         finally:
@@ -3290,6 +3438,241 @@ class CliCommandTests(unittest.TestCase):
                 logs_rendered,
             )
         finally:
+            _cleanup_dir(cwd)
+
+    def test_main_ps_detail_renders_background_metadata_foundation(self) -> None:
+        cwd = _make_tmp_dir("cli_bg_metadata_detail")
+        save_transcript(
+            SessionConfig(cwd=cwd, interactive=False),
+            SessionState(
+                session_id="saved-bg-session",
+                context_summary="Earlier compacted context",
+                messages=[{"role": "user", "content": [{"type": "text", "text": "resume"}]}],
+                saved_task_surface_counts={"checklist": 2, "background_execution": 1},
+                active_planning_artifact_id="plan-123",
+                recent_planning_artifacts=[
+                    PlanningArtifact(
+                        artifact_id="plan-123",
+                        kind="ultraplan",
+                        goal="inspect",
+                        summary="summary",
+                    ),
+                ],
+            ),
+        )
+        record = create_background_session(
+            cwd,
+            prompt="hello",
+            provider="anthropic",
+            model="demo",
+            status="completed",
+        )
+        update_background_session(cwd, record.bg_id, session_id="saved-bg-session")
+
+        try:
+            with redirect_stdout(StringIO()) as stdout:
+                exit_code = main(["--cwd", str(cwd), "ps", record.bg_id])
+            self.assertEqual(exit_code, 0)
+            rendered = stdout.getvalue()
+            self.assertIn("background session source: saved_background", rendered)
+            self.assertIn("live attachable: no", rendered)
+            self.assertIn("saved resumable: yes", rendered)
+            self.assertIn("inactive only: no", rendered)
+            self.assertIn("primary action: pyclaude --resume-session saved-bg-session repl", rendered)
+            self.assertIn(f"secondary action: pyclaude logs {record.bg_id}", rendered)
+            self.assertIn("last known message count: 1", rendered)
+            self.assertIn("last known context summary chars: 25", rendered)
+            self.assertIn("task surfaces: checklist:2,background_execution:1", rendered)
+            self.assertIn("has active plan: yes", rendered)
+            self.assertIn("active plan id: plan-123", rendered)
+            self.assertIn("planning artifact count: 1", rendered)
+            self.assertIn("background workflow:", rendered)
+            self.assertIn("current workflow: saved background session with resumable transcript", rendered)
+            self.assertIn("active plan: plan-123 (ultraplan: inspect)", rendered)
+            self.assertIn("working set: 0 file(s)", rendered)
+            self.assertLess(
+                rendered.index("go_to_saved_resume: pyclaude --resume-session saved-bg-session repl"),
+                rendered.index(f"go_to_logs: pyclaude logs {record.bg_id} summary | pyclaude logs {record.bg_id}"),
+            )
+        finally:
+            _cleanup_dir(cwd)
+
+    def test_main_ps_and_logs_summary_share_background_metadata_payload(self) -> None:
+        cwd = _make_tmp_dir("cli_bg_metadata_shared")
+        save_transcript(
+            SessionConfig(cwd=cwd, interactive=False),
+            SessionState(
+                session_id="saved-bg-session",
+                context_summary="compact",
+                messages=[{"role": "user", "content": [{"type": "text", "text": "resume"}]}],
+            ),
+        )
+        record = create_background_session(
+            cwd,
+            prompt="hello",
+            provider="anthropic",
+            model="demo",
+            status="completed",
+        )
+        update_background_session(cwd, record.bg_id, session_id="saved-bg-session")
+
+        try:
+            with redirect_stdout(StringIO()) as ps_stdout:
+                ps_exit = main(["--cwd", str(cwd), "ps"])
+            self.assertEqual(ps_exit, 0)
+            ps_rendered = ps_stdout.getvalue()
+            self.assertIn("source=saved_background", ps_rendered)
+            self.assertIn("continuation=saved resumable", ps_rendered)
+            self.assertIn("live_attachable=no", ps_rendered)
+            self.assertIn("saved_resumable=yes", ps_rendered)
+            self.assertIn("inactive_only=no", ps_rendered)
+            self.assertIn("messages=1", ps_rendered)
+            self.assertIn("context_summary_chars=7", ps_rendered)
+
+            with redirect_stdout(StringIO()) as logs_stdout:
+                logs_exit = main(["--cwd", str(cwd), "logs", record.bg_id, "summary"])
+            self.assertEqual(logs_exit, 0)
+            logs_rendered = logs_stdout.getvalue()
+            self.assertIn("background session source: saved_background", logs_rendered)
+            self.assertIn("continuation category: saved resumable", logs_rendered)
+            self.assertIn("live attachable: no", logs_rendered)
+            self.assertIn("saved resumable: yes", logs_rendered)
+            self.assertIn("inactive only: no", logs_rendered)
+            self.assertIn("last known message count: 1", logs_rendered)
+            self.assertIn("last known context summary chars: 7", logs_rendered)
+            self.assertIn("background workflow:", logs_rendered)
+            self.assertIn("current workflow: saved background session with resumable transcript", logs_rendered)
+        finally:
+            _cleanup_dir(cwd)
+
+    def test_main_ps_detail_live_background_workflow_is_attach_first(self) -> None:
+        cwd = _make_tmp_dir("cli_bg_workflow_live")
+        save_transcript(
+            SessionConfig(cwd=cwd, interactive=False),
+            SessionState(
+                session_id="live-bg-session",
+                messages=[{"role": "user", "content": [{"type": "text", "text": "resume"}]}],
+                recent_change_sets=[
+                    WorkspaceChangeSet(
+                        tool_name="apply_patch",
+                        summary="Update demo.py",
+                        files=[
+                            WorkspaceFileChange(
+                                path="demo.py",
+                                existed_before=True,
+                                before_content="old\n",
+                                after_content="new\n",
+                                action_kind="update",
+                            )
+                        ],
+                    )
+                ],
+                saved_task_records=[
+                    {
+                        "id": "task-live-1",
+                        "kind": "agent",
+                        "description": "Update demo.py",
+                        "status": "running",
+                        "progress_summary": "Running background agent",
+                        "metadata": {
+                            "task_role": "background",
+                            "parent_session_id": "live-bg-session",
+                        },
+                    }
+                ],
+                saved_task_surface_counts={"background_execution": 1},
+            ),
+        )
+        record = create_background_session(
+            cwd,
+            prompt="hello",
+            provider="anthropic",
+            model="demo",
+            status="running",
+        )
+        update_background_session(
+            cwd,
+            record.bg_id,
+            session_id="live-bg-session",
+            bridge_host="127.0.0.1",
+            bridge_port=8765,
+        )
+
+        try:
+            with redirect_stdout(StringIO()) as stdout:
+                exit_code = main(["--cwd", str(cwd), "ps", record.bg_id])
+            self.assertEqual(exit_code, 0)
+            rendered = stdout.getvalue()
+            self.assertIn("background workflow:", rendered)
+            self.assertIn("current workflow: attachable live background session", rendered)
+            self.assertIn("background execution tasks: 1", rendered)
+            self.assertIn("primary task: task-live-1 (background_execution: Update demo.py)", rendered)
+            self.assertIn("primary task progress: Running background agent", rendered)
+            self.assertIn("latest change: Update demo.py", rendered)
+            self.assertIn("recent activity: Running background agent", rendered)
+            self.assertIn("last tool: apply_patch", rendered)
+            self.assertIn("progress summary: Running background agent", rendered)
+            self.assertIn("completion state: running", rendered)
+            self.assertIn("focused file: demo.py", rendered)
+            self.assertIn("focused file source: recent_change", rendered)
+            self.assertIn("go_to_task: /task show task-live-1 | /tasks active", rendered)
+            self.assertIn("/tasks active", rendered)
+            self.assertLess(
+                rendered.index(f"go_to_live_attach: pyclaude attach {record.bg_id}"),
+                rendered.index("go_to_task: /task show task-live-1 | /tasks active"),
+            )
+            self.assertLess(
+                rendered.index("go_to_task: /task show task-live-1 | /tasks active"),
+                rendered.index(f"go_to_logs: pyclaude logs {record.bg_id} summary | pyclaude logs {record.bg_id}"),
+            )
+        finally:
+            _cleanup_dir(cwd)
+
+    def test_main_agents_prints_lightweight_agent_definitions(self) -> None:
+        cwd = _make_tmp_dir("cli_agents_surface")
+
+        try:
+            with redirect_stdout(StringIO()) as stdout:
+                exit_code = main(["--cwd", str(cwd), "agents"])
+            self.assertEqual(exit_code, 0)
+            rendered = stdout.getvalue()
+            self.assertIn("agent definitions:", rendered)
+            self.assertIn("source summary:", rendered)
+            self.assertIn("- builtin: definitions=4 effective=4 shadowed=0 root=builtin", rendered)
+            self.assertIn("effective definitions:", rendered)
+            self.assertIn("- default: source=builtin effective=yes override_state=base based_on=none", rendered)
+            self.assertIn("- background: source=builtin effective=yes override_state=base based_on=none", rendered)
+            self.assertIn("- isolated_workspace: source=builtin effective=yes override_state=base based_on=none", rendered)
+            self.assertIn("- read_only_planning: source=builtin effective=yes override_state=base based_on=none", rendered)
+            self.assertIn("diagnostics:", rendered)
+            self.assertIn("- none", rendered)
+            self.assertIn("resolution:", rendered)
+            self.assertIn("- shadowing_policy: same-name project-local replaces builtin", rendered)
+        finally:
+            _cleanup_dir(cwd)
+
+    def test_task_show_renders_background_linkage_hint(self) -> None:
+        cwd = _make_tmp_dir("cli_task_background_linkage")
+        session = Session(SessionConfig(cwd=cwd, interactive=False))
+        try:
+            task = session.task_manager.create(
+                "agent",
+                "background work",
+                parent_session_id=session.state.session_id,
+                task_role="background",
+                background_session_id="bg-123",
+                background_reverse_hint="pyclaude ps bg-123 | pyclaude logs bg-123 summary",
+            )
+
+            handled, output = _handle_repl_command(session, f"/task show {task.id}")
+
+            self.assertTrue(handled)
+            assert output is not None
+            self.assertIn("background_linkage:", output)
+            self.assertIn("- background_session_id: bg-123", output)
+            self.assertIn("- background_reverse_hint: pyclaude ps bg-123 | pyclaude logs bg-123 summary", output)
+        finally:
+            session.close()
             _cleanup_dir(cwd)
 
     def test_main_ps_list_renders_live_attachable_guidance(self) -> None:
@@ -3870,9 +4253,9 @@ class CliCommandTests(unittest.TestCase):
             assert output_reload_before is not None
             self.assertIn("project context:", output_summary)
             self.assertIn("project memory: loaded", output_summary)
-            self.assertIn("loaded skills:", output_summary)
-            self.assertIn("loaded skills:", output_skills)
-            self.assertIn("active auto-enabled skills:", output_skills)
+            self.assertIn("skill registry:", output_summary)
+            self.assertIn("skill registry:", output_skills)
+            self.assertIn("registered skills:", output_skills)
             self.assertIn("No project-context reload has run in this live session.", output_reload_before)
             self.assertEqual(
                 output_invalid,
@@ -3888,6 +4271,7 @@ class CliCommandTests(unittest.TestCase):
             assert output_refresh is not None
             assert output_reload_after is not None
             self.assertIn("Reloaded project context.", output_refresh)
+            self.assertIn("skill_content_changed=no", output_refresh)
             self.assertIn("errors: none", output_reload_after)
         finally:
             session.close()

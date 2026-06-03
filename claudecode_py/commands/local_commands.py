@@ -42,6 +42,7 @@ _CHANGES_COMMAND_USAGE = (
 _TASKS_COMMAND_USAGE = "Usage: /tasks [list|active|changes|context|show <id>]"
 _HISTORY_COMMAND_USAGE = "Usage: /history [all|messages|tasks|workspace|changes]"
 _COMPACT_COMMAND_USAGE = "Usage: /compact [status|preview [instructions...]|<instructions...>]"
+_REWIND_COMMAND_USAGE = "Usage: /rewind [list|show <n|boundary-id>|apply <n|boundary-id>]"
 _SESSIONS_COMMAND_USAGE = (
     "Usage: /sessions [list|show latest|show <session-id-prefix>|show <session-id-prefix> summary|show <session-id-prefix> workspace]"
 )
@@ -117,6 +118,21 @@ def handle_compact_command(session: "Session", args: str) -> str:
     if lowered.startswith("status "):
         return _COMPACT_COMMAND_USAGE
     return session.compact_history_into_context_summary(instructions=raw)
+
+
+def handle_rewind_command(session: "Session", args: str) -> str:
+    raw = args.strip()
+    lowered = raw.lower()
+    if not raw or lowered == "list":
+        return session.describe_rewind()
+    if lowered.startswith("show "):
+        return session.describe_rewind(raw)
+    if lowered.startswith("apply "):
+        selector = raw.split(" ", 1)[1].strip()
+        if not selector:
+            return _REWIND_COMMAND_USAGE
+        return session.rewind_to_boundary(selector)
+    return _REWIND_COMMAND_USAGE
 
 
 def handle_sessions_command(session: "Session", args: str) -> str:

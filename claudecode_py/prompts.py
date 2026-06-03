@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
+from typing import Literal
+
 from .skills import LoadedSkill, ProjectContext
 
 
@@ -27,6 +30,86 @@ Rules:
 """
 
 
+@dataclass(slots=True, frozen=True)
+class SystemPromptBlock:
+    text: str
+    cache_scope: Literal["global", "session", "dynamic", "none"]
+    kind: Literal["prefix", "static", "dynamic", "context_summary", "planning", "skills", "metadata"]
+
+
+def compose_system_prompt_blocks(
+    *,
+    base_prompt: str,
+    project_context: ProjectContext,
+    auto_enabled_skills: list[LoadedSkill],
+    manually_enabled_skills: list[LoadedSkill],
+    context_summary: str | None,
+    planning_context: str | None = None,
+) -> list[SystemPromptBlock]:
+    parts = [
+        SystemPromptBlock(
+            text=base_prompt,
+            cache_scope="session",
+            kind="prefix",
+        )
+    ]
+    if project_context.memory_content:
+        parts.append(
+            SystemPromptBlock(
+                text="Project memory:\n" f"{project_context.memory_content}",
+                cache_scope="session",
+                kind="static",
+            )
+        )
+    if auto_enabled_skills:
+        skill_lines = []
+        for skill in auto_enabled_skills:
+            skill_lines.append(f"- {skill.name} ({skill.path.name})")
+            if skill.content:
+                skill_lines.append(skill.content)
+        parts.append(
+            SystemPromptBlock(
+                text="Auto-enabled project skills:\n" + "\n".join(skill_lines),
+                cache_scope="session",
+                kind="skills",
+            )
+        )
+    if manually_enabled_skills:
+        skill_lines = []
+        for skill in manually_enabled_skills:
+            skill_lines.append(f"- {skill.name} ({skill.path.name})")
+            if skill.content:
+                skill_lines.append(skill.content)
+        parts.append(
+            SystemPromptBlock(
+                text="Manually enabled project skills:\n" + "\n".join(skill_lines),
+                cache_scope="session",
+                kind="skills",
+            )
+        )
+    if context_summary:
+        parts.append(
+            SystemPromptBlock(
+                text="Compacted conversation context from earlier turns:\n" + context_summary,
+                cache_scope="dynamic",
+                kind="context_summary",
+            )
+        )
+    if planning_context:
+        parts.append(
+            SystemPromptBlock(
+                text="Recent planning artifact to reuse when relevant:\n" + planning_context,
+                cache_scope="dynamic",
+                kind="planning",
+            )
+        )
+    return [part for part in parts if part.text.strip()]
+
+
+def render_system_prompt_blocks(blocks: list[SystemPromptBlock]) -> str:
+    return "\n\n".join(block.text for block in blocks if block.text.strip())
+
+
 def compose_system_prompt(
     *,
     base_prompt: str,
@@ -36,28 +119,13 @@ def compose_system_prompt(
     context_summary: str | None,
     planning_context: str | None = None,
 ) -> str:
-    parts = [base_prompt]
-    if project_context.memory_content:
-        parts.append(
-            "Project memory:\n"
-            f"{project_context.memory_content}"
+    return render_system_prompt_blocks(
+        compose_system_prompt_blocks(
+            base_prompt=base_prompt,
+            project_context=project_context,
+            auto_enabled_skills=auto_enabled_skills,
+            manually_enabled_skills=manually_enabled_skills,
+            context_summary=context_summary,
+            planning_context=planning_context,
         )
-    if auto_enabled_skills:
-        skill_lines = []
-        for skill in auto_enabled_skills:
-            skill_lines.append(f"- {skill.name} ({skill.path.name})")
-            if skill.content:
-                skill_lines.append(skill.content)
-        parts.append("Auto-enabled project skills:\n" + "\n".join(skill_lines))
-    if manually_enabled_skills:
-        skill_lines = []
-        for skill in manually_enabled_skills:
-            skill_lines.append(f"- {skill.name} ({skill.path.name})")
-            if skill.content:
-                skill_lines.append(skill.content)
-        parts.append("Manually enabled project skills:\n" + "\n".join(skill_lines))
-    if context_summary:
-        parts.append("Compacted conversation context from earlier turns:\n" + context_summary)
-    if planning_context:
-        parts.append("Recent planning artifact to reuse when relevant:\n" + planning_context)
-    return "\n\n".join(part for part in parts if part)
+    )

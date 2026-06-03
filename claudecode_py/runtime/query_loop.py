@@ -7,11 +7,17 @@ from time import sleep
 from ..models import Message
 from ..providers.errors import (
     ProviderCapabilityError,
+    ProviderContextLimitError,
     ProviderNetworkError,
     ProviderRateLimitError,
     ProviderTimeoutError,
 )
-from .events import EventSink, RuntimeEvent, null_sink
+from .events import EventSink, RuntimeEvent, summarize_tool_input
+from .tool_result_replacement import (
+    ToolResultBudgetResult,
+    apply_tool_result_budget_to_messages,
+    estimate_provider_call_context_usage,
+)
 
 
 def run_query_loop(
@@ -25,7 +31,7 @@ def run_query_loop(
     if not isinstance(session, Session):
         raise TypeError("session must be a Session")
 
-    sink = sink or null_sink
+    sink = session.build_runtime_event_sink(sink)
     session.validate_provider_capabilities()
     start_message_count = len(session.state.messages)
     start_context_summary = session.state.context_summary
@@ -38,6 +44,8 @@ def run_query_loop(
     start_constraint_source = session.state.constraint_source
     start_constraint_reason = session.state.constraint_reason
     start_constraint_trigger_count = session.state.constraint_trigger_count
+    start_tool_result_replacement_records = list(session.state.tool_result_replacement_records)
+    start_tool_result_artifact_records = list(session.state.tool_result_artifact_records)
     execution_task_id: str | None = None
     plan_drifted = False
 
@@ -81,7 +89,7 @@ def run_query_loop(
         planning_prompt_pending = True
         for _ in range(session.config.max_turns):
             with _turn_execution_scope(session, write_constraints_active=write_constraints_active):
-                response, streamed_text = _create_message_with_retries(
+                response, streamed_text = _create_message_with_compact_recovery(
                     session,
                     sink,
                     turn_user_prompt=planning_prompt if planning_prompt_pending else None,
@@ -90,6 +98,7 @@ def run_query_loop(
             assistant_message: Message = {"role": "assistant", "content": response.content}
             session.state.messages.append(assistant_message)
             _enforce_message_budget(session, sink)
+            _emit_response_usage_event(session, response, sink)
 
             if response.text:
                 final_text = response.text
@@ -308,6 +317,12 @@ def run_query_loop(
                     session.tool_context(),
                     sink=sink,
                 )
+            _emit_estimated_tool_result_usage_event(
+                session,
+                response,
+                tool_result_blocks=tool_result_blocks,
+                sink=sink,
+            )
             session.state.messages.append({"role": "user", "content": tool_result_blocks})
             _enforce_message_budget(session, sink)
             for block in tool_result_blocks:
@@ -320,6 +335,14 @@ def run_query_loop(
                         is_error=bool(block.get("is_error")),
                     )
                 )
+            sink(
+                RuntimeEvent(
+                    kind="tool_result_summarized",
+                    message=_summarize_tool_result_blocks(tool_result_blocks),
+                    result_count=len(tool_result_blocks),
+                    is_error=any(bool(block.get("is_error")) for block in tool_result_blocks),
+                )
+            )
             sink(
                 RuntimeEvent(
                     kind="assistant_tool_result_ready",
@@ -347,6 +370,11 @@ def run_query_loop(
         session.state.constraint_source = start_constraint_source
         session.state.constraint_reason = start_constraint_reason
         session.state.constraint_trigger_count = start_constraint_trigger_count
+        session.state.tool_result_replacement_records = list(start_tool_result_replacement_records)
+        session.state.tool_result_artifact_records = list(start_tool_result_artifact_records)
+        session.reconstruct_tool_result_replacement_state()
+        if session.persist_transcript:
+            session.persist_state()
         raise
     finally:
         session.clear_plan_execution()
@@ -355,21 +383,222 @@ def run_query_loop(
     raise RuntimeError("Max turn count reached.")
 
 
+def _emit_response_usage_event(session: "Session", response, sink: EventSink) -> None:
+    usage = getattr(response, "usage", None)
+    if usage is not None and usage.total_tokens is not None:
+        event = RuntimeEvent(
+            kind="assistant_usage",
+            message="provider usage",
+            prompt_tokens=usage.prompt_tokens,
+            completion_tokens=usage.completion_tokens,
+            total_tokens=usage.total_tokens,
+            usage_source="provider",
+        )
+        sink(event)
+        session._record_runtime_usage_event(event)
+        return
+    estimated_total = _estimate_response_tokens(response)
+    if estimated_total <= 0:
+        return
+    event = RuntimeEvent(
+        kind="assistant_usage",
+        message="estimated response usage",
+        total_tokens=estimated_total,
+        usage_source="estimated",
+    )
+    sink(event)
+    session._record_runtime_usage_event(event)
+
+
+def _emit_estimated_tool_result_usage_event(
+    session: "Session",
+    response,
+    *,
+    tool_result_blocks: list[dict],
+    sink: EventSink,
+) -> None:
+    usage = getattr(response, "usage", None)
+    if usage is not None and usage.total_tokens is not None:
+        return
+    estimated_total = sum(_estimate_tool_result_block_tokens(block) for block in tool_result_blocks)
+    if estimated_total <= 0:
+        return
+    event = RuntimeEvent(
+        kind="assistant_usage",
+        message="estimated tool result usage",
+        total_tokens=estimated_total,
+        usage_source="estimated",
+    )
+    sink(event)
+    session._record_runtime_usage_event(event)
+
+
+def _estimate_response_tokens(response) -> int:
+    total = 0
+    text = str(getattr(response, "text", "") or "").strip()
+    if text:
+        total += _estimate_token_count(text)
+    for tool_call in getattr(response, "tool_calls", []) or []:
+        total += _estimate_token_count(summarize_tool_input(tool_call.input))
+    return total
+
+
+def _estimate_tool_result_block_tokens(block: dict[str, object]) -> int:
+    if not isinstance(block, dict):
+        return 0
+    parts: list[str] = []
+    if block.get("is_error"):
+        parts.append("error")
+    content = str(block.get("content", "") or "").strip()
+    if content:
+        parts.append(content[:160])
+    return _estimate_token_count(" ".join(parts))
+
+
+def _estimate_token_count(text: str) -> int:
+    stripped = text.strip()
+    if not stripped:
+        return 0
+    return (len(stripped) + 3) // 4
+
+
+def _normalize_context_limit_reason(exc: ProviderContextLimitError, limit: int = 160) -> str:
+    message = " ".join(str(exc).strip().split())
+    if not message:
+        return "prompt-too-long: provider context limit"
+    prefix = "prompt-too-long: "
+    available = max(limit - len(prefix), 1)
+    if len(message) > available:
+        message = message[: available - 3].rstrip() + "..."
+    return prefix + message
+
+
 def _create_message_with_retries(
     session: "Session",
     sink: EventSink,
     *,
     turn_user_prompt: str | None = None,
+    messages_override: list[dict] | None = None,
 ):
+    messages = messages_override or _messages_for_provider_call(
+        session,
+        turn_user_prompt=turn_user_prompt,
+    )
+    session.mark_tool_result_ids_seen_from_messages(messages)
     return _create_provider_message_with_retries(
         session.provider,
         session=session,
-        messages=_messages_for_provider_call(session, turn_user_prompt=turn_user_prompt),
+        messages=messages,
         tools=session.tool_specs(),
         system_prompt=session.build_system_prompt(),
         sink=sink,
         allow_streaming=not session.has_advisor_model(),
     )
+
+
+def _create_message_with_compact_recovery(
+    session: "Session",
+    sink: EventSink,
+    *,
+    turn_user_prompt: str | None = None,
+):
+    attempted_recovery = False
+    while True:
+        replacement_result = _replacement_aware_provider_view(
+            session,
+            turn_user_prompt=turn_user_prompt,
+        )
+        _persist_and_emit_tool_result_replacement_events(session, replacement_result, sink)
+        compacted = _enforce_message_budget(
+            session,
+            sink,
+            messages_override=replacement_result.messages,
+        )
+        if compacted:
+            replacement_result = _replacement_aware_provider_view(
+                session,
+                turn_user_prompt=turn_user_prompt,
+            )
+            _persist_and_emit_tool_result_replacement_events(session, replacement_result, sink)
+        try:
+            return _create_message_with_retries(
+                session,
+                sink,
+                turn_user_prompt=turn_user_prompt,
+                messages_override=replacement_result.messages,
+            )
+        except ProviderContextLimitError as exc:
+            if attempted_recovery:
+                raise
+            preview = session._history_compaction_preview_payload()
+            budget = session.refresh_runtime_budget_state(
+                preview=preview,
+                message_override=replacement_result.messages,
+            )
+            if not bool(budget.get("would_compact")) or not bool(preview.get("would_compact")):
+                raise
+            attempted_recovery = True
+            sink(
+                RuntimeEvent(
+                    kind="provider_retry",
+                    message=(
+                        "ProviderContextLimitError: compacting and retrying turn after "
+                        "prompt-too-long (attempt 1/1)"
+                    ),
+                    is_error=True,
+                )
+            )
+            reason = _normalize_context_limit_reason(exc)
+            sink(
+                RuntimeEvent(
+                    kind="compact_recovery_started",
+                    message="starting compact recovery after prompt-too-long",
+                    compaction_trigger="recovery",
+                    budget_state=str(budget.get("budget_state") or "ok"),
+                    budget_reason=str(budget.get("budget_reason") or ""),
+                    is_error=True,
+                )
+            )
+            _compact_history(
+                session,
+                sink,
+                trigger_reason=reason,
+                trigger="recovery",
+            )
+            refreshed_view = _replacement_aware_provider_view(
+                session,
+                turn_user_prompt=turn_user_prompt,
+            )
+            _persist_and_emit_tool_result_replacement_events(session, refreshed_view, sink)
+            refreshed = session.refresh_runtime_budget_state(
+                message_override=refreshed_view.messages
+            )
+            refreshed_state = str(refreshed.get("budget_state") or "ok")
+            if refreshed_state in {"compact_needed", "hard_stop"}:
+                sink(
+                    RuntimeEvent(
+                        kind="compact_recovery_finished",
+                        message="compact recovery failed to restore budget headroom",
+                        compaction_trigger="recovery",
+                        budget_state=refreshed_state,
+                        budget_reason=str(refreshed.get("budget_reason") or ""),
+                        is_error=True,
+                    )
+                )
+                raise RuntimeError(
+                    "Prompt-too-long recovery failed after compaction: "
+                    f"{refreshed.get('budget_reason') or 'budget limits exceeded'}"
+                ) from exc
+            sink(
+                RuntimeEvent(
+                    kind="compact_recovery_finished",
+                    message="compact recovery restored budget headroom; retrying turn",
+                    compaction_trigger="recovery",
+                    budget_state=refreshed_state,
+                    budget_reason=str(refreshed.get("budget_reason") or ""),
+                    is_error=False,
+                )
+            )
 
 
 def _create_provider_message_with_retries(
@@ -413,9 +642,11 @@ def _create_provider_message_with_retries(
 
 
 def _create_message_once(session: "Session", sink: EventSink):
+    replacement_result = _replacement_aware_provider_view(session)
+    _persist_and_emit_tool_result_replacement_events(session, replacement_result, sink)
     return _create_provider_message_once(
         session.provider,
-        messages=_messages_for_provider_call(session),
+        messages=replacement_result.messages,
         tools=session.tool_specs(),
         system_prompt=session.build_system_prompt(),
         sink=sink,
@@ -771,6 +1002,95 @@ def _messages_for_provider_call(session: "Session", *, turn_user_prompt: str | N
     return messages
 
 
+def _replacement_aware_provider_view(
+    session: "Session",
+    *,
+    turn_user_prompt: str | None = None,
+) -> ToolResultBudgetResult:
+    messages = _messages_for_provider_call(session, turn_user_prompt=turn_user_prompt)
+    return apply_tool_result_budget_to_messages(session, messages)
+
+
+def _persist_and_emit_tool_result_replacement_events(
+    session: "Session",
+    replacement_result: ToolResultBudgetResult,
+    sink: EventSink,
+) -> None:
+    if replacement_result.newly_artifact_records:
+        session._record_tool_result_artifact_records(replacement_result.newly_artifact_records)
+    if replacement_result.newly_replaced_records:
+        session._record_tool_result_replacement_records(replacement_result.newly_replaced_records)
+    if replacement_result.newly_artifact_records or replacement_result.newly_replaced_records:
+        session.persist_state()
+    if replacement_result.newly_artifact_records:
+        sink(
+            RuntimeEvent(
+                kind="tool_result_artifact_created",
+                message=(
+                    "tool-result artifact: created "
+                    f"count={replacement_result.artifact_count} "
+                    f"shed_chars={replacement_result.artifact_chars_saved}"
+                ),
+                artifact_count=replacement_result.artifact_count,
+                artifact_chars_saved=replacement_result.artifact_chars_saved,
+                replacement_reason=replacement_result.budget_reason,
+            )
+        )
+    if replacement_result.newly_replaced_records:
+        sink(
+            RuntimeEvent(
+                kind="tool_result_replacement_applied",
+                message=(
+                    "tool-result replacement: applied "
+                    f"count={replacement_result.replacement_count} "
+                    f"shed_chars={replacement_result.replaced_chars_total}"
+                ),
+                replacement_count=replacement_result.replacement_count,
+                replaced_chars_total=replacement_result.replaced_chars_total,
+                replacement_reason=replacement_result.budget_reason,
+            )
+        )
+    elif replacement_result.reapplied_count:
+        sink(
+            RuntimeEvent(
+                kind="tool_result_replacement_reapplied",
+                message=(
+                    "tool-result replacement: re-applied "
+                    f"count={replacement_result.reapplied_count}"
+                ),
+                replacement_count=replacement_result.reapplied_count,
+                replaced_chars_total=replacement_result.replaced_chars_total,
+                replacement_reason=replacement_result.budget_reason,
+            )
+        )
+    if replacement_result.artifact_reuse_count:
+        sink(
+            RuntimeEvent(
+                kind="tool_result_artifact_reused",
+                message=(
+                    "tool-result artifact: re-used "
+                    f"count={replacement_result.artifact_reuse_count}"
+                ),
+                artifact_count=replacement_result.artifact_reuse_count,
+                replacement_reason=replacement_result.budget_reason,
+            )
+        )
+    if replacement_result.microcompact_count:
+        sink(
+            RuntimeEvent(
+                kind="tool_result_microcompacted",
+                message=(
+                    "tool-result microcompact: applied "
+                    f"count={replacement_result.microcompact_count} "
+                    f"shed_chars={replacement_result.microcompact_chars_saved}"
+                ),
+                microcompact_count=replacement_result.microcompact_count,
+                microcompact_chars_saved=replacement_result.microcompact_chars_saved,
+                replacement_reason=replacement_result.budget_reason,
+            )
+        )
+
+
 def _read_only_turn_tool_names(session: "Session") -> tuple[str, ...]:
     tool_names = []
     for spec in session.tool_specs():
@@ -808,18 +1128,74 @@ def _turn_execution_scope(session: "Session", *, write_constraints_active: bool)
     )
 
 
-def _enforce_message_budget(session: "Session", sink: EventSink) -> None:
-    count = len(session.state.messages)
-    if count <= session.config.max_history_messages:
-        return
-    _compact_history(session, sink)
-    count = len(session.state.messages)
-    if count > session.config.max_history_messages:
+def _enforce_message_budget(
+    session: "Session",
+    sink: EventSink,
+    *,
+    messages_override: list[dict] | None = None,
+) -> bool:
+    report = (
+        estimate_provider_call_context_usage(session, messages_override)
+        if messages_override is not None
+        else None
+    )
+    budget = session.refresh_runtime_budget_state(
+        report=report,
+        message_override=messages_override,
+    )
+    if session.should_emit_budget_pressure_event(budget):
+        sink(
+            RuntimeEvent(
+                kind="budget_pressure",
+                message=str(budget.get("budget_reason") or budget.get("budget_state") or "budget pressure"),
+                budget_state=str(budget.get("budget_state") or "ok"),
+                budget_reason=str(budget.get("budget_reason") or ""),
+                is_error=str(budget.get("budget_state") or "ok") in {"compact_needed", "hard_stop"},
+            )
+        )
+    state = str(budget.get("budget_state") or "ok")
+    if state in {"ok", "warning"}:
+        return False
+    if state == "hard_stop":
+        raise RuntimeError(
+            "Message budget exceeded without a recoverable compaction path: "
+            f"{budget.get('budget_reason') or 'budget limits exceeded'}"
+        )
+    _compact_history(session, sink, trigger_reason=str(budget.get("budget_reason") or "").strip() or None)
+    refreshed = session.refresh_runtime_budget_state()
+    if str(refreshed.get("budget_state") or "ok") in {"compact_needed", "hard_stop"}:
         raise RuntimeError(
             "Message budget exceeded after compaction: "
-            f"{count} messages > {session.config.max_history_messages}"
+            f"{refreshed.get('budget_reason') or 'budget limits exceeded'}"
         )
+    return True
 
 
-def _compact_history(session: "Session", sink: EventSink) -> None:
-    session.apply_history_compaction(persist=False, sink=sink)
+def _summarize_tool_result_blocks(tool_result_blocks: list[dict[str, object]]) -> str:
+    result_count = len(tool_result_blocks)
+    error_blocks = [block for block in tool_result_blocks if bool(block.get("is_error"))]
+    if not error_blocks:
+        return f"ok results={result_count}"
+    parts = [f"results={result_count}", f"errors={len(error_blocks)}"]
+    first_error = str(error_blocks[0].get("content") or "").strip()
+    if first_error:
+        compact = " ".join(first_error.split())
+        if len(compact) > 120:
+            compact = compact[:117].rstrip() + "..."
+        parts.append(f"first_error={compact}")
+    return " ".join(parts)
+
+
+def _compact_history(
+    session: "Session",
+    sink: EventSink,
+    trigger_reason: str | None = None,
+    *,
+    trigger: str = "auto",
+) -> None:
+    session.apply_history_compaction(
+        persist=False,
+        sink=sink,
+        trigger=trigger,
+        trigger_reason=trigger_reason,
+    )

@@ -96,6 +96,15 @@ class TuiStateTests(unittest.TestCase):
 
         state.record_runtime_event(
             RuntimeEvent(
+                kind="tool_waiting_for_approval",
+                message='{"path":"session.py"}',
+                tool_name="read_file",
+                tool_call_id="tool-1",
+                approval_risk_level="read",
+            )
+        )
+        state.record_runtime_event(
+            RuntimeEvent(
                 kind="tool_started",
                 message='{"path":"session.py"}',
                 tool_name="read_file",
@@ -117,6 +126,7 @@ class TuiStateTests(unittest.TestCase):
         self.assertIn("Recent Tools", rendered)
         self.assertIn("[OK] read_file (12ms)", rendered)
         self.assertIn('input: {"path":"session.py"}', rendered)
+        self.assertNotIn("[WAITING]", rendered)
 
     def test_failed_tool_event_updates_existing_entry(self) -> None:
         state = TuiState()
@@ -241,11 +251,69 @@ class TuiStateTests(unittest.TestCase):
                 message="compacted 10 messages",
             )
         )
+        state.record_runtime_event(
+            RuntimeEvent(
+                kind="budget_pressure",
+                message="message count 6 >= warning threshold 6",
+                budget_state="warning",
+                budget_reason="message count 6 >= warning threshold 6",
+            )
+        )
+        state.record_runtime_event(
+            RuntimeEvent(
+                kind="compact_recovery_started",
+                message="starting compact recovery after prompt-too-long",
+            )
+        )
+        state.record_runtime_event(
+            RuntimeEvent(
+                kind="compact_recovery_finished",
+                message="compact recovery restored budget headroom; retrying turn",
+            )
+        )
+        state.record_runtime_event(
+            RuntimeEvent(
+                kind="tool_batch_started",
+                message="starting 2 parallel read-only tool call(s)",
+                batch_size=2,
+                batch_parallel=True,
+            )
+        )
+        state.record_runtime_event(
+            RuntimeEvent(
+                kind="tool_batch_finished",
+                message="completed 2 parallel read-only tool call(s)",
+                batch_size=2,
+                batch_parallel=True,
+                result_count=2,
+            )
+        )
 
         rendered = state.render_events()
 
         self.assertIn("[provider:retry] retrying in 0.5s", rendered)
         self.assertIn("[context] compacted 10 messages", rendered)
+        self.assertIn("[budget] message count 6 >= warning threshold 6", rendered)
+        self.assertIn("[recovery:start] starting compact recovery after prompt-too-long", rendered)
+        self.assertIn("[recovery:done] compact recovery restored budget headroom; retrying turn", rendered)
+        self.assertIn("[tool:batch:start] starting 2 parallel read-only tool call(s)", rendered)
+        self.assertIn("[tool:batch:done] completed 2 parallel read-only tool call(s)", rendered)
+
+    def test_tool_result_summary_is_recorded_as_turn_activity(self) -> None:
+        state = TuiState()
+        state.start_turn("Inspect runtime")
+
+        state.record_runtime_event(
+            RuntimeEvent(
+                kind="tool_result_summarized",
+                message="ok results=2",
+                result_count=2,
+            )
+        )
+
+        rendered = state.render_chat()
+
+        self.assertIn("[Activity]\n[tool:summary] ok results=2", rendered)
 
     def test_task_detail_panel_renders_file_context_hint_lines(self) -> None:
         state = TuiState(selected_task_id="task-123")
@@ -494,6 +562,35 @@ class TuiStateTests(unittest.TestCase):
                 "recent_change_sets: 2\n"
                 "redo_change_sets: 0\n"
             ),
+            memory_metadata={
+                "memory_boundary_count": 3,
+                "memory_rewindable_boundary_count": 2,
+                "memory_context_summary_chars": 128,
+                "memory_compaction_state": "warning",
+                "memory_compaction_reason": "message count 6 >= warning threshold 6",
+                "memory_last_boundary_kind": "rewind",
+                "memory_latest_rewindable_boundary_kind": "compact",
+                "memory_default_rewind_selector": "1",
+                "memory_rewind_show_action": "/rewind show 1",
+                "memory_rewind_apply_action": "/rewind apply 1",
+                "memory_last_operation": "rewind",
+                "memory_last_operation_messages": "restored from selected boundary snapshot",
+                "memory_last_operation_session_identity": "preserved",
+                "memory_last_operation_task_plan_file_focus": "cleared",
+            },
+            rewind_preview_metadata={
+                "selector_index": 2,
+                "boundary_id": "hb-compact-2",
+                "boundary_kind_label": "compact boundary",
+                "trigger": "manual",
+                "summary": "Compacted older turns",
+                "snapshot_message_count": 4,
+                "snapshot_summary_chars": 128,
+                "restore_effect_summary": "Conversation messages and compacted context summary were restored from a selected boundary snapshot.",
+                "show_action": "/rewind show 2",
+                "apply_action": "/rewind apply 2",
+            },
+            selected_rewind_boundary_index=1,
             focused_file_context_metadata={
                 "file_context_scope": "task",
                 "file_context_file_count": 2,
@@ -582,6 +679,28 @@ class TuiStateTests(unittest.TestCase):
         self.assertIn("last_plan_drift: pending_tools: write_file", rendered)
         self.assertIn("active_plan_kind: ultraplan", rendered)
         self.assertIn("active_plan_goal: map runtime", rendered)
+        self.assertIn("Memory Lifecycle", rendered)
+        self.assertIn("history_boundaries: 3", rendered)
+        self.assertIn("rewindable_boundaries: 2", rendered)
+        self.assertIn("memory compaction: warning", rendered)
+        self.assertIn("compact reason: message count 6 >= warning threshold 6", rendered)
+        self.assertIn("latest memory operation: rewind", rendered)
+        self.assertIn("memory_messages: restored from selected boundary snapshot", rendered)
+        self.assertIn("memory_session_identity: preserved", rendered)
+        self.assertIn("memory_focus_policy: cleared", rendered)
+        self.assertIn("default rewind selector: 1", rendered)
+        self.assertIn("rewind show: /rewind show 1", rendered)
+        self.assertIn("rewind apply: /rewind apply 1", rendered)
+        self.assertIn("selected_rewind_boundary: 2/2", rendered)
+        self.assertIn("selected_rewind_boundary_id: hb-compact-2", rendered)
+        self.assertIn("selected_rewind_boundary_kind: compact boundary", rendered)
+        self.assertIn("selected_rewind_boundary_trigger: manual", rendered)
+        self.assertIn("selected_rewind_boundary_summary: Compacted older turns", rendered)
+        self.assertIn("selected_rewind_restore_messages: 4", rendered)
+        self.assertIn("selected_rewind_restore_context_summary_chars: 128", rendered)
+        self.assertIn("selected_rewind_show: /rewind show 2", rendered)
+        self.assertIn("selected_rewind_apply: /rewind apply 2", rendered)
+        self.assertIn("Ctrl+Alt+Left/Right select rewind boundary", rendered)
         self.assertIn("Focused file context", rendered)
         self.assertIn("source: task", rendered)
         self.assertIn("shortcuts: Ctrl+Left/Right focus task files", rendered)
@@ -637,7 +756,7 @@ class TuiStateTests(unittest.TestCase):
             ),
         )
 
-        self.assertIn("Workspace", rendered)
+        self.assertIn("Workspace State", rendered)
         self.assertIn("workspace_mode: snapshot", rendered)
         self.assertIn("workspace_health: unavailable", rendered)
         self.assertIn("workspace_label: scout-agent", rendered)
@@ -658,6 +777,283 @@ class TuiStateTests(unittest.TestCase):
         self.assertIn("selected_workspace_secondary_action: workspace_cleanup_preview", rendered)
         self.assertIn("selected_workspace_tertiary_action: /workspaces list", rendered)
         self.assertIn("selected_workspace_target: session-1", rendered)
+
+    def test_status_panel_renders_background_section(self) -> None:
+        state = TuiState()
+
+        rendered = state.render_status_panel(
+            provider_text="provider: fake\nmodel: demo",
+            config_text="provider: openai-compatible\nmodel: gpt-test\nsession_id: session-1\n",
+            background_metadata={
+                "background_session_id": "bg-123",
+                "background_continuation_category": "live attachable",
+                "background_current_workflow_summary": "attachable live background session",
+                "background_task_surface_summary": "background_execution:1",
+                "background_primary_task": {
+                    "task_id": "task-bg",
+                    "surface_kind": "background_execution",
+                    "status": "running",
+                    "description": "Finish background work",
+                },
+                "background_focused_file": "demo.py",
+                "background_pending_followup_count": 1,
+                "background_pending_followup_summary": "please continue",
+                "background_send_followup_action": "session.action background_send_followup bg-123",
+                "background_attach_action": "pyclaude attach bg-123",
+                "background_logs_action": "pyclaude logs bg-123 summary",
+            },
+        )
+
+        self.assertIn("Background State", rendered)
+        self.assertIn("background_session_id: bg-123", rendered)
+        self.assertIn("background_continuation: live attachable", rendered)
+        self.assertIn("background_workflow: attachable live background session", rendered)
+        self.assertIn("background_task_surfaces: background_execution:1", rendered)
+        self.assertIn(
+            "background_primary_task: task-bg | background_execution | running | Finish background work",
+            rendered,
+        )
+        self.assertIn("background_focused_file: demo.py", rendered)
+        self.assertIn("background_pending_followups: 1", rendered)
+        self.assertIn("background_pending_followup: please continue", rendered)
+        self.assertIn(
+            "background_send_followup: session.action background_send_followup bg-123",
+            rendered,
+        )
+        self.assertIn("background_attach: pyclaude attach bg-123", rendered)
+        self.assertIn("background_logs: pyclaude logs bg-123 summary", rendered)
+
+    def test_status_panel_renders_background_registry_section(self) -> None:
+        state = TuiState()
+
+        rendered = state.render_status_panel(
+            provider_text="provider: fake\nmodel: demo",
+            config_text="provider: openai-compatible\nmodel: gpt-test\nsession_id: session-1\n",
+            background_registry_metadata={
+                "background_registry_count": 2,
+                "background_registry_selected_bg_id": "bg-123",
+                "background_registry_selected_status": "running",
+                "background_registry_selected_continuation_category": "live attachable",
+                "background_registry_selected_workflow_summary": "attachable live background session",
+                "background_registry_selected_primary_task": {
+                    "task_id": "task-bg",
+                    "status": "running",
+                    "description": "Finish background work",
+                },
+                "background_registry_selected_focused_file": "demo.py",
+                "background_registry_selected_recent_activity": "Waiting for attach",
+                "background_registry_selected_token_count": 42,
+                "background_registry_selected_token_count_source": "provider",
+                "background_registry_selected_last_tool_input": '{"prompt":"continue"}',
+                "background_registry_selected_last_tool_summary": "ok (25ms)",
+                "background_registry_selected_progress_summary": "Waiting for attach",
+                "background_registry_selected_completion_state": "running",
+                "background_registry_selected_completion_summary": "Waiting for attach",
+                "background_registry_selected_pending_followup_count": 1,
+                "background_registry_selected_pending_followup_summary": "please continue",
+                "background_registry_primary_action": "pyclaude attach bg-123",
+                "background_registry_secondary_action": "pyclaude logs bg-123 summary",
+                "background_registry_logs_action": "pyclaude logs bg-123 summary",
+                "background_registry_send_followup_action": "session.action background_send_followup bg-123",
+                "background_registry_entries": [
+                    {
+                        "background_session_id": "bg-123",
+                        "status": "running",
+                        "background_continuation_category": "live attachable",
+                        "background_primary_action": "pyclaude attach bg-123",
+                        "background_send_followup_action": "session.action background_send_followup bg-123",
+                        "background_pending_followup_count": 1,
+                        "background_pending_followup_summary": "please continue",
+                        "background_recent_activity": "Waiting for attach",
+                        "background_token_count": 42,
+                        "background_token_count_source": "provider",
+                        "background_last_tool_input": '{"prompt":"continue"}',
+                        "background_last_tool_summary": "ok (25ms)",
+                        "background_progress_summary": "Waiting for attach",
+                        "background_completion_state": "running",
+                        "background_completion_summary": "Waiting for attach",
+                    },
+                    {
+                        "background_session_id": "bg-456",
+                        "status": "completed",
+                        "background_continuation_category": "saved resumable",
+                        "background_primary_action": "pyclaude --resume-session session-456 repl",
+                    },
+                ],
+            },
+        )
+
+        self.assertIn("Background Sessions", rendered)
+        self.assertIn("background_sessions: 2", rendered)
+        self.assertIn("selected_background_session: bg-123", rendered)
+        self.assertIn("selected_background_status: running", rendered)
+        self.assertIn("selected_background_continuation: live attachable", rendered)
+        self.assertIn("selected_background_workflow: attachable live background session", rendered)
+        self.assertIn("selected_background_primary_task: task-bg | running | Finish background work", rendered)
+        self.assertIn("selected_background_focused_file: demo.py", rendered)
+        self.assertIn("selected_background_recent_activity: Waiting for attach", rendered)
+        self.assertIn("selected_background_token_count: 42 (provider)", rendered)
+        self.assertIn('selected_background_last_tool_input: {"prompt":"continue"}', rendered)
+        self.assertIn("selected_background_last_tool_summary: ok (25ms)", rendered)
+        self.assertIn("selected_background_progress: Waiting for attach", rendered)
+        self.assertIn("selected_background_completion: running", rendered)
+        self.assertIn("selected_background_pending_followups: 1", rendered)
+        self.assertIn("selected_background_pending_followup: please continue", rendered)
+        self.assertIn("background_registry_primary_action: pyclaude attach bg-123", rendered)
+        self.assertIn(
+            "background_registry_send_followup_action: session.action background_send_followup bg-123",
+            rendered,
+        )
+        self.assertIn("> 1. bg-123 status=running continuation=live attachable action=pyclaude attach bg-123", rendered)
+
+    def test_status_panel_renders_background_handoff_section(self) -> None:
+        state = TuiState()
+
+        rendered = state.render_status_panel(
+            provider_text="provider: fake\nmodel: demo",
+            config_text="provider: openai-compatible\nmodel: gpt-test\nsession_id: session-1\n",
+            background_handoff_metadata={
+                "background_handoff_count": 1,
+                "background_handoff_selected_bg_id": "bg-456",
+                "background_handoff_selected_completion_state": "completed",
+                "background_handoff_selected_completion_summary": "Background session completed.",
+                "background_handoff_transcript_action": "pyclaude logs bg-456 summary",
+                "background_handoff_task_action": "/task show task-bg",
+                "background_handoff_changes_action": "pyclaude --resume-session session-456 repl | /changes working-set",
+                "background_handoff_resume_action": "pyclaude --resume-session session-456 repl",
+            },
+        )
+
+        self.assertIn("Background Notifications", rendered)
+        self.assertIn("background_notifications: 1", rendered)
+        self.assertIn("latest_background_handoff: bg-456", rendered)
+        self.assertIn("latest_background_state: completed", rendered)
+        self.assertIn("latest_background_summary: Background session completed.", rendered)
+        self.assertIn("background_handoff_transcript_action: pyclaude logs bg-456 summary", rendered)
+        self.assertIn("background_handoff_task_action: /task show task-bg", rendered)
+
+    def test_status_panel_prefers_structured_workspace_and_file_context_surfaces(self) -> None:
+        state = TuiState()
+
+        rendered = state.render_status_panel(
+            provider_text="provider: openai-compatible\nmodel: demo\n",
+            config_text="provider: openai-compatible\nmodel: demo\nsession_id: session-1\n",
+            status_metadata={
+                "status_session_id": "session-1",
+                "status_provider": "openai-compatible",
+                "status_model": "demo",
+                "status_workspace_summary": "mode=snapshot health=unavailable focused=demo.py",
+                "status_workspace_mode": "snapshot",
+                "status_workspace_health": "unavailable",
+                "status_workspace_anomaly": "unavailable, fallback active",
+                "status_workspace_recovery": "/workspaces repair session-1",
+                "status_working_set_summary": "mix: diff_backed=1 context_only=0 explicit=1 task=1 plan=0 change=1",
+                "status_focused_file_summary": "demo.py (change)",
+                "status_explicit_context_entry_count": 1,
+                "status_unresolved_explicit_context_entry_count": 0,
+                "status_action_groups": {"go_to_focused_file": ["/files focused"]},
+            },
+            workspace_surface_metadata={
+                "workspace_label": "scout-agent",
+                "workspace_effective_cwd": "C:/tmp/.pyclaude/workspaces/scout-agent",
+                "workspace_effective_cwd_exists": False,
+                "workspace_cleanup_status": "failed",
+                "workspace_cleanup_error": "PermissionError: cleanup blocked",
+                "workspace_fallback_cwd": "C:/repo",
+                "workspace_recommended_actions": [
+                    "/workspaces list",
+                    "/workspaces repair session-1",
+                    "/workspaces cleanup",
+                ],
+                "workspace_action_bundle": {
+                    "primary_action": "workspace_repair session-1",
+                    "secondary_action": "workspace_cleanup_preview",
+                    "tertiary_action": "/workspaces list",
+                },
+                "workspace_action_groups": {
+                    "inspect_current_workspace": ["/workspaces current"],
+                    "inspect_workspace_inventory": ["/workspaces list"],
+                    "workspace_recovery": ["/workspaces repair session-1", "/workspaces cleanup"],
+                },
+            },
+            file_context_surface_metadata={
+                "working_set": {
+                    "file_context_scope": "session",
+                    "file_context_file_count": 2,
+                    "file_context_files": [
+                        {
+                            "path": "demo.py",
+                            "scope_reasons": ["explicit context path", "recent change"],
+                            "change_id": "chg-1",
+                            "target": {
+                                "action": "open_file",
+                                "path": "demo.py",
+                                "line": 12,
+                                "label": "demo file",
+                            },
+                            "diff_targets": {
+                                "hunks": [
+                                    {
+                                        "action": "open_diff",
+                                        "path": "demo.py",
+                                        "line": 14,
+                                        "label": "demo diff",
+                                    }
+                                ]
+                            },
+                            "diff_target_count": 1,
+                            "is_context_only": False,
+                        },
+                        {
+                            "path": "notes.md",
+                            "scope_reasons": ["active task"],
+                            "target": {
+                                "action": "open_file",
+                                "path": "notes.md",
+                                "line": 1,
+                                "label": "notes",
+                            },
+                            "is_context_only": True,
+                        },
+                    ],
+                },
+                "focused_file": {
+                    "source": "working-set",
+                    "index": 0,
+                },
+                "explicit_context": {
+                    "entry_count": 1,
+                    "unresolved_entry_count": 0,
+                    "explicit_only_file_count": 0,
+                    "automatic_file_count": 1,
+                    "overlapping_file_count": 1,
+                    "compare_summary_lines": [
+                        "explicit context compare:",
+                        "- explicit-only files: 0",
+                        "- automatic-only files: 1",
+                        "- overlapping files: 1",
+                    ],
+                },
+                "file_action_groups": {
+                    "inspect_focused_file": ["/files focused"],
+                    "inspect_focused_diff": ["/diff focused"],
+                    "inspect_explicit_context": ["/files explicit", "/files context"],
+                    "stay_on_surface": ["/status workflow"],
+                },
+            },
+        )
+
+        self.assertIn("Workspace Recovery", rendered)
+        self.assertIn("workspace_recommended_actions: /workspaces list, /workspaces repair session-1, /workspaces cleanup", rendered)
+        self.assertIn("- inspect current workspace: /workspaces current", rendered)
+        self.assertIn("Focused file context", rendered)
+        self.assertIn("context_origin: explicit+automatic", rendered)
+        self.assertIn("Working Set", rendered)
+        self.assertIn("> 1. demo.py", rendered)
+        self.assertIn("Explicit Context", rendered)
+        self.assertIn("overlapping_files: 1", rendered)
+        self.assertIn("File Actions", rendered)
+        self.assertIn("- inspect focused diff: /diff focused", rendered)
 
     def test_status_panel_renders_structured_symbol_section(self) -> None:
         state = TuiState()
@@ -1391,13 +1787,168 @@ class TuiStateTests(unittest.TestCase):
                 "enabled_skills: 2\n"
                 "session_id: demo-session\n"
             ),
+            status_metadata={
+                "status_session_id": "demo-session",
+                "status_provider": "openai-compatible",
+                "status_model": "gpt-4.1-mini",
+                "status_advisor_model": "gpt-4.1-mini",
+                "status_advisor_mode": "off",
+                "status_mode": "main",
+                "status_context_usage": "42 / 4096 (1.0%)",
+                "status_memory_summary": "none",
+                "status_memory_compaction": "ok",
+                "status_memory_last_operation": "none",
+                "status_budget_reason": "context summary chars 15 >= warning threshold 12",
+                "status_budget_pressure": "warning",
+                "status_background_summary": "Background session completed.",
+                "status_background_notification_count": 1,
+                "status_background_latest_handoff": "bg-456",
+                "status_runtime_progress_summary": "read_file: waiting for approval (read)",
+                "status_runtime_progress_kind": "tool_waiting_for_approval",
+                "status_runtime_active_tool_name": "read_file",
+                "status_runtime_active_tool_status": "waiting_for_approval",
+                "status_runtime_active_tool_input": '{"path":"demo.py"}',
+                "status_runtime_last_tool_name": "read_file",
+                "status_runtime_last_tool_status": "ok",
+                "status_runtime_last_tool_summary": "ok (25ms)",
+                "status_runtime_parallel_batch_active": True,
+                "status_runtime_parallel_batch_size": 2,
+                "status_runtime_last_result_summary": "ok results=2",
+                "status_runtime_compact_recovery_summary": "retry succeeded after recovery compact",
+                "status_working_set_summary": "mix: diff_backed=1 context_only=0 explicit=0 task=0 plan=0 change=1",
+                "status_focused_file_summary": "demo.py (change)",
+                "status_plan_summary": "map runtime",
+                "status_active_task_count": 2,
+                "status_task_surface_summary": "background_execution=1, other_task=1",
+                "status_project_context_summary": "memory=none skills=2 plugins=8",
+                "status_project_context_reload_health": "latest reload: none",
+                "status_project_context_issue": "none",
+                "status_skills_health": "loaded=2 enabled=2 manual_enabled=0 manual_disabled=0",
+                "status_skill_registry_summary": "registered=2 enabled=2 inactive=0 diagnostics=0",
+                "status_skill_prompt_summary": "auto_enabled=2 manual_enabled=0 inactive=0",
+                "status_skill_reload_state": "latest reload: none",
+                "status_skill_manual_overrides": "enabled=0 disabled=0",
+                "status_skill_diagnostics": 0,
+                "status_plugins_health": "loaded=8 enabled=8 diagnostics=0",
+                "status_plugin_registry_summary": "registered=8 enabled=8 disabled=0 diagnostics=0",
+                "status_plugin_reload_state": "latest reload: plugins unchanged",
+                "status_plugin_manual_overrides": "enabled=1 disabled=0",
+                "status_mcp_health": "servers=2 connected=1 failed=1 retrying=0",
+                "status_mcp_issue": "mcp failed servers: 1",
+                "status_permission_mode": "default",
+                "status_permission_summary": "mode=default workspace_rules=0 session_rules=0",
+                "status_workspace_anomaly": "none",
+                "status_runtime_health_alert": "mcp failed servers: 1",
+                "status_workspace_summary": "mode=main health=healthy focused=demo.py",
+                "status_workspace_mode": "main",
+                "status_workspace_health": "healthy",
+                "status_workspace_recovery": "/workspaces list",
+                "status_workspace_recommended_actions": ["/workspaces list", "/workspaces cleanup"],
+                "status_workspace_primary_action": "workspace_cleanup_preview",
+                "status_workspace_secondary_action": "/workspaces list",
+                "status_workspace_tertiary_action": "none",
+                "status_action_groups": {
+                    "go_to_focused_file": ["/files focused"],
+                    "inspect_changes": ["/changes working-set", "/files context"],
+                    "inspect_task": ["/tasks active"],
+                    "inspect_project_context_health": ["/project-context", "/plugins", "/skills"],
+                },
+                "status_explicit_context_entry_count": 0,
+                "status_unresolved_explicit_context_entry_count": 0,
+                "status_next_actions": ["/files focused", "/changes working-set", "/tasks active"],
+            },
+            plugin_surface_metadata={
+                "plugin_registry_summary": "registered=8 enabled=8 disabled=0 diagnostics=1",
+                "plugin_diagnostic_count": 1,
+                "plugin_manual_enabled_count": 1,
+                "plugin_manual_disabled_count": 0,
+                "plugin_selected_summary": "review (commands)",
+                "plugin_reload_state": {"summary": "latest reload: diagnostics changed"},
+                "plugin_action_groups": {
+                    "inspect_plugin_registry": ["/plugins"],
+                    "inspect_project_context_plugins": ["/project-context plugins"],
+                    "inspect_plugin_reload_state": ["/project-context reload-status", "/context-refresh"],
+                    "inspect_selected_plugin": ["/plugin show review"],
+                    "toggle_selected_plugin": ["/plugin disable review"],
+                },
+            },
+            skills_surface_metadata={
+                "skill_registry_summary": "registered=2 enabled=2 inactive=0 diagnostics=1",
+                "skill_enabled_count": 2,
+                "skill_disabled_count": 0,
+                "skill_inactive_count": 0,
+                "skill_diagnostic_count": 1,
+                "skill_manual_enabled_count": 1,
+                "skill_manual_disabled_count": 0,
+                "skill_builtin_count": 1,
+                "skill_project_local_count": 1,
+                "skill_plugin_contributed_count": 0,
+                "skill_prompt_composition_summary": "auto_enabled=1 manual_enabled=1 inactive=0",
+                "skill_selected_summary": "review (project-local, manual_enabled)",
+                "skill_reload_state": {"summary": "latest reload: skill content changed"},
+                "skill_action_groups": {
+                    "inspect_skill_registry": ["/skills"],
+                    "inspect_project_context_skills": ["/project-context skills"],
+                    "inspect_skill_reload_state": ["/project-context reload-status", "/skills-reload"],
+                    "inspect_selected_skill": ["/project-context skills"],
+                    "toggle_selected_skill": ["/skills-disable review"],
+                },
+            },
         )
 
         self.assertIn("busy: yes", rendered)
+        self.assertIn("Session Identity", rendered)
+        self.assertIn("Model and Provider", rendered)
+        self.assertIn("Memory Lifecycle", rendered)
+        self.assertIn("Background Notifications", rendered)
+        self.assertIn("Workspace State", rendered)
+        self.assertIn("Active Workflow", rendered)
+        self.assertIn("Project-Context Health", rendered)
+        self.assertIn("Skill Registry", rendered)
+        self.assertIn("Next Actions", rendered)
         self.assertIn("provider: openai-compatible", rendered)
         self.assertIn("model: gpt-4.1-mini", rendered)
         self.assertIn("session_id: demo-session", rendered)
-        self.assertIn("mcp_failed: 1", rendered)
+        self.assertIn("context_usage: 42 / 4096 (1.0%)", rendered)
+        self.assertIn("project_context: memory=none skills=2 plugins=8", rendered)
+        self.assertIn("skill_registry: registered=2 enabled=2 inactive=0 diagnostics=0", rendered)
+        self.assertIn("skill_prompt_composition: auto_enabled=2 manual_enabled=0 inactive=0", rendered)
+        self.assertIn("skill_reload_state: latest reload: none", rendered)
+        self.assertIn("manual_skill_overrides: enabled=0 disabled=0", rendered)
+        self.assertIn("skill_registry: registered=2 enabled=2 inactive=0 diagnostics=1", rendered)
+        self.assertIn("skill_prompt_composition: auto_enabled=1 manual_enabled=1 inactive=0", rendered)
+        self.assertIn("skill_sources: builtin=1 project_local=1 plugin_contributed=0", rendered)
+        self.assertIn("skill_status: enabled=2 disabled=0 inactive=0", rendered)
+        self.assertIn("skill_reload_state: latest reload: skill content changed", rendered)
+        self.assertIn("skill_diagnostics: 1", rendered)
+        self.assertIn("selected_skill: review (project-local, manual_enabled)", rendered)
+        self.assertIn("- inspect skill registry: /skills", rendered)
+        self.assertIn("- inspect skill reload state: /project-context reload-status | /skills-reload", rendered)
+        self.assertIn("mcp_health: servers=2 connected=1 failed=1 retrying=0", rendered)
+        self.assertIn("permission_summary: mode=default workspace_rules=0 session_rules=0", rendered)
+        self.assertIn("runtime_health_alert: mcp failed servers: 1", rendered)
+        self.assertIn("plugin_registry: registered=8 enabled=8 disabled=0 diagnostics=0", rendered)
+        self.assertIn("plugin_reload_state: latest reload: plugins unchanged", rendered)
+        self.assertIn("manual_plugin_overrides: enabled=1 disabled=0", rendered)
+        self.assertIn("workspace_anomaly: none", rendered)
+        self.assertIn("workspace_recovery: /workspaces list", rendered)
+        self.assertIn("workspace_recommended_actions: /workspaces list, /workspaces cleanup", rendered)
+        self.assertIn("status_workspace_primary_action: workspace_cleanup_preview", rendered)
+        self.assertIn("runtime progress: read_file: waiting for approval (read)", rendered)
+        self.assertIn("active tool: waiting_for_approval read_file", rendered)
+        self.assertIn('active tool input: {"path":"demo.py"}', rendered)
+        self.assertIn("last tool outcome: read_file | ok | ok (25ms)", rendered)
+        self.assertIn("parallel batch: active size=2", rendered)
+        self.assertIn("last tool-result summary: ok results=2", rendered)
+        self.assertIn("budget pressure: context summary chars 15 >= warning threshold 12", rendered)
+        self.assertIn("compact recovery: retry succeeded after recovery compact", rendered)
+        self.assertIn("Plugin Registry", rendered)
+        self.assertIn("plugin_diagnostics: 1", rendered)
+        self.assertIn("selected_plugin: review (commands)", rendered)
+        self.assertIn("- inspect plugin registry: /plugins", rendered)
+        self.assertIn("- inspect selected plugin: /plugin show review", rendered)
+        self.assertIn("- inspect focused file: /files focused", rendered)
+        self.assertIn("- inspect project-context health: /project-context | /plugins | /skills", rendered)
         self.assertIn("Capabilities", rendered)
         self.assertIn("tool_calling: yes", rendered)
 

@@ -9,10 +9,11 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from claudecode_py.config import SessionConfig
-from claudecode_py.models import AssistantResponse, ProviderStreamEvent, ToolCall
+from claudecode_py.models import AssistantResponse, ProviderStreamEvent, TokenUsage, ToolCall
 from claudecode_py.providers.capabilities import ProviderCapabilities
 from claudecode_py.providers.errors import (
     ProviderCapabilityError,
+    ProviderContextLimitError,
     ProviderNetworkError,
     ProviderRateLimitError,
 )
@@ -92,6 +93,9 @@ class QueryLoopTests(unittest.TestCase):
         self.assertEqual(result, "should not happen")
         self.assertIsNotNone(session.state.context_summary)
         self.assertLessEqual(len(session.state.messages), 1)
+        self.assertEqual(session.state.history_boundaries[-1].kind, "compact")
+        self.assertEqual(session.state.history_boundaries[-1].trigger, "auto")
+        self.assertIn("message count", session.state.history_boundaries[-1].trigger_reason or "")
 
     def test_query_loop_fails_fast_when_provider_lacks_tool_calling(self) -> None:
         session = Session(
@@ -433,6 +437,736 @@ class QueryLoopTests(unittest.TestCase):
         event_kinds = [event.kind for event in events]
         self.assertIn("assistant_tool_call", event_kinds)
         self.assertIn("assistant_tool_result_ready", event_kinds)
+
+    def test_query_loop_emits_provider_usage_runtime_event(self) -> None:
+        session = Session(
+            SessionConfig(
+                cwd=Path(__file__).resolve().parent,
+                interactive=False,
+            )
+        )
+        events: list[RuntimeEvent] = []
+
+        class UsageProvider:
+            def __init__(self) -> None:
+                self.capabilities = ProviderCapabilities(
+                    provider="fake",
+                    model="usage-model",
+                    supports_tool_calling=True,
+                    supports_streaming=False,
+                    supports_structured_output=False,
+                )
+
+            def create_message(self, *, messages, tools, system_prompt):
+                del messages, tools, system_prompt
+                return AssistantResponse(
+                    content=[{"type": "text", "text": "done"}],
+                    text="done",
+                    tool_calls=[],
+                    usage=TokenUsage(prompt_tokens=11, completion_tokens=7, total_tokens=18),
+                )
+
+        session.provider = UsageProvider()
+        result = run_query_loop(session, "hello", sink=events.append)
+
+        self.assertEqual(result, "done")
+        usage_events = [event for event in events if event.kind == "assistant_usage"]
+        self.assertEqual(len(usage_events), 1)
+        self.assertEqual(usage_events[0].usage_source, "provider")
+        self.assertEqual(usage_events[0].total_tokens, 18)
+        runtime_budget = session.runtime_budget_state_payload()
+        self.assertEqual(runtime_budget["last_turn_token_source"], "provider")
+        self.assertEqual(runtime_budget["last_turn_token_count"], 18)
+        self.assertTrue(runtime_budget["provider_usage_seen"])
+
+    def test_query_loop_records_estimated_usage_in_runtime_budget_state(self) -> None:
+        session = Session(
+            SessionConfig(
+                cwd=Path(__file__).resolve().parent,
+                interactive=False,
+            )
+        )
+
+        class UsageFreeProvider:
+            def __init__(self) -> None:
+                self.capabilities = ProviderCapabilities(
+                    provider="fake",
+                    model="usage-free-model",
+                    supports_tool_calling=True,
+                    supports_streaming=False,
+                    supports_structured_output=False,
+                )
+
+            def create_message(self, *, messages, tools, system_prompt):
+                del messages, tools, system_prompt
+                return AssistantResponse(
+                    content=[{"type": "text", "text": "done"}],
+                    text="done",
+                    tool_calls=[],
+                )
+
+        session.provider = UsageFreeProvider()
+        result = run_query_loop(session, "hello")
+
+        self.assertEqual(result, "done")
+        runtime_budget = session.runtime_budget_state_payload()
+        self.assertEqual(runtime_budget["last_turn_token_source"], "estimated")
+        self.assertGreater(int(runtime_budget["last_turn_token_count"] or 0), 0)
+        self.assertFalse(runtime_budget["provider_usage_seen"])
+
+    def test_query_loop_recovers_from_prompt_too_long_with_compact_retry(self) -> None:
+        session = Session(
+            SessionConfig(
+                cwd=Path(__file__).resolve().parent,
+                interactive=False,
+                max_tokens=20000,
+                max_history_messages=10,
+                history_keep_last_messages=2,
+            )
+        )
+        session.state.messages = [
+            {"role": "user", "content": [{"type": "text", "text": "one"}]},
+            {"role": "assistant", "content": [{"type": "text", "text": "two"}]},
+            {"role": "user", "content": [{"type": "text", "text": "three"}]},
+            {"role": "assistant", "content": [{"type": "text", "text": "four"}]},
+        ]
+        events: list[RuntimeEvent] = []
+
+        class RecoveryProvider:
+            def __init__(self) -> None:
+                self.calls = 0
+                self.capabilities = ProviderCapabilities(
+                    provider="fake",
+                    model="recovery-model",
+                    supports_tool_calling=True,
+                    supports_streaming=False,
+                    supports_structured_output=False,
+                )
+
+            def create_message(self, *, messages, tools, system_prompt):
+                del messages, tools, system_prompt
+                self.calls += 1
+                if self.calls == 1:
+                    raise ProviderContextLimitError(
+                        "maximum context length exceeded for this request"
+                    )
+                return AssistantResponse(
+                    content=[{"type": "text", "text": "done after recovery"}],
+                    text="done after recovery",
+                    tool_calls=[],
+                )
+
+        session.provider = RecoveryProvider()
+        result = run_query_loop(session, "hello", sink=events.append)
+
+        self.assertEqual(result, "done after recovery")
+        self.assertEqual(session.provider.calls, 2)
+        self.assertEqual(session.state.history_boundaries[-1].kind, "compact")
+        self.assertEqual(session.state.history_boundaries[-1].trigger, "recovery")
+        self.assertIn(
+            "prompt-too-long: maximum context length exceeded for this request",
+            session.state.history_boundaries[-1].trigger_reason or "",
+        )
+        self.assertTrue(any(event.kind == "provider_retry" for event in events))
+        self.assertTrue(any(event.kind == "context_compacted" for event in events))
+        self.assertTrue(any(event.kind == "compact_recovery_started" for event in events))
+        self.assertTrue(any(event.kind == "compact_recovery_finished" and not event.is_error for event in events))
+
+    def test_query_loop_recovers_from_prompt_too_long_after_tool_results(self) -> None:
+        session = Session(
+            SessionConfig(
+                cwd=Path(__file__).resolve().parent,
+                interactive=False,
+                max_tokens=20000,
+                max_history_messages=10,
+                history_keep_last_messages=2,
+            )
+        )
+        session.state.messages = [
+            {"role": "user", "content": [{"type": "text", "text": "one"}]},
+            {"role": "assistant", "content": [{"type": "text", "text": "two"}]},
+            {"role": "user", "content": [{"type": "text", "text": "three"}]},
+            {"role": "assistant", "content": [{"type": "text", "text": "four"}]},
+        ]
+        events: list[RuntimeEvent] = []
+
+        class RecoveryProvider:
+            def __init__(self) -> None:
+                self.calls = 0
+                self.capabilities = ProviderCapabilities(
+                    provider="fake",
+                    model="recovery-tool-model",
+                    supports_tool_calling=True,
+                    supports_streaming=False,
+                    supports_structured_output=False,
+                )
+
+            def create_message(self, *, messages, tools, system_prompt):
+                del messages, tools, system_prompt
+                self.calls += 1
+                if self.calls == 1:
+                    return AssistantResponse(
+                        content=[
+                            {"type": "text", "text": "Looking..."},
+                            {"type": "tool_use", "id": "call-1", "name": "task_list", "input": {}},
+                        ],
+                        text="Looking...",
+                        tool_calls=[ToolCall(id="call-1", name="task_list", input={})],
+                    )
+                if self.calls == 2:
+                    raise ProviderContextLimitError("prompt too long after tool results")
+                return AssistantResponse(
+                    content=[{"type": "text", "text": "done after tool recovery"}],
+                    text="done after tool recovery",
+                    tool_calls=[],
+                )
+
+        session.provider = RecoveryProvider()
+        result = run_query_loop(session, "hello", sink=events.append)
+
+        self.assertEqual(result, "done after tool recovery")
+        self.assertEqual(session.provider.calls, 3)
+        self.assertEqual(session.state.history_boundaries[-1].trigger, "recovery")
+        self.assertTrue(any(event.kind == "tool_result_summarized" for event in events))
+        self.assertTrue(any(event.kind == "compact_recovery_started" for event in events))
+        self.assertTrue(any(event.kind == "compact_recovery_finished" and not event.is_error for event in events))
+
+    def test_query_loop_replaces_large_tool_results_before_provider_call(self) -> None:
+        session = Session(
+            SessionConfig(
+                cwd=Path(__file__).resolve().parent,
+                interactive=False,
+                max_tokens=30000,
+                max_history_messages=20,
+            )
+        )
+        events: list[RuntimeEvent] = []
+
+        class ReplacementProvider:
+            def __init__(self) -> None:
+                self.calls = 0
+                self.second_call_messages = None
+                self.capabilities = ProviderCapabilities(
+                    provider="fake",
+                    model="replacement-model",
+                    supports_tool_calling=True,
+                    supports_streaming=False,
+                    supports_structured_output=False,
+                )
+
+            def create_message(self, *, messages, tools, system_prompt):
+                del tools, system_prompt
+                self.calls += 1
+                if self.calls == 1:
+                    return AssistantResponse(
+                        content=[
+                            {"type": "text", "text": "Inspecting..."},
+                            {"type": "tool_use", "id": "call-1", "name": "task_list", "input": {}},
+                        ],
+                        text="Inspecting...",
+                        tool_calls=[ToolCall(id="call-1", name="task_list", input={})],
+                    )
+                self.second_call_messages = messages
+                return AssistantResponse(
+                    content=[{"type": "text", "text": "done with replacement"}],
+                    text="done with replacement",
+                    tool_calls=[],
+                )
+
+        session.provider = ReplacementProvider()
+        session.execute_tool_calls = lambda tool_calls, ctx, sink=None: [  # type: ignore[method-assign]
+            {
+                "type": "tool_result",
+                "tool_use_id": "call-1",
+                "content": "X" * 20000,
+                "is_error": False,
+            }
+        ]
+
+        result = run_query_loop(session, "hello", sink=events.append)
+
+        self.assertEqual(result, "done with replacement")
+        self.assertEqual(session.provider.calls, 2)
+        second_messages = session.provider.second_call_messages
+        self.assertIsNotNone(second_messages)
+        tool_result_block = second_messages[-1]["content"][0]
+        self.assertEqual(tool_result_block["tool_use_id"], "call-1")
+        self.assertIn("Tool result replaced for context budget.", tool_result_block["content"])
+        self.assertEqual(len(session.state.tool_result_replacement_records), 1)
+        self.assertEqual(len(session.state.tool_result_artifact_records), 1)
+        self.assertEqual(
+            session.state.tool_result_replacement_records[0].tool_use_id,
+            "call-1",
+        )
+        self.assertTrue(Path(session.state.tool_result_artifact_records[0].artifact_path).exists())
+        self.assertFalse(any(boundary.kind == "compact" for boundary in session.state.history_boundaries))
+        self.assertTrue(
+            any(event.kind == "tool_result_replacement_applied" for event in events)
+        )
+        self.assertTrue(any(event.kind == "tool_result_artifact_created" for event in events))
+
+    def test_query_loop_microcompacts_large_tool_results_before_provider_call(self) -> None:
+        session = Session(
+            SessionConfig(
+                cwd=Path(__file__).resolve().parent,
+                interactive=False,
+                max_tokens=5000,
+                max_history_messages=20,
+            )
+        )
+        events: list[RuntimeEvent] = []
+
+        class MicrocompactProvider:
+            def __init__(self) -> None:
+                self.calls = 0
+                self.second_call_messages = None
+                self.capabilities = ProviderCapabilities(
+                    provider="fake",
+                    model="microcompact-model",
+                    supports_tool_calling=True,
+                    supports_streaming=False,
+                    supports_structured_output=False,
+                )
+
+            def create_message(self, *, messages, tools, system_prompt):
+                del tools, system_prompt
+                self.calls += 1
+                if self.calls == 1:
+                    return AssistantResponse(
+                        content=[
+                            {"type": "text", "text": "Inspecting..."},
+                            {"type": "tool_use", "id": "call-1", "name": "task_list", "input": {}},
+                        ],
+                        text="Inspecting...",
+                        tool_calls=[ToolCall(id="call-1", name="task_list", input={})],
+                    )
+                self.second_call_messages = messages
+                return AssistantResponse(
+                    content=[{"type": "text", "text": "done with microcompact"}],
+                    text="done with microcompact",
+                    tool_calls=[],
+                )
+
+        session.provider = MicrocompactProvider()
+        session.execute_tool_calls = lambda tool_calls, ctx, sink=None: [  # type: ignore[method-assign]
+            {
+                "type": "tool_result",
+                "tool_use_id": "call-1",
+                "content": "Y" * 5000,
+                "is_error": False,
+            }
+        ]
+
+        result = run_query_loop(session, "hello", sink=events.append)
+
+        self.assertEqual(result, "done with microcompact")
+        self.assertEqual(len(session.state.tool_result_replacement_records), 1)
+        self.assertEqual(len(session.state.tool_result_artifact_records), 0)
+        self.assertIsNotNone(session.provider.second_call_messages)
+        tool_result_block = session.provider.second_call_messages[-1]["content"][0]
+        self.assertIn("Tool result replaced for context budget.", tool_result_block["content"])
+        self.assertTrue(any(event.kind == "tool_result_microcompacted" for event in events))
+        self.assertFalse(any(event.kind == "tool_result_artifact_created" for event in events))
+
+    def test_query_loop_re_raises_prompt_too_long_without_compaction_path(self) -> None:
+        session = Session(
+            SessionConfig(
+                cwd=Path(__file__).resolve().parent,
+                interactive=False,
+            )
+        )
+
+        class NoPathProvider:
+            def __init__(self) -> None:
+                self.calls = 0
+                self.capabilities = ProviderCapabilities(
+                    provider="fake",
+                    model="no-path-model",
+                    supports_tool_calling=True,
+                    supports_streaming=False,
+                    supports_structured_output=False,
+                )
+
+            def create_message(self, *, messages, tools, system_prompt):
+                del messages, tools, system_prompt
+                self.calls += 1
+                raise ProviderContextLimitError("prompt too long with no compaction path")
+
+        session.provider = NoPathProvider()
+        with self.assertRaises(ProviderContextLimitError):
+            run_query_loop(session, "hello")
+        self.assertEqual(session.provider.calls, 1)
+        self.assertEqual(session.state.history_boundaries, [])
+
+    def test_query_loop_fails_when_recovery_budget_remains_over_limit(self) -> None:
+        session = Session(
+            SessionConfig(
+                cwd=Path(__file__).resolve().parent,
+                interactive=False,
+                max_tokens=20000,
+                max_context_summary_chars=10,
+                max_history_messages=6,
+                history_keep_last_messages=2,
+            )
+        )
+        session.state.messages = [
+            {"role": "user", "content": [{"type": "text", "text": "one"}]},
+            {"role": "assistant", "content": [{"type": "text", "text": "two"}]},
+            {"role": "user", "content": [{"type": "text", "text": "three"}]},
+            {"role": "assistant", "content": [{"type": "text", "text": "four"}]},
+        ]
+
+        class RecoveryProvider:
+            def __init__(self) -> None:
+                self.calls = 0
+                self.capabilities = ProviderCapabilities(
+                    provider="fake",
+                    model="recovery-fail-model",
+                    supports_tool_calling=True,
+                    supports_streaming=False,
+                    supports_structured_output=False,
+                )
+
+            def create_message(self, *, messages, tools, system_prompt):
+                del messages, tools, system_prompt
+                self.calls += 1
+                raise ProviderContextLimitError("maximum context length exceeded")
+
+        session.provider = RecoveryProvider()
+        with self.assertRaisesRegex(RuntimeError, "Prompt-too-long recovery failed after compaction"):
+            run_query_loop(session, "hello")
+        self.assertEqual(session.provider.calls, 1)
+        self.assertEqual(session.state.history_boundaries[-1].trigger, "recovery")
+
+    def test_query_loop_emits_budget_pressure_for_warning_state(self) -> None:
+        session = Session(
+            SessionConfig(
+                cwd=Path(__file__).resolve().parent,
+                interactive=False,
+                max_tokens=20000,
+                max_history_messages=8,
+                history_keep_last_messages=2,
+            )
+        )
+        session.state.messages = [
+            {"role": "user", "content": [{"type": "text", "text": "one"}]},
+            {"role": "assistant", "content": [{"type": "text", "text": "two"}]},
+            {"role": "user", "content": [{"type": "text", "text": "three"}]},
+            {"role": "assistant", "content": [{"type": "text", "text": "four"}]},
+            {"role": "user", "content": [{"type": "text", "text": "five"}]},
+            {"role": "assistant", "content": [{"type": "text", "text": "six"}]},
+        ]
+        events: list[RuntimeEvent] = []
+
+        class FakeProvider:
+            def __init__(self) -> None:
+                self.capabilities = ProviderCapabilities(
+                    provider="fake",
+                    model="fake-model",
+                    supports_tool_calling=True,
+                    supports_streaming=False,
+                    supports_structured_output=False,
+                )
+
+            def create_message(self, *, messages, tools, system_prompt):
+                del messages, tools, system_prompt
+                return AssistantResponse(
+                    content=[{"type": "text", "text": "done"}],
+                    text="done",
+                    tool_calls=[],
+                )
+
+        session.provider = FakeProvider()
+        result = run_query_loop(session, "hello", sink=events.append)
+
+        self.assertEqual(result, "done")
+        budget_events = [event for event in events if event.kind == "budget_pressure"]
+        self.assertGreaterEqual(len(budget_events), 1)
+        self.assertTrue(all(event.budget_state == "warning" for event in budget_events))
+        self.assertTrue(
+            all("warning threshold" in (event.budget_reason or "") for event in budget_events)
+        )
+
+    def test_query_loop_does_not_recover_twice_from_prompt_too_long(self) -> None:
+        session = Session(
+            SessionConfig(
+                cwd=Path(__file__).resolve().parent,
+                interactive=False,
+                max_tokens=20000,
+                max_history_messages=6,
+                history_keep_last_messages=2,
+            )
+        )
+        session.state.messages = [
+            {"role": "user", "content": [{"type": "text", "text": "one"}]},
+            {"role": "assistant", "content": [{"type": "text", "text": "two"}]},
+            {"role": "user", "content": [{"type": "text", "text": "three"}]},
+            {"role": "assistant", "content": [{"type": "text", "text": "four"}]},
+        ]
+
+        class RepeatProvider:
+            def __init__(self) -> None:
+                self.calls = 0
+                self.capabilities = ProviderCapabilities(
+                    provider="fake",
+                    model="repeat-model",
+                    supports_tool_calling=True,
+                    supports_streaming=False,
+                    supports_structured_output=False,
+                )
+
+            def create_message(self, *, messages, tools, system_prompt):
+                del messages, tools, system_prompt
+                self.calls += 1
+                raise ProviderContextLimitError("prompt too long again")
+
+        session.provider = RepeatProvider()
+        with self.assertRaises(ProviderContextLimitError):
+            run_query_loop(session, "hello")
+        self.assertEqual(session.provider.calls, 2)
+
+    def test_query_loop_hard_stops_when_budget_has_no_compaction_path(self) -> None:
+        session = Session(
+            SessionConfig(
+                cwd=Path(__file__).resolve().parent,
+                interactive=False,
+                max_context_summary_chars=10,
+            )
+        )
+        session.state.context_summary = "x" * 20
+
+        class FakeProvider:
+            def __init__(self) -> None:
+                self.calls = 0
+                self.capabilities = ProviderCapabilities(
+                    provider="fake",
+                    model="fake-model",
+                    supports_tool_calling=True,
+                    supports_streaming=False,
+                    supports_structured_output=False,
+                )
+
+            def create_message(self, *, messages, tools, system_prompt):
+                del messages, tools, system_prompt
+                self.calls += 1
+                return AssistantResponse(
+                    content=[{"type": "text", "text": "should not happen"}],
+                    text="should not happen",
+                    tool_calls=[],
+                )
+
+        session.provider = FakeProvider()
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "Message budget exceeded without a recoverable compaction path",
+        ):
+            run_query_loop(session, "hello")
+        self.assertEqual(session.provider.calls, 0)
+
+    def test_background_task_sink_tracks_runtime_progress_metadata(self) -> None:
+        session = Session(
+            SessionConfig(
+                cwd=Path(__file__).resolve().parent,
+                interactive=False,
+            )
+        )
+        session.set_background_session_link("bg-123")
+        task = session.task_manager.create(
+            "agent",
+            "Finish background work",
+            **session._task_background_metadata(),
+            task_role="background",
+        )
+        sink = session._build_background_task_sink(task.id)
+
+        sink(
+            RuntimeEvent(
+                kind="assistant_usage",
+                message="estimated response usage",
+                total_tokens=12,
+                usage_source="estimated",
+            )
+        )
+        sink(
+            RuntimeEvent(
+                kind="tool_started",
+                message='{"path":"demo.py"}',
+                tool_name="read_file",
+                tool_call_id="call-1",
+            )
+        )
+        sink(
+            RuntimeEvent(
+                kind="tool_waiting_for_approval",
+                message='{"path":"demo.py"}',
+                tool_name="read_file",
+                tool_call_id="call-1",
+                approval_risk_level="read",
+            )
+        )
+        sink(
+            RuntimeEvent(
+                kind="tool_finished",
+                message="ok",
+                tool_name="read_file",
+                tool_call_id="call-1",
+                duration_ms=25,
+            )
+        )
+        sink(
+            RuntimeEvent(
+                kind="tool_result_summarized",
+                message="ok results=1",
+                result_count=1,
+            )
+        )
+        sink(
+            RuntimeEvent(
+                kind="budget_pressure",
+                message="message count 6 >= warning threshold 6",
+                budget_state="warning",
+                budget_reason="message count 6 >= warning threshold 6",
+            )
+        )
+        sink(
+            RuntimeEvent(
+                kind="compact_recovery_started",
+                message="starting compact recovery after prompt-too-long",
+                compaction_trigger="recovery",
+                budget_state="compact_needed",
+                budget_reason="prompt too long",
+                is_error=True,
+            )
+        )
+        sink(
+            RuntimeEvent(
+                kind="task_progress",
+                message="Reviewing runtime metadata",
+                task_id=task.id,
+            )
+        )
+
+        updated = session.task_manager.get(task.id)
+        assert updated is not None
+        self.assertEqual(updated.metadata["background_token_count"], 15)
+        self.assertEqual(updated.metadata["background_token_count_source"], "estimated")
+        self.assertEqual(updated.metadata["background_last_tool"], "read_file")
+        self.assertEqual(updated.metadata["background_last_tool_input"], '{"path":"demo.py"}')
+        self.assertEqual(updated.metadata["background_last_tool_summary"], "ok (25ms)")
+        self.assertEqual(updated.metadata["background_runtime_active_tool_status"], "none")
+        self.assertFalse(updated.metadata["background_runtime_parallel_batch_active"])
+        self.assertEqual(updated.metadata["background_runtime_parallel_batch_size"], 0)
+        self.assertEqual(updated.metadata["background_runtime_last_result_summary"], "ok results=1")
+        self.assertEqual(updated.metadata["background_runtime_budget_pressure_summary"], "message count 6 >= warning threshold 6")
+        self.assertEqual(updated.metadata["background_runtime_compact_recovery_summary"], "starting compact recovery after prompt-too-long")
+        self.assertEqual(updated.metadata["background_runtime_last_tool_result_summary"], "ok results=1")
+        self.assertEqual(updated.metadata["background_runtime_last_budget_pressure"], "message count 6 >= warning threshold 6")
+        self.assertEqual(updated.metadata["background_runtime_last_compact_recovery"], "starting compact recovery after prompt-too-long")
+        self.assertEqual(updated.metadata["background_recent_activity_kind"], "compact_recovery")
+        self.assertEqual(
+            updated.metadata["background_recent_activity"],
+            "starting compact recovery after prompt-too-long",
+        )
+        self.assertEqual(
+            updated.metadata["background_progress_summary"],
+            "starting compact recovery after prompt-too-long",
+        )
+
+    def test_runtime_progress_surface_tracks_tool_lifecycle(self) -> None:
+        session = Session(
+            SessionConfig(
+                cwd=Path(__file__).resolve().parent,
+                interactive=False,
+            )
+        )
+        try:
+            emit = session.build_runtime_event_sink(None)
+            emit(
+                RuntimeEvent(
+                    kind="tool_batch_started",
+                    message="starting 2 parallel read-only tool call(s)",
+                    batch_size=2,
+                    batch_parallel=True,
+                )
+            )
+            emit(
+                RuntimeEvent(
+                    kind="tool_waiting_for_approval",
+                    message='{"path":"demo.py"}',
+                    tool_name="read_file",
+                    tool_call_id="call-1",
+                    approval_risk_level="read",
+                )
+            )
+            emit(
+                RuntimeEvent(
+                    kind="tool_started",
+                    message='{"path":"demo.py"}',
+                    tool_name="read_file",
+                    tool_call_id="call-1",
+                )
+            )
+            emit(
+                RuntimeEvent(
+                    kind="tool_result_summarized",
+                    message="ok results=2",
+                    result_count=2,
+                )
+            )
+            emit(
+                RuntimeEvent(
+                    kind="budget_pressure",
+                    message="message count 6 >= warning threshold 6",
+                    budget_state="warning",
+                    budget_reason="message count 6 >= warning threshold 6",
+                )
+            )
+            emit(
+                RuntimeEvent(
+                    kind="compact_recovery_started",
+                    message="starting compact recovery after prompt-too-long",
+                    compaction_trigger="recovery",
+                    budget_state="compact_needed",
+                    budget_reason="prompt too long",
+                )
+            )
+            emit(
+                RuntimeEvent(
+                    kind="tool_finished",
+                    message="ok",
+                    tool_name="read_file",
+                    tool_call_id="call-1",
+                    duration_ms=25,
+                )
+            )
+            emit(
+                RuntimeEvent(
+                    kind="tool_batch_finished",
+                    message="completed 2 parallel read-only tool call(s)",
+                    batch_size=2,
+                    batch_parallel=True,
+                    result_count=2,
+                )
+            )
+
+            payload = session.runtime_progress_surface_payload()
+            self.assertEqual(payload["runtime_active_tool_status"], "none")
+            self.assertEqual(payload["runtime_last_tool_name"], "read_file")
+            self.assertEqual(payload["runtime_last_tool_status"], "ok")
+            self.assertEqual(payload["runtime_last_tool_summary"], "ok (25ms)")
+            self.assertEqual(payload["runtime_last_result_summary"], "ok results=2")
+            self.assertEqual(
+                payload["runtime_budget_pressure_summary"],
+                "message count 6 >= warning threshold 6",
+            )
+            self.assertEqual(
+                payload["runtime_compact_recovery_summary"],
+                "starting compact recovery after prompt-too-long",
+            )
+            self.assertFalse(payload["runtime_parallel_batch_active"])
+            self.assertEqual(payload["runtime_parallel_batch_size"], 0)
+        finally:
+            session.close()
 
     def test_query_loop_applies_advisor_revision_to_final_answer(self) -> None:
         session = Session(

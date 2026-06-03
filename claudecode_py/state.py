@@ -15,6 +15,10 @@ def _artifact_id() -> str:
     return uuid4().hex[:10]
 
 
+def _history_boundary_id() -> str:
+    return uuid4().hex[:12]
+
+
 @dataclass
 class WorkspaceFileChange:
     path: str
@@ -79,6 +83,51 @@ class ExplicitContextEntry:
 
 
 @dataclass
+class HistoryBoundary:
+    boundary_id: str = field(default_factory=_history_boundary_id)
+    kind: str = ""
+    created_at: str = field(default_factory=_utc_now_iso)
+    trigger: str = ""
+    trigger_reason: str | None = None
+    summary: str = ""
+    compaction_mode: str = ""
+    message_count_before: int = 0
+    message_count_after: int = 0
+    compacted_count: int = 0
+    kept_count: int = 0
+    context_summary_chars_before: int = 0
+    context_summary_chars_after: int = 0
+    instructions: str | None = None
+    old_session_id: str | None = None
+    new_session_id: str | None = None
+    target_boundary_id: str | None = None
+    snapshot_messages: list[Message] | None = None
+    snapshot_context_summary: str | None = None
+
+
+@dataclass
+class ToolResultReplacementRecord:
+    tool_use_id: str
+    replacement: str
+    original_size_chars: int
+    replacement_size_chars: int
+    created_at: str = field(default_factory=_utc_now_iso)
+    reason: str = "message_budget"
+
+
+@dataclass
+class ToolResultArtifactRecord:
+    tool_use_id: str
+    artifact_path: str
+    content_sha256: str
+    original_size_chars: int
+    preview_size_chars: int
+    summary: str = ""
+    created_at: str = field(default_factory=_utc_now_iso)
+    reason: str = "message_budget"
+
+
+@dataclass
 class SessionState:
     session_id: str = field(default_factory=lambda: uuid4().hex)
     created_at: str = field(default_factory=_utc_now_iso)
@@ -101,6 +150,7 @@ class SessionState:
     workspace_unavailable_reason: str | None = None
     workspace_fallback_cwd: str | None = None
     context_summary: str | None = None
+    history_boundaries: list[HistoryBoundary] = field(default_factory=list)
     explicit_context_entries: list[ExplicitContextEntry] = field(default_factory=list)
     advisor_model: str | None = None
     advisor_mode: str = "off"
@@ -123,6 +173,8 @@ class SessionState:
     session_permission_rules: list[dict[str, str]] = field(default_factory=list)
     activated_deferred_tool_names: list[str] = field(default_factory=list)
     messages: list[Message] = field(default_factory=list)
+    tool_result_replacement_records: list[ToolResultReplacementRecord] = field(default_factory=list)
+    tool_result_artifact_records: list[ToolResultArtifactRecord] = field(default_factory=list)
     recent_change_sets: list[WorkspaceChangeSet] = field(default_factory=list)
     undone_change_sets: list[WorkspaceChangeSet] = field(default_factory=list)
     saved_task_records: list[dict[str, object]] = field(default_factory=list)

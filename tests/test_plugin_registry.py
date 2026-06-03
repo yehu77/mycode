@@ -268,11 +268,11 @@ class PluginRegistryTests(unittest.TestCase):
         session = Session(SessionConfig(cwd=cwd, interactive=False))
         try:
             rendered = session.describe_plugins()
-            self.assertIn("broken: status=invalid source=external", rendered)
+            self.assertIn("broken: plugin_status=invalid plugin_source=project-local external", rendered)
             self.assertIn("path=", rendered)
             detail = session.describe_plugin("broken")
-            self.assertIn("status: invalid", detail)
-            self.assertIn("source: external", detail)
+            self.assertIn("plugin status: invalid", detail)
+            self.assertIn("plugin source: project-local external", detail)
             self.assertIn('error: ValueError: Plugin manifest field "skills" must be a list.', detail)
         finally:
             session.close()
@@ -315,6 +315,54 @@ class PluginRegistryTests(unittest.TestCase):
             restored_state, _ = load_latest_transcript(cwd)
             assert restored_state is not None
             self.assertIn("docs", restored_state.enabled_plugin_names)
+        finally:
+            session.close()
+            if cwd.exists():
+                shutil.rmtree(cwd)
+
+    def test_project_local_skill_conflict_keeps_effective_skill_and_surfaces_diagnostic(self) -> None:
+        cwd = Path(__file__).resolve().parent / "_tmp_skill_conflict"
+        if cwd.exists():
+            shutil.rmtree(cwd)
+        cwd.mkdir(parents=True)
+        (cwd / ".pyclaude" / "skills").mkdir(parents=True, exist_ok=True)
+        (cwd / ".pyclaude" / "skills" / "review.md").write_text(
+            "---\n"
+            "auto_enable: true\n"
+            "---\n\n"
+            "Project-local review guidance.",
+            encoding="utf-8",
+        )
+        self._write_external_plugin(
+            cwd,
+            "docs",
+            {
+                "name": "docs",
+                "description": "Docs helper plugin.",
+                "skills": [
+                    {
+                        "name": "review",
+                        "description": "Conflicting plugin review guidance.",
+                        "content": "Plugin review guidance.",
+                        "auto_enable": True,
+                    }
+                ],
+            },
+        )
+
+        session = Session(SessionConfig(cwd=cwd, interactive=False))
+        try:
+            rendered = session.describe_loaded_skills()
+            project_context = session.describe_project_context()
+            prompt = session.build_system_prompt()
+
+            self.assertEqual(rendered.count("- review:"), 1)
+            self.assertIn("skill_source=project-local", rendered)
+            self.assertIn("skill diagnostics:", rendered)
+            self.assertIn("review: skill_status=invalid skill_source=plugin-contributed (docs)", rendered)
+            self.assertIn("skill diagnostics: 1", project_context)
+            self.assertIn("Project-local review guidance.", prompt)
+            self.assertNotIn("Plugin review guidance.", prompt)
         finally:
             session.close()
             if cwd.exists():
@@ -385,7 +433,7 @@ class PluginRegistryTests(unittest.TestCase):
 
             self.assertIn("Reloaded project context.", message)
             self.assertIn("docs-style", session.describe_loaded_skills())
-            self.assertIn("docs: status=enabled source=external", session.describe_plugins())
+            self.assertIn("docs: plugin_status=enabled plugin_source=project-local external", session.describe_plugins())
         finally:
             session.close()
             if cwd.exists():
@@ -423,7 +471,7 @@ class PluginRegistryTests(unittest.TestCase):
 
             self.assertIn("Reloaded project context.", message)
             self.assertNotIn("docs-style", session.describe_loaded_skills())
-            self.assertNotIn("docs: status=", session.describe_plugins())
+            self.assertNotIn("docs: plugin_status=", session.describe_plugins())
             self.assertEqual(session.state.enabled_plugin_names, [])
             self.assertEqual(session.state.disabled_plugin_names, [])
         finally:
@@ -448,10 +496,10 @@ class PluginRegistryTests(unittest.TestCase):
 
         try:
             rendered = session.describe_plugins()
-            self.assertIn("review: status=enabled source=builtin", rendered)
-            self.assertIn("review: status=invalid source=external", rendered)
+            self.assertIn("review: plugin_status=enabled plugin_source=builtin", rendered)
+            self.assertIn("review: plugin_status=invalid plugin_source=project-local external", rendered)
             detail = session.describe_plugin("review")
-            self.assertIn("source: builtin", detail)
+            self.assertIn("plugin source: builtin", detail)
         finally:
             session.close()
             if cwd.exists():
@@ -468,9 +516,9 @@ class PluginRegistryTests(unittest.TestCase):
 
         try:
             rendered = session.describe_plugins()
-            self.assertIn("broken: status=invalid source=external", rendered)
+            self.assertIn("broken: plugin_status=invalid plugin_source=project-local external", rendered)
             detail = session.describe_plugin("broken")
-            self.assertIn("status: invalid", detail)
+            self.assertIn("plugin status: invalid", detail)
             self.assertIn('error: Missing required manifest "plugin.json".', detail)
         finally:
             session.close()

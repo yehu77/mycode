@@ -92,6 +92,17 @@ class WorkspaceSessionComponent:
     def __init__(self, session: Any) -> None:
         self._session = session
 
+    def _workspace_anomaly_summary(self, item: dict[str, Any]) -> str:
+        session = self._session
+        return session._workspace_anomaly_summary(
+            workspace_health=str(item.get("workspace_health") or "healthy"),
+            workspace_cleanup_status=str(item.get("workspace_cleanup_status") or "none"),
+            workspace_unavailable=bool(item.get("workspace_unavailable")),
+            workspace_unavailable_reason=str(item.get("workspace_unavailable_reason") or "").strip() or None,
+            workspace_fallback_cwd=str(item.get("workspace_fallback_cwd") or "").strip() or None,
+            workspace_cleanup_error=str(item.get("workspace_cleanup_error") or "").strip() or None,
+        )
+
     def _workspace_selector_for_item(self, item: dict[str, Any]) -> str:
         session_ids = sorted(str(session_id).strip() for session_id in item.get("session_ids", set()) if str(session_id).strip())
         if len(session_ids) == 1:
@@ -118,8 +129,42 @@ class WorkspaceSessionComponent:
         title: str,
         action_bundle: dict[str, str],
     ) -> list[str]:
+        session = self._session
+        selector = self._workspace_selector_for_item(item)
+        recommended_actions = session._workspace_recommended_actions(
+            workspace_health=str(item.get("workspace_health") or "healthy"),
+            workspace_label=str(item.get("label") or "").strip() or None,
+            session_id=selector if len(item.get("session_ids", set()) or []) == 1 else None,
+        )
+        anomaly_summary = self._workspace_anomaly_summary(item)
         lines = [
             title,
+            "workspace state:",
+            f"- label: {item.get('label') or 'none'}",
+            f"- mode: {item.get('mode') or 'main'}",
+            f"- health: {item.get('workspace_health') or 'healthy'}",
+            f"- origin: {item.get('original_cwd') or ''}",
+            f"- effective_cwd: {item.get('effective_cwd') or ''}",
+            f"- cleanup_status: {item.get('workspace_cleanup_status') or 'none'}",
+            f"- session_refs: {int(item.get('session_refs') or 0)}",
+            f"- background_refs: {int(item.get('background_refs') or 0)}",
+            "workspace anomaly:",
+            f"- workspace anomaly: {anomaly_summary}",
+            f"- workspace_unavailable_reason: {item.get('workspace_unavailable_reason') or 'none'}",
+            f"- workspace_cleanup_error: {item.get('workspace_cleanup_error') or 'none'}",
+            f"- workspace_fallback_cwd: {item.get('workspace_fallback_cwd') or 'none'}",
+            "workspace recovery:",
+            f"- workspace recovery: {recommended_actions[0] if recommended_actions else 'none'}",
+            "- workspace_recommended_actions: "
+            + (", ".join(recommended_actions) if recommended_actions else "none"),
+            f"- selected_workspace_primary_action: {action_bundle.get('primary_action') or 'none'}",
+            f"- selected_workspace_secondary_action: {action_bundle.get('secondary_action') or 'none'}",
+            f"- selected_workspace_tertiary_action: {action_bundle.get('tertiary_action') or 'none'}",
+            f"- selected_workspace_target: {action_bundle.get('target') or 'none'}",
+            "next actions:",
+            f"- primary action: {action_bundle.get('primary_action') or 'none'}",
+            f"- secondary action: {action_bundle.get('secondary_action') or 'none'}",
+            f"- tertiary action: {action_bundle.get('tertiary_action') or 'none'}",
             f"label: {item.get('label') or 'none'}",
             f"mode: {item.get('mode') or 'main'}",
             f"health: {item.get('workspace_health') or 'healthy'}",
@@ -133,6 +178,7 @@ class WorkspaceSessionComponent:
             f"tertiary action: {action_bundle.get('tertiary_action') or 'none'}",
         ]
         if item.get("workspace_created_at"):
+            lines.insert(9, f"- created_at: {item['workspace_created_at']}")
             lines.append(f"created_at: {item['workspace_created_at']}")
         if item.get("workspace_fallback_cwd"):
             lines.append(f"fallback_cwd: {item['workspace_fallback_cwd']}")

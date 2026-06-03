@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from ..commands.registry import CommandRegistry, ReplCommand
-from ..skills.loader import LoadedSkill, ProjectContext
+from ..skills.loader import LoadedSkill, ProjectContext, SkillLoadDiagnostic
 
 if TYPE_CHECKING:
     from ..state import SessionState
@@ -31,6 +31,8 @@ class PluginSkillDefinition:
             description=self.description,
             auto_enable=self.auto_enable,
             tags=self.tags,
+            source="plugin",
+            source_owner=plugin_name,
         )
 
 
@@ -88,6 +90,33 @@ class PluginDefinition:
     def plugin_id(self) -> str:
         return f"{self.name}@{self.source}"
 
+    @property
+    def source_label(self) -> str:
+        return "project-local external" if self.source == "external" else self.source
+
+    def contribution_types(self) -> tuple[str, ...]:
+        labels: list[str] = []
+        if self.commands:
+            labels.append("commands")
+        if self.skills:
+            labels.append("skills")
+        if self.mcp_servers:
+            labels.append("mcp_servers")
+        if self.hooks or not labels:
+            labels.append("hooks/config-only")
+        return tuple(labels)
+
+    def contribution_summary(self) -> str:
+        return ",".join(self.contribution_types()) or "none"
+
+    def contribution_name_map(self) -> dict[str, tuple[str, ...]]:
+        return {
+            "commands": tuple(command.name for command in self.commands),
+            "skills": tuple(skill.name for skill in self.skills),
+            "mcp_servers": tuple(server.name for server in self.mcp_servers),
+            "hooks": tuple(self.hooks),
+        }
+
 
 @dataclass(slots=True, frozen=True)
 class PluginLoadDiagnostic:
@@ -95,6 +124,10 @@ class PluginLoadDiagnostic:
     source: str
     path: Path
     error: str
+
+    @property
+    def source_label(self) -> str:
+        return "project-local external" if self.source == "external" else self.source
 
 
 class PluginRegistry:
@@ -153,6 +186,76 @@ class PluginRegistry:
             return True
         return plugin.default_enabled
 
+    def manual_override_state(self, name: str, state: "SessionState") -> str:
+        plugin = self.get_plugin(name)
+        if plugin is None:
+            return "none"
+        if plugin.name in state.enabled_plugin_names:
+            return "manual-enabled"
+        if plugin.name in state.disabled_plugin_names:
+            return "manual-disabled"
+        return "inherited"
+
+    def plugin_entry_payload(self, plugin: PluginDefinition, state: "SessionState") -> dict[str, object]:
+        contribution_names = plugin.contribution_name_map()
+        return {
+            "name": plugin.name,
+            "plugin_id": plugin.plugin_id,
+            "source": plugin.source,
+            "source_label": plugin.source_label,
+            "status": "enabled" if self.is_enabled(plugin.name, state) else "disabled",
+            "default_enabled": bool(plugin.default_enabled),
+            "manual_override_state": self.manual_override_state(plugin.name, state),
+            "version": plugin.version,
+            "description": plugin.description,
+            "path": str(plugin.path) if plugin.path is not None else None,
+            "contribution_types": list(plugin.contribution_types()),
+            "contribution_summary": plugin.contribution_summary(),
+            "command_count": len(plugin.commands),
+            "skill_count": len(plugin.skills),
+            "mcp_server_count": len(plugin.mcp_servers),
+            "hook_count": len(plugin.hooks),
+            "command_names": list(contribution_names["commands"]),
+            "skill_names": list(contribution_names["skills"]),
+            "mcp_server_names": list(contribution_names["mcp_servers"]),
+            "hook_names": list(contribution_names["hooks"]),
+        }
+
+    def diagnostic_entry_payload(self, diagnostic: PluginLoadDiagnostic) -> dict[str, object]:
+        return {
+            "name": diagnostic.name,
+            "source": diagnostic.source,
+            "source_label": diagnostic.source_label,
+            "path": str(diagnostic.path),
+            "error": diagnostic.error,
+        }
+
+    def registry_summary_payload(self, state: "SessionState") -> dict[str, object]:
+        plugins = self.list_plugins()
+        diagnostics = self.list_diagnostics()
+        enabled = self.enabled_plugins(state)
+        disabled = self.disabled_plugins(state)
+        manual_enabled = [
+            plugin.name for plugin in plugins if self.manual_override_state(plugin.name, state) == "manual-enabled"
+        ]
+        manual_disabled = [
+            plugin.name for plugin in plugins if self.manual_override_state(plugin.name, state) == "manual-disabled"
+        ]
+        return {
+            "registry_count": len(plugins),
+            "enabled_count": len(enabled),
+            "disabled_count": len(disabled),
+            "diagnostic_count": len(diagnostics),
+            "manual_enabled_count": len(manual_enabled),
+            "manual_disabled_count": len(manual_disabled),
+            "builtin_count": sum(1 for plugin in plugins if plugin.source == "builtin"),
+            "project_local_count": sum(1 for plugin in plugins if plugin.source == "external"),
+            "enabled_plugin_names": [plugin.name for plugin in enabled],
+            "disabled_plugin_names": [plugin.name for plugin in disabled],
+            "manual_enabled_plugin_names": manual_enabled,
+            "manual_disabled_plugin_names": manual_disabled,
+        }
+
     def build_command_registry(
         self,
         state: "SessionState",
@@ -173,13 +276,35 @@ class PluginRegistry:
         cwd: Path,
     ) -> ProjectContext:
         skills = list(base_context.skills)
+        diagnostics = list(base_context.skill_diagnostics)
+        seen_skill_names = {skill.name: skill for skill in skills}
         for plugin in self.enabled_plugins(state):
             for skill in plugin.skills:
-                skills.append(skill.to_loaded_skill(cwd=cwd, plugin_name=plugin.name))
+                loaded_skill = skill.to_loaded_skill(cwd=cwd, plugin_name=plugin.name)
+                existing = seen_skill_names.get(loaded_skill.name)
+                if existing is not None:
+                    diagnostics.append(
+                        SkillLoadDiagnostic(
+                            name=loaded_skill.name,
+                            source="plugin",
+                            source_owner=plugin.name,
+                            path=loaded_skill.path,
+                            error=(
+                                "Skill name conflict: "
+                                f'plugin-contributed skill "{loaded_skill.name}" from "{plugin.name}" '
+                                f"conflicts with effective {existing.source} skill from "
+                                f'"{existing.source_owner}" and is skipped.'
+                            ),
+                        )
+                    )
+                    continue
+                seen_skill_names[loaded_skill.name] = loaded_skill
+                skills.append(loaded_skill)
         return ProjectContext(
             memory_path=base_context.memory_path,
             memory_content=base_context.memory_content,
             skills=skills,
+            skill_diagnostics=diagnostics,
         )
 
     def enabled_mcp_server_payloads(self, state: "SessionState") -> list[dict[str, object]]:
@@ -291,8 +416,9 @@ def merge_plugin_registries(*registries: PluginRegistry) -> PluginRegistry:
                         source=plugin.source,
                         path=plugin.path or Path(plugin.name),
                         error=(
-                            f'Plugin name conflicts with already-registered plugin '
-                            f'"{existing.name}" from source={existing.source}.'
+                            f'Same-name plugin conflict with already-registered '
+                            f'"{existing.name}" from source={existing.source}; '
+                            f"existing plugin remains effective."
                         ),
                     )
                 )

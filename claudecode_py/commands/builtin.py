@@ -15,6 +15,7 @@ from .local_commands import (
     handle_permissions_command,
     handle_plan_command,
     handle_project_context_command,
+    handle_rewind_command,
     handle_sessions_command,
     handle_status_command,
     handle_symbol_command,
@@ -48,6 +49,11 @@ def build_core_commands() -> list[ReplCommand]:
             "/compact",
             "Compact older conversation history into context summary, optionally with instructions",
             lambda session, args: handle_compact_command(session, args),
+        ),
+        ReplCommand(
+            "/rewind",
+            "Inspect or apply rewindable conversation boundaries",
+            lambda session, args: handle_rewind_command(session, args),
         ),
         ReplCommand(
             "/status",
@@ -155,6 +161,11 @@ def build_core_commands() -> list[ReplCommand]:
             lambda session, args: session.describe_project_memory(),
         ),
         ReplCommand(
+            "/agents",
+            "Show lightweight local agent definitions",
+            lambda session, args: session.describe_agents(),
+        ),
+        ReplCommand(
             "/skills",
             "Show loaded project skills",
             lambda session, args: session.describe_loaded_skills(),
@@ -249,8 +260,7 @@ def _bind_help_command(commands: list[ReplCommand], registry: CommandRegistry) -
 def _clear_command(session: "Session", args: str) -> str:
     raw = args.strip().lower()
     if not raw or raw == "history":
-        session.clear_history()
-        return "Cleared conversation history only for this session."
+        return session.clear_history()
     if raw == "changes":
         return session.clear_change_history()
     if raw == "symbol":

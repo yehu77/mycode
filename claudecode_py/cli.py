@@ -12,6 +12,7 @@ from threading import Thread
 from time import sleep
 from typing import TYPE_CHECKING
 
+from .background_metadata import background_grouped_actions, background_session_metadata, background_workflow_payload
 from .commands import CommandExecution, build_default_command_registry, render_repl_command_help
 from .config import load_config
 from .env_loader import load_dotenv
@@ -38,8 +39,8 @@ from .storage.background_sessions import (
     resolve_background_session,
     update_background_session,
 )
-from .storage.transcript import get_session_path, list_transcripts, load_transcript_by_session_id
-from .workflow_semantics import build_continuation_semantics
+from .storage.transcript import get_session_path, list_transcripts
+from .session_components.workflow_surface import render_summary_field_lines, render_workflow_action_sections
 from .workspace import IsolatedWorkspace, cleanup_isolated_workspace, prepare_isolated_workspace
 from .workspace.isolation import derive_workspace_health
 
@@ -87,6 +88,7 @@ def build_parser() -> argparse.ArgumentParser:
     serve_bridge.add_argument("--port", type=int, default=8765, help="Bridge bind port")
     sessions = subparsers.add_parser("sessions", help="List saved sessions")
     sessions.add_argument("--limit", type=int, default=10, help="Maximum sessions to show")
+    subparsers.add_parser("agents", help="Inspect lightweight local agent definitions")
     bg_ps = subparsers.add_parser("ps", help="List detached background sessions")
     bg_ps.add_argument("--limit", type=int, default=20, help="Maximum background sessions to show")
     bg_ps.add_argument("session", nargs="?", help="Optional background session id or prefix for detail view")
@@ -645,68 +647,35 @@ def _render_planning_bits(*, active_planning_artifact_id: str | None, planning_a
     return bits
 
 
-def _background_continuation_hint(record: BackgroundSessionRecord) -> str:
-    if record.status in {"busy", "running", "queued"}:
-        return f"pyclaude attach {record.bg_id}"
-    if record.session_id:
-        return f"pyclaude --resume-session {record.session_id} repl"
-    return f"pyclaude logs {record.bg_id}"
-
-
-def _background_session_is_live_attachable(record: BackgroundSessionRecord) -> bool:
-    return (
-        record.status in {"busy", "running"}
-        and bool(record.bridge_host)
-        and bool(record.bridge_port)
-        and bool(record.session_id)
-    )
-
-
-def _background_session_is_saved_resumable(record: BackgroundSessionRecord) -> bool:
-    if _background_session_is_live_attachable(record) or not record.session_id:
-        return False
-    state, _ = load_transcript_by_session_id(Path(record.cwd), record.session_id)
-    return state is not None
-
-
-def _background_continuation_category(record: BackgroundSessionRecord) -> str:
-    return _background_grouped_actions(record, detail=False)["category"]
-
-
-def _background_grouped_actions(record: BackgroundSessionRecord, *, detail: bool) -> dict[str, str]:
-    live_attachable = _background_session_is_live_attachable(record)
-    saved_resumable = _background_session_is_saved_resumable(record)
-    semantics = build_continuation_semantics(
-        is_live_attachable=live_attachable,
-        is_saved_resumable=saved_resumable,
-        live_attach_command=f"pyclaude attach {record.bg_id}",
-        resume_session_id=record.session_id,
-        stay_on_surface=(
-        f"pyclaude ps | pyclaude logs {record.bg_id}"
-        if detail
-        else f"pyclaude ps {record.bg_id} | pyclaude logs {record.bg_id}"
-        ),
-    )
-    return {
-        "category": semantics.category,
-        "go_to_live_attach": semantics.go_to_live_attach,
-        "go_to_saved_resume": semantics.go_to_saved_resume,
-        "stay_on_surface": semantics.stay_on_surface,
-    }
-
-
 def _render_background_session_header(record: BackgroundSessionRecord, *, include_prompt: bool) -> str:
-    actions = _background_grouped_actions(record, detail=True)
+    metadata = background_session_metadata(record, detail=True)
+    workflow = background_workflow_payload(record, detail=True)
+    actions = background_grouped_actions(record, detail=True)
     bridge_endpoint = (
         f"{record.bridge_host}:{record.bridge_port}"
         if record.bridge_host and record.bridge_port
         else "none"
     )
+    task_surface_counts = metadata["background_task_surface_counts"]
+    if isinstance(task_surface_counts, dict) and task_surface_counts:
+        task_surface_summary = ",".join(
+            f"{key}:{int(value)}"
+            for key, value in task_surface_counts.items()
+            if isinstance(value, int) and value >= 0
+        )
+    else:
+        task_surface_summary = "none"
     lines = [
         "background session:",
         f"background session id: {record.bg_id}",
         f"session id: {record.session_id or 'none'}",
+        f"background session source: {metadata['background_session_source']}",
         f"continuation category: {actions['category']}",
+        f"live attachable: {'yes' if metadata['background_live_attachable'] else 'no'}",
+        f"saved resumable: {'yes' if metadata['background_saved_resumable'] else 'no'}",
+        f"inactive only: {'yes' if metadata['background_inactive_only'] else 'no'}",
+        f"primary action: {metadata['background_primary_action']}",
+        f"secondary action: {metadata['background_secondary_action']}",
         f"provider: {record.provider}",
         f"model: {record.model}",
         f"status: {record.status}",
@@ -715,7 +684,13 @@ def _render_background_session_header(record: BackgroundSessionRecord, *, includ
         f"ended at: {record.ended_at or 'none'}",
         f"pid: {record.pid if record.pid is not None else 'none'}",
         f"log path: {record.log_path or 'none'}",
-        f"transcript path: {record.transcript_path or 'none'}",
+        f"transcript path: {metadata['background_transcript_path'] or 'none'}",
+        f"last known message count: {metadata['background_last_known_message_count'] if metadata['background_last_known_message_count'] is not None else 'none'}",
+        f"last known context summary chars: {metadata['background_last_known_context_summary_chars'] if metadata['background_last_known_context_summary_chars'] is not None else 'none'}",
+        f"task surfaces: {task_surface_summary}",
+        f"has active plan: {'yes' if metadata['background_has_active_plan'] else 'no'}",
+        f"active plan id: {metadata['background_active_plan_id'] or 'none'}",
+        f"planning artifact count: {int(metadata['background_planning_artifact_count'] or 0)}",
         f"workspace mode: {record.workspace_mode}",
         f"workspace health: {getattr(record, 'workspace_health', 'healthy')}",
         f"workspace label: {record.workspace_label or 'none'}",
@@ -729,8 +704,93 @@ def _render_background_session_header(record: BackgroundSessionRecord, *, includ
         f"go_to_saved_resume: {actions['go_to_saved_resume']}",
         f"stay_on_surface: {actions['stay_on_surface']}",
     ]
+    workflow_lines = ["background workflow:"]
+    workflow_lines.extend(
+        render_summary_field_lines(
+            [
+                ("current workflow", workflow["background_current_workflow_summary"]),
+                ("task surfaces", workflow["background_task_surface_summary"]),
+                ("background execution tasks", workflow["background_background_execution_count"]),
+                ("active plan execution tasks", workflow["background_active_plan_execution_count"]),
+                (
+                    "primary task",
+                    (
+                        f"{workflow['background_primary_task']['task_id']} "
+                        f"({workflow['background_primary_task']['surface_kind']}: "
+                        f"{workflow['background_primary_task']['description']})"
+                        if workflow["background_primary_task"] is not None
+                        else None
+                    ),
+                ),
+                (
+                    "primary task status",
+                    (
+                        workflow["background_primary_task"]["status"]
+                        if workflow["background_primary_task"] is not None
+                        else None
+                    ),
+                ),
+                (
+                    "primary task progress",
+                    (
+                        workflow["background_primary_task"]["progress_summary"]
+                        if workflow["background_primary_task"] is not None
+                        else None
+                    ),
+                ),
+                ("active plan", workflow["background_active_plan_summary"]),
+                ("recent changes", workflow["background_recent_change_count"]),
+                ("latest change", workflow["background_latest_change_summary"]),
+                ("latest change tool", workflow["background_latest_change_tool_name"]),
+                ("latest change files", workflow["background_latest_change_file_count"]),
+                ("recent activity", workflow["background_recent_activity"]),
+                ("token count", _render_background_token_summary(workflow)),
+                ("last tool", workflow["background_last_tool"]),
+                ("last tool input", workflow["background_last_tool_input"]),
+                ("active tool status", workflow["background_runtime_active_tool_status"]),
+                (
+                    "parallel batch",
+                    (
+                        f"active size={workflow['background_runtime_parallel_batch_size']}"
+                        if workflow["background_runtime_parallel_batch_active"]
+                        else "none"
+                    ),
+                ),
+                ("last tool summary", workflow["background_last_tool_summary"]),
+                ("last tool-result summary", workflow["background_runtime_last_result_summary"]),
+                ("budget pressure", workflow["background_runtime_budget_pressure_summary"]),
+                ("compact recovery", workflow["background_runtime_compact_recovery_summary"]),
+                ("tool uses", workflow["background_tool_use_count"]),
+                ("message count", workflow["background_message_count"]),
+                ("progress summary", workflow["background_progress_summary"]),
+                ("completion state", workflow["background_completion_state"]),
+                ("completion summary", workflow["background_completion_summary"]),
+                ("failure reason", workflow["background_failure_reason"]),
+                ("result pointer", workflow["background_result_pointer"]),
+                ("transcript pointer", workflow["background_transcript_pointer"]),
+                ("pending followups", workflow["background_pending_followup_count"]),
+                ("pending followup", workflow["background_pending_followup_summary"]),
+                ("latest followup", workflow["background_latest_followup_message"]),
+                ("latest followup mode", workflow["background_latest_followup_mode"]),
+                ("working set", f"{workflow['background_working_set_file_count']} file(s)"),
+                ("focused file", workflow["background_focused_file"]),
+                ("focused file source", workflow["background_focused_file_source"]),
+                ("explicit context entries", workflow["background_explicit_context_count"]),
+            ],
+            line_prefix="- ",
+        )
+    )
+    workflow_lines.extend(
+        render_workflow_action_sections(
+            workflow["background_action_groups"],
+            heading="next_actions:",
+            ordered_keys=workflow["background_action_order"],
+            line_prefix="- ",
+        )
+    )
     if include_prompt:
         lines.insert(9, f"prompt: {record.prompt}")
+    lines.extend(["", *workflow_lines])
     return "\n".join(lines)
 
 
@@ -745,6 +805,8 @@ def _render_background_sessions(records: list[BackgroundSessionRecord]) -> str:
     for item in records:
         updated = item.updated_at or item.created_at
         session_id = item.session_id or "-"
+        metadata = background_session_metadata(item, detail=False)
+        workflow = background_workflow_payload(item, detail=False)
         workspace_bits = _render_workspace_bits(
             workspace_mode=item.workspace_mode,
             workspace_health=getattr(item, "workspace_health", "healthy"),
@@ -763,12 +825,37 @@ def _render_background_sessions(records: list[BackgroundSessionRecord]) -> str:
                 getattr(item, "session_command_policy_require_read_only_subagents", False)
             ),
         )
-        actions = _background_grouped_actions(item, detail=False)
         source_bits = [
-            "source=live_background" if item.status in {"busy", "running", "queued"} else "source=saved_background",
-            "continue=" + _background_continuation_hint(item),
-            "continuation=" + actions["category"],
+            "source=" + str(metadata["background_session_source"]),
+            "continue=" + str(metadata["background_primary_action"]),
+            "continuation=" + str(metadata["background_continuation_category"]),
+            "live_attachable=" + ("yes" if metadata["background_live_attachable"] else "no"),
+            "saved_resumable=" + ("yes" if metadata["background_saved_resumable"] else "no"),
+            "inactive_only=" + ("yes" if metadata["background_inactive_only"] else "no"),
         ]
+        message_count = metadata["background_last_known_message_count"]
+        context_summary_chars = metadata["background_last_known_context_summary_chars"]
+        if message_count is not None:
+            source_bits.append(f"messages={int(message_count)}")
+        if context_summary_chars is not None:
+            source_bits.append(f"context_summary_chars={int(context_summary_chars)}")
+        progress_summary = str(workflow["background_progress_summary"] or "").strip()
+        if progress_summary:
+            source_bits.append("progress=" + progress_summary)
+        token_summary = _render_background_token_summary(workflow)
+        if token_summary:
+            source_bits.append("tokens=" + token_summary)
+        completion_state = str(workflow["background_completion_state"] or "").strip()
+        if completion_state:
+            source_bits.append("completion=" + completion_state)
+        pending_followups = int(workflow.get("background_pending_followup_count", 0) or 0)
+        if pending_followups > 0:
+            source_bits.append(f"pending_followups={pending_followups}")
+        task_bits = _render_task_surface_bits(metadata["background_task_surface_counts"])
+        planning_bits = _render_planning_bits(
+            active_planning_artifact_id=metadata["background_active_plan_id"],
+            planning_artifact_count=metadata["background_planning_artifact_count"],
+        )
         lines.append(
             f"{item.bg_id}  status={item.status}  updated={updated}  "
             f"session={session_id}  provider={item.provider}  model={item.model}  "
@@ -777,13 +864,23 @@ def _render_background_sessions(records: list[BackgroundSessionRecord]) -> str:
                     *source_bits,
                     *workspace_bits,
                     *execution_bits,
-                    f"go_to_live_attach={actions['go_to_live_attach']}",
-                    f"go_to_saved_resume={actions['go_to_saved_resume']}",
-                    f"stay_on_surface={actions['stay_on_surface']}",
+                    *task_bits,
+                    *planning_bits,
+                    f"go_to_live_attach={metadata['background_go_to_live_attach']}",
+                    f"go_to_saved_resume={metadata['background_go_to_saved_resume']}",
+                    f"stay_on_surface={metadata['background_stay_on_surface']}",
                 ]
             )
         )
     return "\n".join(lines)
+
+
+def _render_background_token_summary(payload: dict[str, object]) -> str | None:
+    token_count = payload.get("background_token_count")
+    if token_count in {None, ""}:
+        return None
+    token_source = str(payload.get("background_token_count_source") or "").strip()
+    return f"{token_count} ({token_source})" if token_source else str(token_count)
 
 
 def _resolve_background_session_or_raise(cwd: Path, identifier: str) -> BackgroundSessionRecord:
@@ -938,6 +1035,7 @@ def _run_background_worker(config, *, bg_id: str, prompt: str) -> int:
         return 1
     session_id = created["result"]["session_id"]
     session = dispatcher._sessions[session_id].session
+    session.set_background_session_link(bg_id)
     session.set_session_execution_contract(execution_mode="background-session")
     session.state.original_cwd = str(config.cwd.resolve())
     session.state.effective_cwd = str(workspace.effective_cwd.resolve())
@@ -1336,6 +1434,14 @@ def main(argv: list[str] | None = None) -> int:
                 + "  ".join([*planning_bits, *task_bits, *workspace_bits, *execution_bits])
             )
         return 0
+
+    if args.command == "agents":
+        session = session_factory.create_session(config)
+        try:
+            print(session.describe_agents())
+            return 0
+        finally:
+            session.close()
 
     if args.command == "ps":
         if args.session:

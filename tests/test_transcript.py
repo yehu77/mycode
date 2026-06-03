@@ -10,8 +10,11 @@ if str(ROOT) not in sys.path:
 from claudecode_py.config import SessionConfig
 from claudecode_py.state import (
     AdvisorReviewSummary,
+    HistoryBoundary,
     PlanningArtifact,
     SessionState,
+    ToolResultArtifactRecord,
+    ToolResultReplacementRecord,
     WorkspaceChangeSet,
     WorkspaceFileChange,
 )
@@ -41,6 +44,24 @@ class TranscriptTests(unittest.TestCase):
                 enabled_skill_names=["review"],
                 disabled_skill_names=["draft"],
                 messages=[{"role": "user", "content": [{"type": "text", "text": "hi"}]}],
+                tool_result_replacement_records=[
+                    ToolResultReplacementRecord(
+                        tool_use_id="tool-1",
+                        replacement="Tool result replaced for context budget.",
+                        original_size_chars=12000,
+                        replacement_size_chars=120,
+                    )
+                ],
+                tool_result_artifact_records=[
+                    ToolResultArtifactRecord(
+                        tool_use_id="tool-1",
+                        artifact_path=str(cwd / ".pyclaude" / "tool_result_artifacts" / "session-1" / "tool-1.txt"),
+                        content_sha256="abc123",
+                        original_size_chars=12000,
+                        preview_size_chars=120,
+                        summary="trimmed",
+                    )
+                ],
                 recent_change_sets=[
                     WorkspaceChangeSet(
                         tool_name="write_file",
@@ -88,6 +109,16 @@ class TranscriptTests(unittest.TestCase):
             self.assertEqual(loaded_state.enabled_skill_names, ["review"])
             self.assertEqual(loaded_state.disabled_skill_names, ["draft"])
             self.assertEqual(loaded_state.messages[0]["role"], "user")
+            self.assertEqual(len(loaded_state.tool_result_replacement_records), 1)
+            self.assertEqual(len(loaded_state.tool_result_artifact_records), 1)
+            self.assertEqual(
+                loaded_state.tool_result_replacement_records[0].tool_use_id,
+                "tool-1",
+            )
+            self.assertEqual(
+                loaded_state.tool_result_artifact_records[0].tool_use_id,
+                "tool-1",
+            )
             self.assertEqual(len(loaded_state.recent_change_sets), 1)
             self.assertEqual(len(loaded_state.undone_change_sets), 1)
             self.assertEqual(loaded_state.recent_change_sets[0].files[0].action_kind, "create")
@@ -115,6 +146,18 @@ class TranscriptTests(unittest.TestCase):
                 session_id="session-b",
                 created_at="2026-01-02T00:00:00+00:00",
                 context_summary="summary",
+                history_boundaries=[
+                    HistoryBoundary(
+                        kind="compact",
+                        trigger="auto",
+                        trigger_reason="message count 5 > 4",
+                        summary="Compacted earlier turns",
+                        compaction_mode="local_estimated_summary",
+                        compacted_count=2,
+                        kept_count=2,
+                        context_summary_chars_after=7,
+                    )
+                ],
                 messages=[
                     {"role": "user", "content": [{"type": "text", "text": "b1"}]},
                     {"role": "assistant", "content": [{"type": "text", "text": "b2"}]},
@@ -128,11 +171,26 @@ class TranscriptTests(unittest.TestCase):
             self.assertEqual(summaries[0].session_id, "session-b")
             self.assertEqual(summaries[0].message_count, 2)
             self.assertTrue(summaries[0].context_summary_present)
+            self.assertEqual(summaries[0].history_boundary_count, 1)
+            self.assertEqual(summaries[0].compact_boundary_count, 1)
+            self.assertEqual(summaries[0].last_history_boundary_kind, "compact")
+            self.assertEqual(summaries[0].last_compact_boundary_trigger, "auto")
+            self.assertEqual(summaries[0].last_compact_boundary_reason, "message count 5 > 4")
+            self.assertEqual(summaries[0].last_compact_boundary_summary, "Compacted earlier turns")
 
             loaded_state, loaded_path = load_transcript_by_session_id(cwd, "session-a")
             self.assertIsNotNone(loaded_state)
             self.assertEqual(loaded_state.session_id, "session-a")
             self.assertEqual(loaded_path, get_session_path(cwd, "session-a"))
+
+            loaded_compacted_state, _ = load_transcript_by_session_id(cwd, "session-b")
+            self.assertIsNotNone(loaded_compacted_state)
+            assert loaded_compacted_state is not None
+            self.assertEqual(len(loaded_compacted_state.history_boundaries), 1)
+            self.assertEqual(
+                loaded_compacted_state.history_boundaries[0].snapshot_context_summary,
+                None,
+            )
         finally:
             if cwd.exists():
                 shutil.rmtree(cwd)

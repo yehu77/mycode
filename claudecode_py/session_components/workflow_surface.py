@@ -36,6 +36,31 @@ def build_file_context_item_action_groups(
     }
 
 
+def build_file_surface_action_groups(
+    session: Any,
+    item: dict[str, Any],
+    *,
+    stay_on_surface_actions: list[str],
+    inspect_focused_file_actions: list[str] | None = None,
+    inspect_focused_diff_actions: list[str] | None = None,
+    inspect_explicit_context_actions: list[str] | None = None,
+) -> dict[str, list[str]]:
+    action_groups = build_file_context_item_action_groups(
+        session,
+        item,
+        stay_on_surface_actions=stay_on_surface_actions,
+    )
+    return {
+        "inspect_focused_file": dedupe_action_commands(inspect_focused_file_actions or []),
+        "inspect_focused_diff": dedupe_action_commands(inspect_focused_diff_actions or []),
+        "inspect_change": dedupe_action_commands(action_groups.get("go_to_change", [])),
+        "inspect_task": dedupe_action_commands(action_groups.get("go_to_task", [])),
+        "inspect_active_plan": dedupe_action_commands(action_groups.get("go_to_plan", [])),
+        "inspect_explicit_context": dedupe_action_commands(inspect_explicit_context_actions or []),
+        "stay_on_surface": dedupe_action_commands(action_groups.get("stay_on_surface", [])),
+    }
+
+
 def render_action_group_lines(
     action_groups: dict[str, list[str]],
     *,
@@ -243,6 +268,74 @@ def render_file_context_action_group_summary(
     )
 
 
+def render_file_surface_action_group_lines(
+    session: Any,
+    item: dict[str, Any],
+    *,
+    stay_on_surface_actions: list[str],
+    inspect_focused_file_actions: list[str] | None = None,
+    inspect_focused_diff_actions: list[str] | None = None,
+    inspect_explicit_context_actions: list[str] | None = None,
+    heading: str = "next_actions:",
+    line_prefix: str = "- ",
+    ordered_keys: tuple[str, ...] | None = None,
+) -> list[str]:
+    return render_action_group_lines(
+        build_file_surface_action_groups(
+            session,
+            item,
+            stay_on_surface_actions=stay_on_surface_actions,
+            inspect_focused_file_actions=inspect_focused_file_actions,
+            inspect_focused_diff_actions=inspect_focused_diff_actions,
+            inspect_explicit_context_actions=inspect_explicit_context_actions,
+        ),
+        heading=heading,
+        line_prefix=line_prefix,
+        ordered_keys=ordered_keys
+        or (
+            "inspect_focused_file",
+            "inspect_focused_diff",
+            "inspect_change",
+            "inspect_task",
+            "inspect_active_plan",
+            "inspect_explicit_context",
+            "stay_on_surface",
+        ),
+    )
+
+
+def render_file_surface_action_group_summary(
+    session: Any,
+    item: dict[str, Any],
+    *,
+    stay_on_surface_actions: list[str],
+    inspect_focused_file_actions: list[str] | None = None,
+    inspect_focused_diff_actions: list[str] | None = None,
+    inspect_explicit_context_actions: list[str] | None = None,
+    ordered_keys: tuple[str, ...] | None = None,
+) -> str:
+    return render_action_group_summary(
+        build_file_surface_action_groups(
+            session,
+            item,
+            stay_on_surface_actions=stay_on_surface_actions,
+            inspect_focused_file_actions=inspect_focused_file_actions,
+            inspect_focused_diff_actions=inspect_focused_diff_actions,
+            inspect_explicit_context_actions=inspect_explicit_context_actions,
+        ),
+        ordered_keys=ordered_keys
+        or (
+            "inspect_focused_file",
+            "inspect_focused_diff",
+            "inspect_change",
+            "inspect_task",
+            "inspect_active_plan",
+            "inspect_explicit_context",
+            "stay_on_surface",
+        ),
+    )
+
+
 def render_focused_file_context_lines(
     session: Any,
     payload: dict[str, Any] | None,
@@ -271,6 +364,7 @@ def render_focused_file_context_lines(
     scope_reasons = session._file_context_scope_reasons(focused_item)
     if scope_reasons:
         lines.append("- in scope because: " + ", ".join(scope_reasons))
+    lines.append("- context origin: " + session._file_context_origin_label(focused_item))
     related_change = str(focused_item.get("change_id") or "").strip()
     change_navigation = session._resolve_change_navigation_for_file_context_item(focused_item)
     if related_change:

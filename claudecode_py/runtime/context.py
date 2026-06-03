@@ -19,7 +19,13 @@ from ..integrations import SymbolLocation
 from ..mcp import McpRegistry
 from ..permissions import PermissionManager
 from ..plugins import PluginRegistry, build_builtin_plugin_registry
-from ..prompts import SYSTEM_PROMPT_TEMPLATE, compose_system_prompt
+from ..prompts import (
+    SYSTEM_PROMPT_TEMPLATE,
+    SystemPromptBlock,
+    compose_system_prompt,
+    compose_system_prompt_blocks,
+    render_system_prompt_blocks,
+)
 from ..providers import build_provider
 from ..skills import LoadedSkill, ProjectContext, load_project_context
 from ..state import SessionState
@@ -96,6 +102,9 @@ class SessionRuntimeContext:
         )
 
     def build_system_prompt(self, state: SessionState) -> str:
+        return render_system_prompt_blocks(self.build_system_prompt_blocks(state))
+
+    def build_system_prompt_blocks(self, state: SessionState) -> list[SystemPromptBlock]:
         auto_enabled_skills, manually_enabled_skills = self.active_skills_by_source(state)
         planning_context = None
         latest = _active_planning_artifact(state)
@@ -106,7 +115,7 @@ class SessionRuntimeContext:
                 f"goal: {latest.goal}\n"
                 f"summary:\n{latest.summary}"
             )
-        return compose_system_prompt(
+        return compose_system_prompt_blocks(
             base_prompt=self.base_system_prompt,
             project_context=self.project_context,
             auto_enabled_skills=auto_enabled_skills,

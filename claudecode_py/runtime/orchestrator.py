@@ -36,13 +36,31 @@ class ToolOrchestrator:
         event_sink = sink or null_sink
         results: list[ToolExecutionResult] = []
         for batch in self._partition(tool_calls):
-            if self._is_parallel_batch(batch):
+            batch_parallel = self._is_parallel_batch(batch)
+            event_sink(
+                RuntimeEvent(
+                    kind="tool_batch_started",
+                    message=self._batch_message(batch, parallel=batch_parallel, completed=False),
+                    batch_size=len(batch),
+                    batch_parallel=batch_parallel,
+                )
+            )
+            if batch_parallel:
                 with ThreadPoolExecutor(max_workers=min(len(batch), 4)) as executor:
                     futures = [executor.submit(self._run_one, call, ctx, event_sink) for call in batch]
                     results.extend(future.result() for future in futures)
             else:
                 for call in batch:
                     results.append(self._run_one(call, ctx, event_sink))
+            event_sink(
+                RuntimeEvent(
+                    kind="tool_batch_finished",
+                    message=self._batch_message(batch, parallel=batch_parallel, completed=True),
+                    batch_size=len(batch),
+                    batch_parallel=batch_parallel,
+                    result_count=len(batch),
+                )
+            )
         return [
             {
                 "type": "tool_result",
@@ -72,21 +90,30 @@ class ToolOrchestrator:
             )
             return ToolExecutionResult(call.id, f'Unknown tool "{call.name}".', True)
 
+        request = tool.approval_request(call.input, ctx)
         sink(
             RuntimeEvent(
-                kind="tool_started",
+                kind="tool_waiting_for_approval",
                 message=summarize_tool_input(call.input),
                 tool_name=tool.name,
                 tool_call_id=call.id,
+                approval_risk_level=request.risk_level,
             )
         )
         started = perf_counter()
-        request = tool.approval_request(call.input, ctx)
         try:
             validator = getattr(ctx.session, "validate_tool_call_policy", None)
             if validator is not None:
                 validator(tool.name, call.input)
             ctx.permission_manager.require_approval(request)
+            sink(
+                RuntimeEvent(
+                    kind="tool_started",
+                    message=summarize_tool_input(call.input),
+                    tool_name=tool.name,
+                    tool_call_id=call.id,
+                )
+            )
             result = tool.execute(call.input, ctx)
             duration_ms = int((perf_counter() - started) * 1000)
             sink(
@@ -133,6 +160,7 @@ class ToolOrchestrator:
                     tool_name=tool.name,
                     tool_call_id=call.id,
                     duration_ms=duration_ms,
+                    approval_risk_level=request.risk_level,
                     is_error=True,
                     **event_kwargs,
                 )
@@ -152,6 +180,12 @@ class ToolOrchestrator:
                 )
             )
             return ToolExecutionResult(call.id, error_text, True)
+
+    def _batch_message(self, batch: list[ToolCall], *, parallel: bool, completed: bool) -> str:
+        batch_size = len(batch)
+        mode = "parallel read-only" if parallel else "serial"
+        phase = "completed" if completed else "starting"
+        return f"{phase} {batch_size} {mode} tool call(s)"
 
     def _partition(self, tool_calls: list[ToolCall]) -> list[list[ToolCall]]:
         batches: list[list[ToolCall]] = []

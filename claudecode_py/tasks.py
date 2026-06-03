@@ -82,6 +82,15 @@ class TaskManager:
             task.updated_at = _utc_now_iso()
             self._condition.notify_all()
 
+    def update_metadata(self, task_id: str, **metadata: Any) -> None:
+        if not metadata:
+            return
+        with self._condition:
+            task = self._tasks[task_id]
+            task.metadata.update(metadata)
+            task.updated_at = _utc_now_iso()
+            self._condition.notify_all()
+
     def stop(self, task_id: str) -> TaskRecord:
         with self._condition:
             task = self._tasks[task_id]

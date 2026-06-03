@@ -10,8 +10,11 @@ from ..config import SessionConfig
 from ..state import (
     AdvisorReviewSummary,
     ExplicitContextEntry,
+    HistoryBoundary,
     PlanningArtifact,
     SessionState,
+    ToolResultArtifactRecord,
+    ToolResultReplacementRecord,
     WorkspaceChangeSet,
     WorkspaceFileChange,
 )
@@ -45,6 +48,13 @@ class TranscriptSummary:
     session_command_policy_require_read_only_subagents: bool
     message_count: int
     context_summary_present: bool
+    history_boundary_count: int
+    compact_boundary_count: int
+    last_history_boundary_kind: str | None
+    last_history_boundary_at: str | None
+    last_compact_boundary_trigger: str | None
+    last_compact_boundary_reason: str | None
+    last_compact_boundary_summary: str | None
     active_planning_artifact_id: str | None
     planning_artifact_count: int
     task_surface_counts: dict[str, int]
@@ -100,6 +110,7 @@ def save_transcript(config: SessionConfig, state: SessionState) -> Path:
         "workspace_unavailable_reason": state.workspace_unavailable_reason,
         "workspace_fallback_cwd": state.workspace_fallback_cwd,
         "context_summary": state.context_summary,
+        "history_boundaries": [asdict(item) for item in state.history_boundaries],
         "explicit_context_entries": [asdict(item) for item in state.explicit_context_entries],
         "advisor_model": state.advisor_model,
         "advisor_mode": state.advisor_mode,
@@ -127,6 +138,12 @@ def save_transcript(config: SessionConfig, state: SessionState) -> Path:
         "model": config.model,
         "message_count": len(state.messages),
         "messages": state.messages,
+        "tool_result_replacement_records": [
+            asdict(item) for item in state.tool_result_replacement_records
+        ],
+        "tool_result_artifact_records": [
+            asdict(item) for item in state.tool_result_artifact_records
+        ],
         "recent_change_sets": [asdict(item) for item in state.recent_change_sets],
         "undone_change_sets": [asdict(item) for item in state.undone_change_sets],
         "saved_task_records": list(state.saved_task_records),
@@ -224,6 +241,59 @@ def load_transcript(path: Path) -> SessionState:
             else None
         ),
         context_summary=payload.get("context_summary"),
+        history_boundaries=[
+            HistoryBoundary(
+                boundary_id=str(entry.get("boundary_id") or ""),
+                kind=str(entry.get("kind") or ""),
+                created_at=str(entry.get("created_at") or utc_now_iso()),
+                trigger=str(entry.get("trigger") or ""),
+                trigger_reason=(
+                    str(entry.get("trigger_reason"))
+                    if entry.get("trigger_reason") is not None
+                    else None
+                ),
+                summary=str(entry.get("summary") or ""),
+                compaction_mode=str(entry.get("compaction_mode") or ""),
+                message_count_before=int(entry.get("message_count_before", 0) or 0),
+                message_count_after=int(entry.get("message_count_after", 0) or 0),
+                compacted_count=int(entry.get("compacted_count", 0) or 0),
+                kept_count=int(entry.get("kept_count", 0) or 0),
+                context_summary_chars_before=int(entry.get("context_summary_chars_before", 0) or 0),
+                context_summary_chars_after=int(entry.get("context_summary_chars_after", 0) or 0),
+                instructions=(
+                    str(entry.get("instructions"))
+                    if entry.get("instructions") is not None
+                    else None
+                ),
+                old_session_id=(
+                    str(entry.get("old_session_id"))
+                    if entry.get("old_session_id") is not None
+                    else None
+                ),
+                new_session_id=(
+                    str(entry.get("new_session_id"))
+                    if entry.get("new_session_id") is not None
+                    else None
+                ),
+                target_boundary_id=(
+                    str(entry.get("target_boundary_id"))
+                    if entry.get("target_boundary_id") is not None
+                    else None
+                ),
+                snapshot_messages=(
+                    list(entry.get("snapshot_messages", []))
+                    if entry.get("snapshot_messages") is not None
+                    else None
+                ),
+                snapshot_context_summary=(
+                    str(entry.get("snapshot_context_summary"))
+                    if entry.get("snapshot_context_summary") is not None
+                    else None
+                ),
+            )
+            for entry in payload.get("history_boundaries", [])
+            if isinstance(entry, dict)
+        ],
         explicit_context_entries=[
             ExplicitContextEntry(
                 raw_path=str(entry.get("raw_path") or ""),
@@ -292,6 +362,32 @@ def load_transcript(path: Path) -> SessionState:
         ],
         activated_deferred_tool_names=list(payload.get("activated_deferred_tool_names", [])),
         messages=list(payload.get("messages", [])),
+        tool_result_replacement_records=[
+            ToolResultReplacementRecord(
+                tool_use_id=str(item.get("tool_use_id") or ""),
+                replacement=str(item.get("replacement") or ""),
+                original_size_chars=int(item.get("original_size_chars", 0) or 0),
+                replacement_size_chars=int(item.get("replacement_size_chars", 0) or 0),
+                created_at=str(item.get("created_at") or utc_now_iso()),
+                reason=str(item.get("reason") or "message_budget"),
+            )
+            for item in payload.get("tool_result_replacement_records", [])
+            if isinstance(item, dict)
+        ],
+        tool_result_artifact_records=[
+            ToolResultArtifactRecord(
+                tool_use_id=str(item.get("tool_use_id") or ""),
+                artifact_path=str(item.get("artifact_path") or ""),
+                content_sha256=str(item.get("content_sha256") or ""),
+                original_size_chars=int(item.get("original_size_chars", 0) or 0),
+                preview_size_chars=int(item.get("preview_size_chars", 0) or 0),
+                summary=str(item.get("summary") or ""),
+                created_at=str(item.get("created_at") or utc_now_iso()),
+                reason=str(item.get("reason") or "message_budget"),
+            )
+            for item in payload.get("tool_result_artifact_records", [])
+            if isinstance(item, dict)
+        ],
         recent_change_sets=[
             WorkspaceChangeSet(
                 change_id=item.get("change_id", utc_now_iso()),
@@ -440,6 +536,29 @@ def list_transcripts(cwd: Path, *, limit: int | None = None) -> list[TranscriptS
                 ),
                 message_count=int(payload.get("message_count", len(payload.get("messages", [])))),
                 context_summary_present=bool(payload.get("context_summary")),
+                history_boundary_count=len(payload.get("history_boundaries", [])),
+                compact_boundary_count=sum(
+                    1
+                    for item in payload.get("history_boundaries", [])
+                    if isinstance(item, dict) and str(item.get("kind") or "") == "compact"
+                ),
+                last_history_boundary_kind=_last_history_boundary_field(payload, "kind"),
+                last_history_boundary_at=_last_history_boundary_field(payload, "created_at"),
+                last_compact_boundary_trigger=_last_matching_history_boundary_field(
+                    payload,
+                    kind="compact",
+                    field="trigger",
+                ),
+                last_compact_boundary_reason=_last_matching_history_boundary_field(
+                    payload,
+                    kind="compact",
+                    field="trigger_reason",
+                ),
+                last_compact_boundary_summary=_last_matching_history_boundary_field(
+                    payload,
+                    kind="compact",
+                    field="summary",
+                ),
                 active_planning_artifact_id=(
                     str(payload.get("active_planning_artifact_id"))
                     if payload.get("active_planning_artifact_id") is not None
@@ -476,6 +595,30 @@ def load_latest_transcript(cwd: Path) -> tuple[SessionState | None, Path | None]
         return None, None
     latest = summaries[0].path
     return load_transcript(latest), latest
+
+
+def _last_history_boundary_field(payload: dict, field: str) -> str | None:
+    boundaries = payload.get("history_boundaries", [])
+    if not isinstance(boundaries, list) or not boundaries:
+        return None
+    for item in reversed(boundaries):
+        if isinstance(item, dict) and item.get(field) is not None:
+            return str(item.get(field))
+    return None
+
+
+def _last_matching_history_boundary_field(payload: dict, *, kind: str, field: str) -> str | None:
+    boundaries = payload.get("history_boundaries", [])
+    if not isinstance(boundaries, list) or not boundaries:
+        return None
+    for item in reversed(boundaries):
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("kind") or "") != kind:
+            continue
+        if item.get(field) is not None:
+            return str(item.get(field))
+    return None
 
 
 def update_transcript_workspace_metadata(

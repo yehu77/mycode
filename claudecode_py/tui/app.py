@@ -14,9 +14,18 @@ from ..cli import _focused_file_context_header_lines
 from ..commands import CommandExecution
 from ..interactions import UserQuestionRequest, UserQuestionResponse
 from ..permissions import ApprovalRequest, ApprovalResult
+from ..remote_session import RemoteSessionProxy
 from ..runtime.events import RuntimeEvent
 from ..session import Session
-from .state import PendingApproval, PendingChecklistEdit, PendingQuestion, TuiState
+from ..session_factory import SessionFactory
+from ..storage.background_sessions import BackgroundSessionRecord, resolve_background_session
+from .state import (
+    PendingApproval,
+    PendingBackgroundFollowup,
+    PendingChecklistEdit,
+    PendingQuestion,
+    TuiState,
+)
 
 
 class PyClaudeTui(App[None]):
@@ -131,6 +140,18 @@ class PyClaudeTui(App[None]):
         ("shift+f12", "execute_workspace_secondary_action", "Workspace Secondary"),
         ("alt+f11", "execute_checklist_primary_action", "Checklist Primary"),
         ("alt+f12", "execute_checklist_secondary_action", "Checklist Secondary"),
+        ("alt+shift+up", "select_prev_background_session", "Prev Background"),
+        ("alt+shift+down", "select_next_background_session", "Next Background"),
+        ("alt+shift+f8", "open_background_logs", "Background Logs"),
+        ("alt+shift+f9", "execute_background_primary_action", "Background Primary"),
+        ("alt+shift+f10", "execute_background_secondary_action", "Background Secondary"),
+        ("alt+shift+f6", "send_background_followup", "Background Follow-up"),
+        ("alt+shift+f7", "queue_background_followup", "Background Queue"),
+        ("alt+shift+f12", "cancel_background_followup", "Cancel Bg Queue"),
+        ("ctrl+alt+left", "select_prev_rewind_boundary", "Prev Rewind"),
+        ("ctrl+alt+right", "select_next_rewind_boundary", "Next Rewind"),
+        ("ctrl+alt+p", "preview_selected_rewind_boundary", "Preview Rewind"),
+        ("ctrl+alt+r", "apply_selected_rewind_boundary", "Apply Rewind"),
         ("alt+f9", "execute_symbol_primary_action", "Symbol Primary"),
         ("alt+f10", "execute_symbol_secondary_action", "Symbol Secondary"),
         ("alt+1", "select_prev_symbol_primary_target", "Prev Symbol Primary"),
@@ -213,6 +234,15 @@ class PyClaudeTui(App[None]):
 
     def on_mount(self) -> None:
         self.title = "PyClaudeCode TUI"
+        self._bind_session_handlers()
+        self._initialize_session_surface(reset_state=False)
+
+    def on_unmount(self) -> None:
+        self._unbind_session_handlers(self.session)
+        if hasattr(self.session, "set_question_handler"):
+            self.session.set_question_handler(None)
+
+    def _bind_session_handlers(self) -> None:
         self.sub_title = str(self.session.config.cwd)
         if hasattr(self.session, "set_live_event_sink"):
             self.session.set_live_event_sink(self._handle_runtime_event)
@@ -226,6 +256,22 @@ class PyClaudeTui(App[None]):
                 self._handle_remote_question_requested,
                 self._handle_remote_question_resolved,
             )
+        if hasattr(self.session.permission_manager, "approval_handler"):
+            self.session.permission_manager.approval_handler = self._request_approval
+        if hasattr(self.session, "set_question_handler"):
+            self.session.set_question_handler(self._request_questions)
+
+    def _unbind_session_handlers(self, session: object) -> None:
+        if hasattr(session, "set_live_event_sink"):
+            session.set_live_event_sink(None)
+        if hasattr(session, "set_approval_handlers"):
+            session.set_approval_handlers(None, None)
+        if hasattr(session, "set_question_handlers"):
+            session.set_question_handlers(None, None)
+
+    def _initialize_session_surface(self, *, reset_state: bool) -> None:
+        if reset_state:
+            self.state = TuiState()
         if self.session.state.messages and self.restored_from is not None:
             self.state.append_event(
                 f"Restored saved session {self.session.state.session_id} with {len(self.session.state.messages)} messages."
@@ -266,16 +312,6 @@ class PyClaudeTui(App[None]):
             self._append_event(execution_summary)
         self._append_event('Type "/help" for commands.')
         self._render()
-
-    def on_unmount(self) -> None:
-        if hasattr(self.session, "set_live_event_sink"):
-            self.session.set_live_event_sink(None)
-        if hasattr(self.session, "set_approval_handlers"):
-            self.session.set_approval_handlers(None, None)
-        if hasattr(self.session, "set_question_handlers"):
-            self.session.set_question_handlers(None, None)
-        if hasattr(self.session, "set_question_handler"):
-            self.session.set_question_handler(None)
 
     def _request_approval(self, request: ApprovalRequest) -> ApprovalResult:
         approval_event = Event()
@@ -382,6 +418,9 @@ class PyClaudeTui(App[None]):
             self._submit_pending_checklist_edit(raw_prompt)
             return
         if not prompt:
+            return
+        if self.state.pending_background_followup is not None:
+            self._submit_pending_background_followup(raw_prompt)
             return
         if self.state.pending_question is not None:
             self._resolve_question_from_prompt(prompt)
@@ -944,6 +983,76 @@ class PyClaudeTui(App[None]):
 
     def action_execute_checklist_secondary_action(self) -> None:
         self._execute_checklist_action(primary=False)
+
+    def action_select_prev_background_session(self) -> None:
+        self._move_background_registry_selection(-1)
+
+    def action_select_next_background_session(self) -> None:
+        self._move_background_registry_selection(1)
+
+    def action_execute_background_primary_action(self) -> None:
+        self._execute_background_registry_action(primary=True)
+
+    def action_execute_background_secondary_action(self) -> None:
+        self._execute_background_registry_action(primary=False)
+
+    def action_open_background_logs(self) -> None:
+        self._execute_background_registry_action(logs_only=True)
+
+    def action_send_background_followup(self) -> None:
+        self._request_background_followup(mode="send")
+
+    def action_queue_background_followup(self) -> None:
+        self._request_background_followup(mode="queue")
+
+    def action_cancel_background_followup(self) -> None:
+        if self.state.pending_background_followup is not None:
+            self.state.pending_background_followup = None
+            self._append_event("Canceled background follow-up input.")
+            self._render()
+            return
+        selected = self._resolved_background_registry_context()
+        if not isinstance(selected, dict):
+            self._append_event("No background session is selected.")
+            self._render()
+            return
+        bg_id = str(selected.get("background_session_id") or "").strip()
+        if not bg_id:
+            self._append_event("Selected background session has no id.")
+            self._render()
+            return
+        output = self.session.cancel_pending_background_followup(bg_id)
+        if output:
+            self.state.append_message("System", output)
+        self._render()
+
+    def action_select_prev_rewind_boundary(self) -> None:
+        self._move_rewind_boundary_selection(-1)
+
+    def action_select_next_rewind_boundary(self) -> None:
+        self._move_rewind_boundary_selection(1)
+
+    def action_preview_selected_rewind_boundary(self) -> None:
+        payload = self._selected_rewind_boundary_payload()
+        if not isinstance(payload, dict):
+            self._append_event("No rewindable boundaries are available in the current session.")
+            return
+        command = str(payload.get("show_action") or "").strip()
+        if not command:
+            self._append_event("No rewind preview action is available for the selected boundary.")
+            return
+        self._execute_navigation_command(command)
+
+    def action_apply_selected_rewind_boundary(self) -> None:
+        payload = self._selected_rewind_boundary_payload()
+        if not isinstance(payload, dict):
+            self._append_event("No rewindable boundaries are available in the current session.")
+            return
+        command = str(payload.get("apply_action") or "").strip()
+        if not command:
+            self._append_event("No rewind apply action is available for the selected boundary.")
+            return
+        self._execute_navigation_command(command)
 
     def action_execute_symbol_primary_action(self) -> None:
         self._execute_symbol_action(primary=True)
@@ -1891,6 +2000,64 @@ class PyClaudeTui(App[None]):
             self.state.append_message("System", output)
         self._render()
 
+    def _request_background_followup(self, *, mode: str) -> None:
+        selected = self._resolved_background_registry_context()
+        if not isinstance(selected, dict):
+            self._append_event("No background session is selected.")
+            self._render()
+            return
+        bg_id = str(selected.get("background_session_id") or "").strip()
+        if not bg_id:
+            self._append_event("Selected background session has no id.")
+            self._render()
+            return
+        if mode == "send" and not bool(selected.get("background_live_attachable")):
+            self._append_event("Selected background session is not live-attachable.")
+            self._render()
+            return
+        if mode not in {"send", "queue"}:
+            self._append_event("Unsupported background follow-up mode.")
+            self._render()
+            return
+        label = "send" if mode == "send" else "queue"
+        prompt = (
+            f'Enter a background follow-up message to {label} for "{bg_id}". '
+            'Use ".cancel" to abort.'
+        )
+        self.state.pending_background_followup = PendingBackgroundFollowup(
+            bg_id=bg_id,
+            mode=mode,
+            prompt=prompt,
+        )
+        self._append_event(prompt)
+        self._render()
+
+    def _submit_pending_background_followup(self, raw_value: str) -> None:
+        pending = self.state.pending_background_followup
+        if pending is None:
+            return
+        command = raw_value.strip()
+        if command == ".cancel":
+            self.state.pending_background_followup = None
+            self._append_event("Canceled background follow-up.")
+            self._render()
+            return
+        if not command:
+            self._append_event("Background follow-up cannot be empty.")
+            self._render()
+            return
+        self.state.pending_background_followup = None
+        if pending.mode == "send":
+            output = self.session.send_background_followup(pending.bg_id, raw_value)
+            action_label = "send_background_followup"
+        else:
+            output = self.session.queue_background_message(pending.bg_id, raw_value)
+            action_label = "queue_background_message"
+        self._append_chat("You", f"{action_label} {pending.bg_id} {command}".rstrip())
+        if output:
+            self.state.append_message("System", output)
+        self._render()
+
     def _checklist_tasks_payload(self) -> list[dict[str, object]]:
         if not hasattr(self.session, "checklist_tasks_payload"):
             return []
@@ -2246,6 +2413,269 @@ class PyClaudeTui(App[None]):
         self._refresh_selected_task_detail()
         if output:
             self.state.append_message("System", output)
+        self._render()
+
+    def _background_registry_payload(self) -> dict[str, object] | None:
+        if not hasattr(self.session, "background_registry_payload"):
+            return None
+        try:
+            payload = self.session.background_registry_payload()
+        except Exception:  # noqa: BLE001
+            return None
+        return payload if isinstance(payload, dict) and payload else None
+
+    def _resolved_background_registry_context(self) -> dict[str, object] | None:
+        payload = self._background_registry_payload()
+        if not isinstance(payload, dict):
+            return None
+        entries = payload.get("background_registry_entries")
+        if not isinstance(entries, list) or not entries:
+            return None
+        selected_bg_id = self.state.selected_background_registry_bg_id
+        selected_index = self.state.selected_background_registry_index
+        resolved_index = 0
+        selected_entry: dict[str, object] | None = None
+        for index, item in enumerate(entries):
+            if not isinstance(item, dict):
+                continue
+            bg_id = str(item.get("background_session_id") or "").strip()
+            if selected_bg_id and bg_id == selected_bg_id:
+                resolved_index = index
+                selected_entry = item
+                break
+        if selected_entry is None and 0 <= selected_index < len(entries):
+            item = entries[selected_index]
+            if isinstance(item, dict):
+                resolved_index = selected_index
+                selected_entry = item
+        if selected_entry is None:
+            preferred_bg_id = str(payload.get("background_registry_selected_bg_id") or "").strip()
+            for index, item in enumerate(entries):
+                if not isinstance(item, dict):
+                    continue
+                if preferred_bg_id and str(item.get("background_session_id") or "").strip() == preferred_bg_id:
+                    resolved_index = index
+                    selected_entry = item
+                    break
+        if selected_entry is None:
+            first = entries[0]
+            if not isinstance(first, dict):
+                return None
+            selected_entry = first
+            resolved_index = 0
+        self.state.selected_background_registry_index = resolved_index
+        self.state.selected_background_registry_bg_id = (
+            str(selected_entry.get("background_session_id") or "").strip() or None
+        )
+        return selected_entry
+
+    def _selected_rewind_boundary_payload(self) -> dict[str, object] | None:
+        if not hasattr(self.session, "memory_surface_payload"):
+            return None
+        try:
+            memory_payload = self.session.memory_surface_payload()
+        except Exception:  # noqa: BLE001
+            return None
+        if not isinstance(memory_payload, dict):
+            return None
+        rewindable_count = int(
+            memory_payload.get(
+                "memory_rewindable_boundary_count",
+                memory_payload.get("rewindable_history_boundary_count") or 0,
+            )
+            or 0
+        )
+        if rewindable_count <= 0 or not hasattr(self.session, "rewind_boundary_preview_payload"):
+            self.state.selected_rewind_boundary_index = 0
+            return None
+        resolved_index = max(0, min(self.state.selected_rewind_boundary_index, rewindable_count - 1))
+        self.state.selected_rewind_boundary_index = resolved_index
+        try:
+            payload = self.session.rewind_boundary_preview_payload(str(resolved_index + 1))
+        except Exception:  # noqa: BLE001
+            return None
+        return payload if isinstance(payload, dict) and payload else None
+
+    def _move_rewind_boundary_selection(self, delta: int) -> None:
+        if not hasattr(self.session, "memory_surface_payload"):
+            self._append_event("Memory metadata is not available in the current session.")
+            return
+        try:
+            memory_payload = self.session.memory_surface_payload()
+        except Exception:  # noqa: BLE001
+            self._append_event("Failed to load rewind boundary metadata.")
+            return
+        rewindable_count = int(
+            memory_payload.get(
+                "memory_rewindable_boundary_count",
+                memory_payload.get("rewindable_history_boundary_count") or 0,
+            )
+            if isinstance(memory_payload, dict)
+            else 0
+        )
+        if rewindable_count <= 0:
+            self.state.selected_rewind_boundary_index = 0
+            self._append_event("No rewindable boundaries are available in the current session.")
+            return
+        self.state.move_rewind_boundary_selection(delta, total=rewindable_count)
+        payload = self._selected_rewind_boundary_payload()
+        if isinstance(payload, dict):
+            self._append_event(
+                "rewind boundary selection: "
+                + str(payload.get("boundary_id") or f"selector {payload.get('selector_index') or 1}")
+            )
+        self._render()
+
+    def _move_background_registry_selection(self, delta: int) -> None:
+        payload = self._background_registry_payload()
+        entries = payload.get("background_registry_entries") if isinstance(payload, dict) else None
+        total = len(entries) if isinstance(entries, list) else 0
+        if total <= 0:
+            self._append_event("No background sessions are available in the current workspace.")
+            return
+        self._resolved_background_registry_context()
+        self.state.move_background_registry_selection(delta, total=total)
+        self.state.selected_background_registry_bg_id = None
+        selected = self._resolved_background_registry_context()
+        if selected is not None:
+            self._append_event(
+                "background selection: "
+                + (str(selected.get("background_session_id") or "").strip() or "(unknown)")
+            )
+        self._render()
+
+    def _selected_background_record(self) -> BackgroundSessionRecord | None:
+        context = self._resolved_background_registry_context()
+        if context is None:
+            return None
+        bg_id = str(context.get("background_session_id") or "").strip()
+        if not bg_id:
+            return None
+        try:
+            cwd = Path(self.session.config.cwd)
+        except Exception:  # noqa: BLE001
+            return None
+        return resolve_background_session(cwd, bg_id)
+
+    def _show_background_logs(self, record: BackgroundSessionRecord) -> None:
+        self._append_chat("You", f"pyclaude logs {record.bg_id} summary")
+        lines = [f"background logs: {record.bg_id}"]
+        log_path = Path(record.log_path) if record.log_path else None
+        if log_path is None or not log_path.exists():
+            lines.append("No background log file is available.")
+        else:
+            content = log_path.read_text(encoding="utf-8")
+            tail_lines = [line for line in content.splitlines() if line.strip()][-20:]
+            if tail_lines:
+                lines.append("tail:")
+                lines.extend(tail_lines)
+            else:
+                lines.append("(log is empty)")
+        self.state.append_message("System", "\n".join(lines))
+        self._render()
+
+    def _swap_active_session(
+        self,
+        new_session: object,
+        *,
+        session_source: str,
+        restored_from: Path | None = None,
+        live_background_id: str | None = None,
+    ) -> None:
+        old_session = self.session
+        self._unbind_session_handlers(old_session)
+        self.session = new_session  # type: ignore[assignment]
+        self.session_source = session_source
+        self.restored_from = restored_from
+        self.live_background_id = live_background_id
+        self._bind_session_handlers()
+        if hasattr(old_session, "close"):
+            try:
+                old_session.close()
+            except Exception:  # noqa: BLE001
+                pass
+        self._initialize_session_surface(reset_state=True)
+
+    def _attach_background_record(self, record: BackgroundSessionRecord) -> None:
+        if not record.bridge_host or not record.bridge_port or not record.session_id:
+            self._append_event("Selected background session is not live attachable.")
+            self._render()
+            return
+        try:
+            proxy = RemoteSessionProxy(
+                host=str(record.bridge_host),
+                port=int(record.bridge_port),
+                session_id=str(record.session_id),
+            )
+        except Exception as exc:  # noqa: BLE001
+            self._append_event(f"Background attach failed: {type(exc).__name__}: {exc}")
+            self._render()
+            return
+        self._swap_active_session(
+            proxy,
+            session_source="live_background",
+            live_background_id=record.bg_id,
+        )
+
+    def _resume_background_session(self, session_id: str) -> None:
+        config = replace(self.session.config, interactive=True)
+        session_factory = getattr(self.session, "_session_factory", None)
+        if not isinstance(session_factory, SessionFactory):
+            session_factory = SessionFactory(load_mcp_from_config=True)
+        try:
+            new_session, restored_from = session_factory.create_or_restore_session(
+                config,
+                resume_session_id=session_id,
+            )
+        except Exception as exc:  # noqa: BLE001
+            self._append_event(f"Background resume failed: {type(exc).__name__}: {exc}")
+            self._render()
+            return
+        self._swap_active_session(
+            new_session,
+            session_source="saved_resume",
+            restored_from=restored_from,
+            live_background_id=None,
+        )
+
+    def _execute_background_registry_action(
+        self,
+        *,
+        primary: bool = False,
+        logs_only: bool = False,
+    ) -> None:
+        if self.state.busy:
+            return
+        context = self._resolved_background_registry_context()
+        if context is None:
+            self._append_event("No background session is available in the current workspace.")
+            return
+        record = self._selected_background_record()
+        action_text = ""
+        if logs_only:
+            action_text = str(context.get("background_logs_action") or "").strip()
+        else:
+            action_text = str(
+                context.get("background_primary_action" if primary else "background_secondary_action") or ""
+            ).strip()
+        if not action_text or action_text == "none":
+            self._append_event("No background action is available for the selected session.")
+            return
+        if action_text.startswith("/"):
+            self._execute_navigation_command(action_text)
+            return
+        if action_text.startswith("pyclaude logs ") and record is not None:
+            self._show_background_logs(record)
+            return
+        if action_text.startswith("pyclaude attach ") and record is not None:
+            self._attach_background_record(record)
+            return
+        if action_text.startswith("pyclaude --resume-session "):
+            parts = action_text.split()
+            if len(parts) >= 3:
+                self._resume_background_session(parts[2])
+                return
+        self._append_event(f"Unsupported background action: {action_text}")
         self._render()
 
     def _execute_checklist_action(self, *, primary: bool) -> None:
@@ -2620,6 +3050,54 @@ class PyClaudeTui(App[None]):
             self.state.render_status_panel(
                 provider_text=self.session.describe_provider(),
                 config_text=self.session.describe_config(),
+                status_metadata=(
+                    self.session.status_surface_payload()
+                    if hasattr(self.session, "status_surface_payload")
+                    else None
+                ),
+                memory_metadata=(
+                    self.session.memory_surface_payload()
+                    if hasattr(self.session, "memory_surface_payload")
+                    else None
+                ),
+                rewind_preview_metadata=self._selected_rewind_boundary_payload(),
+                background_metadata=(
+                    self.session.background_surface_payload()
+                    if hasattr(self.session, "background_surface_payload")
+                    else None
+                ),
+                background_registry_metadata=(
+                    self.session.background_registry_payload()
+                    if hasattr(self.session, "background_registry_payload")
+                    else None
+                ),
+                background_handoff_metadata=(
+                    self.session.background_handoff_payload()
+                    if hasattr(self.session, "background_handoff_payload")
+                    else None
+                ),
+                skills_surface_metadata=(
+                    self.session.skills_surface_payload()
+                    if hasattr(self.session, "skills_surface_payload")
+                    else None
+                ),
+                plugin_surface_metadata=(
+                    self.session.plugin_surface_payload()
+                    if hasattr(self.session, "plugin_surface_payload")
+                    else None
+                ),
+                selected_rewind_boundary_index=self.state.selected_rewind_boundary_index,
+                selected_background_registry_index=self.state.selected_background_registry_index,
+                workspace_surface_metadata=(
+                    self.session.workspace_surface_payload()
+                    if hasattr(self.session, "workspace_surface_payload")
+                    else None
+                ),
+                file_context_surface_metadata=(
+                    self.session.file_context_surface_payload()
+                    if hasattr(self.session, "file_context_surface_payload")
+                    else None
+                ),
                 working_set_metadata=(
                     self.session.working_set_payload()
                     if hasattr(self.session, "working_set_payload")

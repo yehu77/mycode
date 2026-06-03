@@ -3,6 +3,33 @@ from __future__ import annotations
 from .base import BaseTool
 
 
+def _background_reverse_hint(task) -> tuple[str | None, str | None]:
+    metadata = task.metadata or {}
+    background_session_id = str(metadata.get("background_session_id") or "").strip() or None
+    explicit_reverse_hint = str(metadata.get("background_reverse_hint") or "").strip() or None
+    parent_session_id = str(metadata.get("parent_session_id") or "").strip() or None
+    task_role = str(metadata.get("task_role") or "").strip()
+    plan_execution_mode = str(metadata.get("plan_execution_mode") or "").strip()
+    child_execution_mode = str(metadata.get("child_execution_mode") or "").strip()
+    is_background_linked = (
+        task_role in {"background", "execution"}
+        or plan_execution_mode == "background_agent"
+        or child_execution_mode == "background-agent"
+    )
+    if not is_background_linked:
+        return None, None
+    if background_session_id:
+        return (
+            background_session_id,
+            explicit_reverse_hint
+            or f"pyclaude ps {background_session_id} | pyclaude logs {background_session_id} summary",
+        )
+    reverse_hint = "/tasks active | /status workflow"
+    if parent_session_id:
+        reverse_hint = f"owning_session={parent_session_id}; actions={reverse_hint}"
+    return parent_session_id, reverse_hint
+
+
 class TaskListTool(BaseTool):
     name = "task_list"
     description = "List background tasks created in the current session."
@@ -21,9 +48,16 @@ class TaskListTool(BaseTool):
         for task in tasks:
             updated = task.updated_at or task.created_at
             progress = f"  progress={task.progress_summary}" if task.progress_summary else ""
+            owning_session_id, reverse_hint = _background_reverse_hint(task)
+            reverse_bits = []
+            if owning_session_id:
+                reverse_bits.append(f"background_session_id={owning_session_id}")
+            if reverse_hint:
+                reverse_bits.append(f"background_reverse_hint={reverse_hint}")
+            reverse_suffix = f"  {' '.join(reverse_bits)}" if reverse_bits else ""
             lines.append(
                 f"{task.id}  status={task.status}  kind={task.kind}  updated={updated}  "
-                f"description={task.description}{progress}"
+                f"description={task.description}{progress}{reverse_suffix}"
             )
         return "\n".join(lines)
 
@@ -65,6 +99,11 @@ class TaskGetTool(BaseTool):
         if task.metadata:
             metadata_lines = [f"{key}: {value}" for key, value in sorted(task.metadata.items())]
             parts.append("metadata:\n" + "\n".join(metadata_lines))
+        owning_session_id, reverse_hint = _background_reverse_hint(task)
+        if owning_session_id:
+            parts.append(f"background_session_id: {owning_session_id}")
+        if reverse_hint:
+            parts.append(f"background_reverse_hint: {reverse_hint}")
         if task.error:
             parts.append(f"error:\n{task.error}")
         if task.output:

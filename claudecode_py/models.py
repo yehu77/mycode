@@ -16,11 +16,19 @@ class ToolCall:
 
 
 @dataclass(slots=True)
+class TokenUsage:
+    prompt_tokens: int | None = None
+    completion_tokens: int | None = None
+    total_tokens: int | None = None
+
+
+@dataclass(slots=True)
 class AssistantResponse:
     content: list[ContentBlock]
     text: str = ""
     tool_calls: list[ToolCall] = field(default_factory=list)
     stop_reason: str | None = None
+    usage: TokenUsage | None = None
 
 
 StreamEventKind = Literal["text_delta", "response"]
@@ -31,3 +39,4 @@ class ProviderStreamEvent:
     kind: StreamEventKind
     text: str = ""
     response: AssistantResponse | None = None
+    usage: TokenUsage | None = None

@@ -7,6 +7,7 @@ import json
 
 EventKind = Literal[
     "assistant_text",
+    "assistant_usage",
     "assistant_tool_call",
     "assistant_tool_result_ready",
     "plan_execution",
@@ -18,10 +19,22 @@ EventKind = Literal[
     "advisor_error",
     "context_compacted",
     "provider_retry",
+    "tool_batch_started",
+    "tool_batch_finished",
+    "tool_waiting_for_approval",
     "tool_started",
     "tool_finished",
     "tool_failed",
     "tool_result",
+    "tool_result_summarized",
+    "tool_result_replacement_applied",
+    "tool_result_replacement_reapplied",
+    "tool_result_artifact_created",
+    "tool_result_artifact_reused",
+    "tool_result_microcompacted",
+    "budget_pressure",
+    "compact_recovery_started",
+    "compact_recovery_finished",
 ]
 
 
@@ -33,6 +46,24 @@ class RuntimeEvent:
     tool_name: str | None = None
     tool_call_id: str | None = None
     duration_ms: int | None = None
+    prompt_tokens: int | None = None
+    completion_tokens: int | None = None
+    total_tokens: int | None = None
+    usage_source: str | None = None
+    batch_size: int | None = None
+    batch_parallel: bool | None = None
+    result_count: int | None = None
+    budget_state: str | None = None
+    budget_reason: str | None = None
+    compaction_trigger: str | None = None
+    approval_risk_level: str | None = None
+    replacement_count: int | None = None
+    replaced_chars_total: int | None = None
+    replacement_reason: str | None = None
+    artifact_count: int | None = None
+    artifact_chars_saved: int | None = None
+    microcompact_count: int | None = None
+    microcompact_chars_saved: int | None = None
     is_error: bool = False
     command_mode_name: str | None = None
     command_mode_allowed_prefixes: tuple[str, ...] = ()

@@ -3,15 +3,21 @@ from __future__ import annotations
 from contextlib import contextmanager
 from copy import deepcopy
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from threading import Thread
 from typing import Any
 import re
 
 from .commands import CommandExecution, render_repl_command_help
+from .agents import AgentDefinition, AgentDefinitionDiagnostic
+from .background_metadata import (
+    background_handoff_payload,
+    background_live_session_payload,
+    background_registry_payload,
+)
 from .config import SessionConfig
-from .context_usage import collect_context_usage, render_context_usage
+from .context_usage import collect_context_usage, render_compaction_policy, render_context_usage
 from .history_compaction import (
     HistoryCompactionRequest,
     build_history_compaction_result,
@@ -60,20 +66,58 @@ from .permissions import (
     PermissionRule,
     PermissionRuleScope,
 )
-from .providers import build_provider, format_capabilities
+from .providers import build_provider
 from .providers.errors import ProviderCapabilityError
 from .runtime.events import RuntimeEvent
+from .runtime.budget import compute_runtime_budget_state
 from .runtime.context import SessionRuntimeContext
+from .runtime.tool_schema_cache import ToolSchemaCache, canonical_json
+from .runtime.tool_result_replacement import build_missing_artifact_replacement_preview
 from .runtime.query_loop import _create_provider_message_with_retries, _request_advisor_review, run_query_loop
+from .prompts import SystemPromptBlock, render_system_prompt_blocks
 from .session_components import (
     AdvisorSessionComponent,
     PlanSessionComponent,
     SymbolSurfaceSessionComponent,
     TaskDetailSessionComponent,
     WorkspaceSessionComponent,
+    change_stack_entry_action_groups as workflow_change_stack_entry_action_groups,
+    describe_change_stack as workflow_describe_change_stack,
+    history_section_lines as workflow_history_section_lines,
+    recent_change_entries as workflow_recent_change_entries,
+    recent_redo_entries as workflow_recent_redo_entries,
+    render_change_stack_lines as workflow_render_change_stack_lines,
+    render_selected_change_next_action_lines as workflow_render_selected_change_next_action_lines,
+    resolve_change_stack_index as workflow_resolve_change_stack_index,
+    selected_change_detail as workflow_selected_change_detail,
+    selected_change_file_count as workflow_selected_change_file_count,
+    visible_change_stack as workflow_visible_change_stack,
+    describe_context_auto as workflow_describe_context_auto,
+    describe_context_filtered as workflow_describe_context_filtered,
+    describe_context_focused as workflow_describe_context_focused,
+    describe_context_inventory as workflow_describe_context_inventory,
+    describe_diff_focused as workflow_describe_diff_focused,
+    describe_diff_summary as workflow_describe_diff_summary,
+    describe_diff_working_set as workflow_describe_diff_working_set,
+    describe_files_auto as workflow_describe_files_auto,
+    describe_files_changes as workflow_describe_files_changes,
+    describe_files_filtered as workflow_describe_files_filtered,
+    describe_files_focused as workflow_describe_files_focused,
+    describe_files_inventory as workflow_describe_files_inventory,
+    describe_files_show as workflow_describe_files_show,
+    describe_recent_changes as workflow_describe_recent_changes,
+    describe_config as workflow_describe_config,
+    describe_provider as workflow_describe_provider,
+    describe_status as workflow_describe_status,
+    describe_status_resume as workflow_describe_status_resume,
+    describe_status_summary as workflow_describe_status_summary,
+    describe_status_workflow as workflow_describe_status_workflow,
+    describe_working_set as workflow_describe_working_set,
+    diff_working_set_payload as workflow_diff_working_set_payload,
     file_context_item_matches_path as workflow_file_context_item_matches_path,
     find_matching_file_context_index as workflow_find_matching_file_context_index,
     focused_path_from_payload as workflow_focused_path_from_payload,
+    history_focus_summary_lines as workflow_history_focus_summary_lines,
     preferred_active_plan_execution_file_index as workflow_preferred_active_plan_execution_file_index,
     preferred_active_plan_file_index as workflow_preferred_active_plan_file_index,
     preferred_active_plan_scout_file_index as workflow_preferred_active_plan_scout_file_index,
@@ -87,11 +131,16 @@ from .session_components import (
     resolve_selected_change_file_context as workflow_resolve_selected_change_file_context,
     resolve_task_file_context as workflow_resolve_task_file_context,
     build_file_context_item_action_groups as workflow_build_file_context_item_action_groups,
+    build_file_surface_action_groups as workflow_build_file_surface_action_groups,
     dedupe_action_commands as workflow_dedupe_action_commands,
     render_action_group_lines as workflow_render_action_group_lines,
     render_action_group_summary as workflow_render_action_group_summary,
     render_file_context_action_group_lines as workflow_render_file_context_action_group_lines,
     render_file_context_action_group_summary as workflow_render_file_context_action_group_summary,
+    render_file_surface_action_group_lines as workflow_render_file_surface_action_group_lines,
+    render_file_surface_action_group_summary as workflow_render_file_surface_action_group_summary,
+    render_context_inventory_text as workflow_render_context_inventory_text,
+    render_files_inventory_text as workflow_render_files_inventory_text,
     render_focused_file_context_lines as workflow_render_focused_file_context_lines,
     render_navigation_section as workflow_render_navigation_section,
     render_primary_secondary_action_section as workflow_render_primary_secondary_action_section,
@@ -100,11 +149,15 @@ from .session_components import (
     render_summary_field_lines as workflow_render_summary_field_lines,
     render_surface_metadata_section as workflow_render_surface_metadata_section,
     render_workflow_action_sections as workflow_render_workflow_action_sections,
+    working_set_files_payload as workflow_working_set_files_payload,
 )
 from .session_factory import SessionFactory, _UNSET
+from .remote_session import BridgeClient
 from .storage.background_sessions import (
     BackgroundSessionRecord,
     list_background_sessions,
+    resolve_background_session,
+    utc_now_iso,
     update_background_session,
 )
 from .storage.session_checklist import ChecklistTask, SessionChecklistStore
@@ -120,8 +173,11 @@ from .storage.transcript import (
 from .state import (
     AdvisorReviewSummary,
     ExplicitContextEntry,
+    HistoryBoundary,
     PlanningArtifact,
     SessionState,
+    ToolResultArtifactRecord,
+    ToolResultReplacementRecord,
     WorkspaceChangeSet,
     WorkspaceFileChange,
 )
@@ -280,6 +336,37 @@ def workspace_recommended_actions(
     return ()
 
 
+def workspace_anomaly_summary(
+    *,
+    workspace_health: str,
+    workspace_cleanup_status: str,
+    workspace_unavailable: bool,
+    workspace_unavailable_reason: str | None = None,
+    workspace_fallback_cwd: str | None = None,
+    workspace_cleanup_error: str | None = None,
+) -> str:
+    issues: list[str] = []
+    cleanup_status = str(workspace_cleanup_status or "none")
+    unavailable_reason = str(workspace_unavailable_reason or "").strip()
+    fallback_cwd = str(workspace_fallback_cwd or "").strip()
+    cleanup_error = str(workspace_cleanup_error or "").strip()
+    if workspace_health == "orphaned":
+        issues.append("orphaned")
+    elif workspace_health == "unavailable" or workspace_unavailable or unavailable_reason:
+        issues.append("unavailable")
+    if workspace_health == "cleanup_pending" or cleanup_status == "pending":
+        issues.append("cleanup pending")
+    if workspace_health == "cleanup_failed" or cleanup_status == "failed" or cleanup_error:
+        issues.append("cleanup failed")
+    if (workspace_health == "unavailable" or workspace_unavailable or unavailable_reason) and fallback_cwd:
+        issues.append("fallback active")
+    if not issues and workspace_health not in {"healthy", "main"}:
+        issues.append(workspace_health.replace("_", " "))
+    if not issues:
+        return "none"
+    return ", ".join(dict.fromkeys(issues))
+
+
 def workspace_action_bundle(
     *,
     workspace_health: str,
@@ -428,6 +515,7 @@ class Session:
             task_manager=task_manager,
             mcp_registry=mcp_registry,
         )
+        self._agent_registry = self._session_factory.resolve_agent_registry(config.cwd)
         self.state = state or SessionState()
         self._workspace_cleanup = None
         self._latest_checklist_duplicate_guard: dict[str, Any] | None = None
@@ -435,7 +523,19 @@ class Session:
         self._current_change_focus_payload: dict[str, Any] | None = None
         self._current_task_focus_payload: dict[str, Any] | None = None
         self._current_plan_focus_payload: dict[str, Any] | None = None
+        self._last_memory_operation_payload: dict[str, Any] | None = None
+        self._runtime_budget_state_payload: dict[str, Any] | None = None
+        self._runtime_progress_surface_state: dict[str, Any] | None = None
+        self._tool_schema_cache = ToolSchemaCache()
+        self._seen_tool_result_ids: set[str] = set()
+        self._tool_result_replacements: dict[str, str] = {}
+        self._tool_result_artifacts: dict[str, ToolResultArtifactRecord] = {}
+        self._last_runtime_turn_token_count: int | None = None
+        self._last_runtime_turn_token_source: str | None = None
+        self._runtime_provider_usage_seen = False
+        self._last_budget_pressure_signature: tuple[str, str] | None = None
         self._last_project_context_reload: dict[str, Any] | None = None
+        self._background_session_id: str | None = None
         self._normalize_advisor_state()
         self._normalize_execution_contract_state()
         self._normalize_workspace_state()
@@ -461,6 +561,7 @@ class Session:
         self._reconcile_plugin_state(initial_load=True)
         self._reconcile_skill_state(initial_load=True)
         self._refresh_command_registry()
+        self.reconstruct_tool_result_replacement_state()
 
     @property
     def config(self) -> SessionConfig:
@@ -483,12 +584,17 @@ class Session:
         return self._runtime_context.mcp_registry
 
     @property
+    def agent_registry(self):
+        return self._agent_registry
+
+    @property
     def provider(self):
         return self._runtime_context.provider
 
     @provider.setter
     def provider(self, value) -> None:
         self._runtime_context.provider = value
+        self._invalidate_tool_schema_cache()
 
     @property
     def project_context(self):
@@ -515,9 +621,11 @@ class Session:
         return self._runtime_context.deferred_tools
 
     def tool_specs(self) -> list[dict[str, Any]]:
-        specs: list[dict[str, Any]] = []
-        for tool in self._available_tools():
-            spec = tool.to_model_tool()
+        specs = [deepcopy(spec) for spec in self.tool_specs_cached()]
+        specs_by_name = {spec["name"]: spec for spec in specs}
+        ordered: list[dict[str, Any]] = []
+        for tool in self._sorted_available_tools():
+            spec = specs_by_name.get(tool.name) or tool.to_model_tool()
             policy = self._active_command_policy
             if tool.name == "bash" and policy and policy.allowed_bash_command_prefixes:
                 allowed = ", ".join(policy.allowed_bash_command_prefixes)
@@ -529,8 +637,348 @@ class Session:
                         f"Allowed commands in this turn must start with: {allowed}."
                     ),
                 }
+            ordered.append(spec)
+        return ordered
+
+    def tool_specs_cached(self) -> list[dict[str, Any]]:
+        specs: list[dict[str, Any]] = []
+        for tool in self._sorted_available_tools():
+            cache_key = self._tool_schema_cache_key_for(tool)
+            spec, _ = self._tool_schema_cache.get_or_create(
+                cache_key,
+                builder=tool.to_model_tool,
+            )
             specs.append(spec)
         return specs
+
+    def _tool_schema_source_rank(self, tool) -> int:
+        source = getattr(tool, "schema_source", lambda: "builtin")()
+        return {"builtin": 0, "plugin": 1, "mcp": 2}.get(source, 3)
+
+    def _tool_schema_sort_key(self, tool) -> tuple[int, int, str]:
+        return (
+            self._tool_schema_source_rank(tool),
+            1 if tool.is_deferred() else 0,
+            tool.name,
+        )
+
+    def _sorted_available_tools(self) -> list[Any]:
+        return sorted(self._available_tools(), key=self._tool_schema_sort_key)
+
+    def _tool_schema_flags_hash(self, tool) -> str:
+        provider_capabilities = getattr(self.provider, "capabilities", None)
+        flags = {
+            "source": getattr(tool, "schema_source", lambda: "builtin")(),
+            "deferred": bool(tool.is_deferred()),
+            "provider": getattr(provider_capabilities, "provider", None),
+            "model": getattr(provider_capabilities, "model", None),
+        }
+        return canonical_json(flags)
+
+    def _tool_schema_cache_key_for(self, tool) -> str:
+        schema_json = canonical_json(tool.input_schema)
+        return f"{tool.name}:{schema_json}:{self._tool_schema_flags_hash(tool)}"
+
+    def _invalidate_tool_schema_cache(self) -> None:
+        self._tool_schema_cache.clear()
+        self._runtime_budget_state_payload = None
+
+    def _invalidate_runtime_prompt_inspection(self) -> None:
+        self._runtime_budget_state_payload = None
+
+    def runtime_tool_result_replacement_state(
+        self,
+    ) -> tuple[set[str], dict[str, str], dict[str, ToolResultArtifactRecord]]:
+        current_ids = self._message_tool_result_ids(self.state.messages)
+        self._seen_tool_result_ids.intersection_update(current_ids)
+        self._tool_result_replacements = {
+            tool_use_id: replacement
+            for tool_use_id, replacement in self._tool_result_replacements.items()
+            if tool_use_id in current_ids
+        }
+        self._tool_result_artifacts = {
+            tool_use_id: record
+            for tool_use_id, record in self._tool_result_artifacts.items()
+            if tool_use_id in current_ids
+        }
+        return (
+            set(self._seen_tool_result_ids),
+            dict(self._tool_result_replacements),
+            dict(self._tool_result_artifacts),
+        )
+
+    def reconstruct_tool_result_replacement_state(self) -> None:
+        seen_ids = self._message_tool_result_ids(self.state.messages)
+        replacements = {
+            str(record.tool_use_id): str(record.replacement)
+            for record in self.state.tool_result_replacement_records
+            if str(record.tool_use_id) in seen_ids and str(record.replacement).strip()
+        }
+        artifact_records = {
+            str(record.tool_use_id): record
+            for record in self.state.tool_result_artifact_records
+            if str(record.tool_use_id) in seen_ids and str(record.artifact_path).strip()
+        }
+        self._seen_tool_result_ids = seen_ids
+        self._tool_result_replacements = replacements
+        self._tool_result_artifacts = artifact_records
+        self._runtime_budget_state_payload = None
+
+    def _message_tool_result_ids(self, messages: list[dict[str, Any]]) -> set[str]:
+        seen_ids: set[str] = set()
+        for message in messages:
+            content = message.get("content")
+            if not isinstance(content, list):
+                continue
+            for block in content:
+                if not isinstance(block, dict):
+                    continue
+                if str(block.get("type") or "") != "tool_result":
+                    continue
+                tool_use_id = str(block.get("tool_use_id") or "").strip()
+                if tool_use_id:
+                    seen_ids.add(tool_use_id)
+        return seen_ids
+
+    def apply_tool_result_replacements_to_messages(
+        self,
+        messages: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        rendered = deepcopy(messages)
+        if not self._tool_result_replacements:
+            return rendered
+        for message in rendered:
+            content = message.get("content")
+            if not isinstance(content, list):
+                continue
+            for block in content:
+                if not isinstance(block, dict):
+                    continue
+                if str(block.get("type") or "") != "tool_result":
+                    continue
+                tool_use_id = str(block.get("tool_use_id") or "").strip()
+                replacement = self.tool_result_replacement_text(tool_use_id)
+                if replacement:
+                    block["content"] = replacement
+        return rendered
+
+    def tool_result_artifact_record(self, tool_use_id: str) -> ToolResultArtifactRecord | None:
+        return self._tool_result_artifacts.get(str(tool_use_id or "").strip())
+
+    def tool_result_replacement_text(self, tool_use_id: str) -> str | None:
+        tool_use_id = str(tool_use_id or "").strip()
+        if not tool_use_id:
+            return None
+        replacement = self._tool_result_replacements.get(tool_use_id)
+        if not replacement:
+            return None
+        artifact_record = self.tool_result_artifact_record(tool_use_id)
+        if artifact_record is None:
+            return replacement
+        artifact_path = Path(str(artifact_record.artifact_path or "")).resolve()
+        if artifact_path.exists():
+            return replacement
+        return build_missing_artifact_replacement_preview(
+            tool_use_id=tool_use_id,
+            artifact_path=self._display_tool_result_artifact_path(artifact_record),
+            original_size_chars=int(artifact_record.original_size_chars or 0),
+            summary=str(artifact_record.summary or ""),
+        )
+
+    def _record_tool_result_replacement_records(
+        self,
+        records: list[ToolResultReplacementRecord] | tuple[ToolResultReplacementRecord, ...],
+    ) -> None:
+        if not records:
+            return
+        existing_ids = {
+            str(record.tool_use_id)
+            for record in self.state.tool_result_replacement_records
+            if str(record.tool_use_id).strip()
+        }
+        for record in records:
+            tool_use_id = str(record.tool_use_id).strip()
+            if not tool_use_id or tool_use_id in existing_ids:
+                continue
+            self.state.tool_result_replacement_records.append(record)
+            self._tool_result_replacements[tool_use_id] = str(record.replacement)
+            self._seen_tool_result_ids.add(tool_use_id)
+            existing_ids.add(tool_use_id)
+        self._runtime_budget_state_payload = None
+
+    def _record_tool_result_artifact_records(
+        self,
+        records: list[ToolResultArtifactRecord] | tuple[ToolResultArtifactRecord, ...],
+    ) -> None:
+        if not records:
+            return
+        existing_ids = {
+            str(record.tool_use_id)
+            for record in self.state.tool_result_artifact_records
+            if str(record.tool_use_id).strip()
+        }
+        for record in records:
+            tool_use_id = str(record.tool_use_id).strip()
+            if not tool_use_id or tool_use_id in existing_ids:
+                continue
+            self.state.tool_result_artifact_records.append(record)
+            self._tool_result_artifacts[tool_use_id] = record
+            self._seen_tool_result_ids.add(tool_use_id)
+            existing_ids.add(tool_use_id)
+        self._runtime_budget_state_payload = None
+
+    def mark_tool_result_ids_seen_from_messages(self, messages: list[dict[str, Any]]) -> None:
+        self._seen_tool_result_ids.update(self._message_tool_result_ids(messages))
+
+    def tool_result_replacement_surface_payload(self) -> dict[str, Any]:
+        seen_ids, replacements, _artifact_records = self.runtime_tool_result_replacement_state()
+        records = list(self.state.tool_result_replacement_records)
+        total_saved = sum(
+            max(int(record.original_size_chars) - int(record.replacement_size_chars), 0)
+            for record in records
+            if str(record.tool_use_id) in seen_ids
+        )
+        last_record = next(
+            (
+                record
+                for record in reversed(records)
+                if str(record.tool_use_id) in seen_ids
+            ),
+            None,
+        )
+        if last_record is None:
+            last_summary = "none"
+        else:
+            saved_chars = max(
+                int(last_record.original_size_chars) - int(last_record.replacement_size_chars),
+                0,
+            )
+            last_summary = (
+                f"tool_use_id={last_record.tool_use_id} "
+                f"saved_chars={saved_chars}"
+            )
+        return {
+            "replacement_record_count": len(records),
+            "replacement_active_count": len(replacements),
+            "replacement_seen_count": len(seen_ids),
+            "replacement_total_chars_saved_estimated": total_saved,
+            "replacement_last_summary": last_summary,
+        }
+
+    def _display_tool_result_artifact_path(self, record: ToolResultArtifactRecord) -> str:
+        artifact_path = Path(str(record.artifact_path or ""))
+        try:
+            return str(artifact_path.resolve().relative_to(Path(self.config.cwd).resolve()))
+        except ValueError:
+            return str(artifact_path)
+
+    def tool_result_artifact_surface_payload(self) -> dict[str, Any]:
+        seen_ids, _replacements, artifacts = self.runtime_tool_result_replacement_state()
+        records = list(self.state.tool_result_artifact_records)
+        total_saved = sum(
+            max(int(record.original_size_chars) - int(record.preview_size_chars), 0)
+            for record in records
+            if str(record.tool_use_id) in seen_ids
+        )
+        last_record = next(
+            (record for record in reversed(records) if str(record.tool_use_id) in seen_ids),
+            None,
+        )
+        if last_record is None:
+            last_summary = "none"
+        else:
+            saved_chars = max(
+                int(last_record.original_size_chars) - int(last_record.preview_size_chars),
+                0,
+            )
+            last_summary = (
+                f"tool_use_id={last_record.tool_use_id} "
+                f"saved_chars={saved_chars} "
+                f"artifact={self._display_tool_result_artifact_path(last_record)}"
+            )
+        return {
+            "artifact_record_count": len(records),
+            "artifact_active_count": len(artifacts),
+            "artifact_seen_count": len(seen_ids),
+            "artifact_total_chars_saved_estimated": total_saved,
+            "artifact_last_summary": last_summary,
+        }
+
+    def tool_schema_surface_payload(self) -> dict[str, Any]:
+        ordered_tools = self._sorted_available_tools()
+        source_counts: dict[tuple[str, bool], int] = {}
+        cache_keys: list[str] = []
+        for tool in ordered_tools:
+            cache_key = self._tool_schema_cache_key_for(tool)
+            cache_keys.append(cache_key)
+            self._tool_schema_cache.get_or_create(cache_key, builder=tool.to_model_tool)
+            source = getattr(tool, "schema_source", lambda: "builtin")()
+            source_counts[(source, tool.is_deferred())] = source_counts.get((source, tool.is_deferred()), 0) + 1
+        order_parts = []
+        for source in ("builtin", "plugin", "mcp"):
+            non_deferred = source_counts.get((source, False), 0)
+            deferred = source_counts.get((source, True), 0)
+            order_parts.append(f"{source}:non-deferred={non_deferred}")
+            order_parts.append(f"{source}:deferred={deferred}")
+        return {
+            "tool_schema_count": len(ordered_tools),
+            "tool_schema_cached_count": len(ordered_tools),
+            "tool_schema_cache_key": self._tool_schema_cache.combined_cache_key(cache_keys),
+            "tool_schema_order_summary": ", ".join(order_parts),
+            "tool_schema_registry_epoch": self._tool_schema_cache.epoch,
+        }
+
+    def system_prompt_blocks(self) -> list[SystemPromptBlock]:
+        blocks = list(self._runtime_context.build_system_prompt_blocks(self.state))
+        checklist_guidance = (
+            "Session checklist guidance:\n"
+            "- If a session checklist exists, treat it as the canonical short task list for the current work.\n"
+            "- Before creating new checklist tasks, call session_task_list to see what already exists.\n"
+            "- Before updating a specific checklist task, call session_task_get unless you just created or listed it in the same turn.\n"
+            "- Prefer updating existing checklist tasks instead of creating duplicates for the same outcome.\n"
+            "- Keep checklist status aligned with real progress using session_task_list/get/update or todo_write."
+        )
+        blocks.append(
+            SystemPromptBlock(
+                text=checklist_guidance,
+                cache_scope="session",
+                kind="static",
+            )
+        )
+        checklist_context = self._checklist_prompt_context()
+        if checklist_context:
+            blocks.append(
+                SystemPromptBlock(
+                    text="Current session checklist:\n" + checklist_context,
+                    cache_scope="dynamic",
+                    kind="planning",
+                )
+            )
+        return [block for block in blocks if block.text.strip()]
+
+    def system_prompt_surface_payload(self) -> dict[str, Any]:
+        blocks = self.system_prompt_blocks()
+        boundary_index = len(blocks)
+        for index, block in enumerate(blocks):
+            if block.cache_scope not in {"session", "global"}:
+                boundary_index = index
+                break
+        prefix_chars = sum(len(block.text) for block in blocks[:boundary_index])
+        dynamic_chars = sum(len(block.text) for block in blocks[boundary_index:])
+        return {
+            "system_prompt_block_count": len(blocks),
+            "system_prompt_dynamic_boundary_index": (
+                boundary_index if boundary_index < len(blocks) else None
+            ),
+            "system_prompt_static_block_count": sum(
+                1 for block in blocks if block.cache_scope in {"session", "global"}
+            ),
+            "system_prompt_dynamic_block_count": sum(
+                1 for block in blocks if block.cache_scope not in {"session", "global"}
+            ),
+            "system_prompt_prefix_chars": prefix_chars,
+            "system_prompt_dynamic_chars": dynamic_chars,
+        }
 
     def execute_tool_calls(self, tool_calls, ctx: ToolContext, *, sink=None) -> list[dict[str, Any]]:
         return self._build_active_orchestrator().execute_tool_calls(tool_calls, ctx, sink=sink)
@@ -618,10 +1066,16 @@ class Session:
         self._live_event_sink = sink
 
     def _emit_runtime_event(self, event: RuntimeEvent) -> None:
-        sink = self._live_event_sink
-        if sink is None:
-            return
-        sink(event)
+        self.build_runtime_event_sink(None)(event)
+
+    def build_runtime_event_sink(self, sink=None):
+        def emit(event: RuntimeEvent) -> None:
+            self._record_runtime_progress_event(event)
+            target = sink if sink is not None else self._live_event_sink
+            if target is not None:
+                target(event)
+
+        return emit
 
     def _workspace_task_progress_message(
         self,
@@ -816,6 +1270,21 @@ class Session:
             metadata["child_command_policy_require_read_only_subagents"] = True
         return metadata
 
+    def set_background_session_link(self, bg_id: str | None) -> None:
+        normalized = str(bg_id or "").strip()
+        self._background_session_id = normalized or None
+
+    def _task_background_metadata(self) -> dict[str, Any]:
+        if not self._background_session_id:
+            return {}
+        return {
+            "background_session_id": self._background_session_id,
+            "background_reverse_hint": (
+                f"pyclaude ps {self._background_session_id} | "
+                f"pyclaude logs {self._background_session_id} summary"
+            ),
+        }
+
     def _task_surface_kind(self, task: Any) -> str:
         return self._task_detail_component._task_surface_kind(task)
 
@@ -906,6 +1375,25 @@ class Session:
             "selected_workspace_tertiary_action": bundle["tertiary_action"],
             "selected_workspace_target": bundle["target"],
         }
+
+    def _workspace_anomaly_summary(
+        self,
+        *,
+        workspace_health: str,
+        workspace_cleanup_status: str,
+        workspace_unavailable: bool,
+        workspace_unavailable_reason: str | None = None,
+        workspace_fallback_cwd: str | None = None,
+        workspace_cleanup_error: str | None = None,
+    ) -> str:
+        return workspace_anomaly_summary(
+            workspace_health=workspace_health,
+            workspace_cleanup_status=workspace_cleanup_status,
+            workspace_unavailable=workspace_unavailable,
+            workspace_unavailable_reason=workspace_unavailable_reason,
+            workspace_fallback_cwd=workspace_fallback_cwd,
+            workspace_cleanup_error=workspace_cleanup_error,
+        )
 
     def _workspace_task_action_fields(self, metadata: dict[str, Any]) -> dict[str, str]:
         return self._task_detail_component._workspace_task_action_fields(metadata)
@@ -1601,20 +2089,7 @@ class Session:
         return self._workspace_component.workspace_unavailable()
 
     def build_system_prompt(self) -> str:
-        base_prompt = self._runtime_context.build_system_prompt(self.state)
-        checklist_guidance = (
-            "Session checklist guidance:\n"
-            "- If a session checklist exists, treat it as the canonical short task list for the current work.\n"
-            "- Before creating new checklist tasks, call session_task_list to see what already exists.\n"
-            "- Before updating a specific checklist task, call session_task_get unless you just created or listed it in the same turn.\n"
-            "- Prefer updating existing checklist tasks instead of creating duplicates for the same outcome.\n"
-            "- Keep checklist status aligned with real progress using session_task_list/get/update or todo_write."
-        )
-        checklist_context = self._checklist_prompt_context()
-        parts = [base_prompt, checklist_guidance]
-        if checklist_context:
-            parts.append("Current session checklist:\n" + checklist_context)
-        return "\n\n".join(part for part in parts if part)
+        return render_system_prompt_blocks(self.system_prompt_blocks())
 
     def latest_planning_artifact(self) -> PlanningArtifact | None:
         return self._plan_component.latest_planning_artifact()
@@ -1671,6 +2146,7 @@ class Session:
             "plan_execution",
             prompt.strip() or artifact.goal,
             parent_session_id=self.state.session_id,
+            **self._task_background_metadata(),
             provider=self.config.provider,
             model=self.config.model,
             cwd=str(self.config.cwd),
@@ -2139,6 +2615,7 @@ class Session:
             "agent",
             description,
             parent_session_id=self.state.session_id,
+            **self._task_background_metadata(),
             provider=self.config.provider,
             model=self.config.model,
             cwd=str(self.config.cwd),
@@ -2722,6 +3199,2127 @@ class Session:
                 )
         return lines
 
+    def _record_history_boundary(self, boundary: HistoryBoundary) -> HistoryBoundary:
+        self.state.history_boundaries.append(boundary)
+        return boundary
+
+    def _latest_history_boundary(self, *, kind: str | None = None) -> HistoryBoundary | None:
+        for boundary in reversed(self.state.history_boundaries):
+            if kind is None or boundary.kind == kind:
+                return boundary
+        return None
+
+    def _history_boundary_is_rewindable(self, boundary: HistoryBoundary) -> bool:
+        return boundary.snapshot_messages is not None or boundary.snapshot_context_summary is not None
+
+    def _rewind_selector_for_boundary(self, boundary: HistoryBoundary) -> int | None:
+        for index, candidate in enumerate(self._rewindable_boundaries(), start=1):
+            if candidate.boundary_id == boundary.boundary_id:
+                return index
+        return None
+
+    def _compaction_policy_thresholds(self) -> dict[str, float]:
+        return {
+            "warning_context_percentage": 70.0,
+            "auto_context_percentage": 85.0,
+            "warning_message_ratio": 0.75,
+            "warning_summary_ratio": 0.75,
+            "auto_summary_ratio": 0.90,
+        }
+
+    def refresh_runtime_budget_state(
+        self,
+        *,
+        report=None,
+        preview: dict[str, Any] | None = None,
+        message_override: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        usage_report = report or collect_context_usage(self, message_override=message_override)
+        preview_payload = preview or self._history_compaction_preview_payload()
+        thresholds = self._compaction_policy_thresholds()
+        would_compact = bool(preview_payload.get("would_compact"))
+        message_count = len(self.state.messages)
+        message_limit = max(int(self.config.max_history_messages), 1)
+        summary_chars = len(self.state.context_summary or "")
+        summary_limit = max(int(self.config.max_context_summary_chars), 1)
+        warning_message_threshold = max(
+            self._history_compaction_keep_last() + 1,
+            int((message_limit * thresholds["warning_message_ratio"]) + 0.9999),
+        )
+        warning_summary_threshold = max(1, int(summary_limit * thresholds["warning_summary_ratio"]))
+        auto_summary_threshold = max(1, int(summary_limit * thresholds["auto_summary_ratio"]))
+        state = compute_runtime_budget_state(
+            context_tokens_estimated=int(usage_report.total_tokens),
+            context_percentage=float(usage_report.percentage),
+            message_count=message_count,
+            message_limit=message_limit,
+            context_summary_chars=summary_chars,
+            context_summary_limit=summary_limit,
+            warning_message_threshold=warning_message_threshold,
+            warning_summary_threshold=warning_summary_threshold,
+            auto_summary_threshold=auto_summary_threshold,
+            warning_context_percentage=float(thresholds["warning_context_percentage"]),
+            auto_context_percentage=float(thresholds["auto_context_percentage"]),
+            would_compact=would_compact,
+            last_turn_token_count=self._last_runtime_turn_token_count,
+            last_turn_token_source=self._last_runtime_turn_token_source,
+            provider_usage_seen=self._runtime_provider_usage_seen,
+        )
+        self._runtime_budget_state_payload = state.to_payload()
+        return dict(self._runtime_budget_state_payload)
+
+    def runtime_budget_state_payload(self) -> dict[str, Any]:
+        if self._runtime_budget_state_payload is None:
+            return self.refresh_runtime_budget_state()
+        return self.refresh_runtime_budget_state()
+
+    def runtime_budget_surface_payload(self) -> dict[str, Any]:
+        budget = self.runtime_budget_state_payload()
+        last_turn_source = str(budget.get("last_turn_token_source") or "").strip() or "none"
+        if last_turn_source not in {"provider", "estimated"}:
+            last_turn_source = "none"
+        compact_boundary = next(
+            (boundary for boundary in reversed(self.state.history_boundaries) if boundary.kind == "compact"),
+            None,
+        )
+        compact_lifecycle = (
+            str(compact_boundary.trigger or "").strip() if compact_boundary is not None else ""
+        ) or "none"
+        return {
+            **budget,
+            "context_token_source": last_turn_source,
+            "last_turn_token_display": (
+                str(budget.get("last_turn_token_count"))
+                if budget.get("last_turn_token_count") is not None
+                else "none"
+            ),
+            "provider_usage_seen_label": "yes" if bool(budget.get("provider_usage_seen")) else "no",
+            "budget_pressure": str(budget.get("budget_state") or "ok"),
+            "compact_lifecycle": compact_lifecycle,
+        }
+
+    def _runtime_narrative_payload(
+        self,
+        *,
+        budget_surface: dict[str, Any] | None = None,
+        compaction_policy: dict[str, Any] | None = None,
+        runtime_progress: dict[str, Any] | None = None,
+        latest_compact_boundary: HistoryBoundary | None = None,
+    ) -> dict[str, dict[str, Any]]:
+        budget_surface = dict(budget_surface or self.runtime_budget_surface_payload())
+        runtime_progress = dict(runtime_progress or self.runtime_progress_surface_payload())
+        latest_compact_boundary = latest_compact_boundary or self._latest_history_boundary(kind="compact")
+
+        budget_state = str(budget_surface.get("budget_state") or "ok")
+        budget_reason = str(budget_surface.get("budget_reason") or "").strip() or None
+        if compaction_policy is None:
+            if budget_state == "warning":
+                derived_compaction_state = "warning"
+            elif budget_state in {"compact_needed", "hard_stop"}:
+                derived_compaction_state = "auto-compact-ready"
+            else:
+                derived_compaction_state = "ok"
+            compaction_policy = {
+                "compaction_state": derived_compaction_state,
+                "compaction_reason": budget_reason,
+            }
+        else:
+            compaction_policy = dict(compaction_policy)
+        context_token_source = str(budget_surface.get("context_token_source") or "").strip() or "none"
+        if context_token_source not in {"provider", "estimated", "none"}:
+            context_token_source = "none"
+        last_turn_token_count = budget_surface.get("last_turn_token_count")
+        last_turn_token_source = str(budget_surface.get("last_turn_token_source") or "").strip() or "none"
+        if last_turn_token_source not in {"provider", "estimated", "none"}:
+            last_turn_token_source = "none"
+        provider_usage_seen = bool(budget_surface.get("provider_usage_seen"))
+
+        compact_lifecycle = (
+            str(budget_surface.get("compact_lifecycle") or "").strip()
+            or (str(latest_compact_boundary.trigger or "").strip() if latest_compact_boundary is not None else "")
+            or "none"
+        )
+        compact_reason = str(compaction_policy.get("compaction_reason") or "").strip() or None
+        latest_compact_trigger = (
+            str(latest_compact_boundary.trigger or "").strip() if latest_compact_boundary is not None else ""
+        ) or "none"
+        latest_compact_reason = (
+            str(latest_compact_boundary.trigger_reason or "").strip()
+            if latest_compact_boundary is not None
+            else ""
+        ) or None
+        latest_compact_summary = (
+            str(latest_compact_boundary.summary or "").strip()
+            if latest_compact_boundary is not None
+            else ""
+        ) or None
+
+        active_tool_status = str(runtime_progress.get("runtime_active_tool_status") or "none")
+        if active_tool_status not in {"running", "waiting_for_approval"}:
+            active_tool_status = "none"
+        active_tool_name = str(runtime_progress.get("runtime_active_tool_name") or "").strip() or None
+        active_tool_input = str(runtime_progress.get("runtime_active_tool_input") or "").strip() or None
+        active_tool = "none"
+        if active_tool_status != "none":
+            active_tool = (
+                f"{active_tool_status} {active_tool_name}".strip()
+                if active_tool_name
+                else active_tool_status
+            )
+
+        last_tool_name = str(runtime_progress.get("runtime_last_tool_name") or "").strip() or None
+        last_tool_status = str(runtime_progress.get("runtime_last_tool_status") or "none")
+        if last_tool_status not in {"ok", "error", "waiting_for_approval"}:
+            last_tool_status = "none"
+        last_tool_summary = str(runtime_progress.get("runtime_last_tool_summary") or "").strip() or None
+        last_tool_outcome_parts = [
+            part
+            for part in (last_tool_name, (last_tool_status if last_tool_status != "none" else None), last_tool_summary)
+            if part
+        ]
+        last_tool_outcome = " | ".join(last_tool_outcome_parts) if last_tool_outcome_parts else "none"
+        parallel_batch_active = bool(runtime_progress.get("runtime_parallel_batch_active"))
+        parallel_batch_size = int(runtime_progress.get("runtime_parallel_batch_size") or 0)
+        parallel_batch = f"active size={parallel_batch_size}" if parallel_batch_active else "none"
+        last_result_summary = str(runtime_progress.get("runtime_last_result_summary") or "").strip() or None
+        compact_recovery_summary = (
+            str(runtime_progress.get("runtime_compact_recovery_summary") or "").strip() or None
+        )
+        replacement_summary = (
+            str(runtime_progress.get("runtime_tool_result_replacement_summary") or "").strip()
+            or None
+        )
+        runtime_progress_summary = (
+            str(runtime_progress.get("runtime_recent_progress_summary") or "").strip() or None
+        )
+        budget_pressure_detail = budget_reason if budget_state != "ok" else None
+
+        return {
+            "budget": {
+                "runtime_budget_state": budget_state,
+                "runtime_budget_reason": budget_reason,
+                "runtime_budget_reason_display": budget_reason or "none",
+                "context_token_source": context_token_source,
+                "last_turn_token_count": last_turn_token_count,
+                "last_turn_token_count_display": (
+                    str(last_turn_token_count) if last_turn_token_count is not None else "none"
+                ),
+                "last_turn_token_source": last_turn_token_source,
+                "provider_usage_seen": provider_usage_seen,
+                "provider_usage_seen_label": "yes" if provider_usage_seen else "no",
+                "budget_pressure": budget_state,
+                "budget_pressure_detail": budget_pressure_detail,
+                "budget_pressure_detail_display": budget_pressure_detail or "none",
+            },
+            "compact": {
+                "memory_compaction": str(compaction_policy.get("compaction_state") or "ok"),
+                "compact_reason": compact_reason,
+                "compact_reason_display": compact_reason or "none",
+                "compact_lifecycle": compact_lifecycle,
+                "latest_compact_trigger": latest_compact_trigger,
+                "latest_compact_reason": latest_compact_reason,
+                "latest_compact_reason_display": latest_compact_reason or "none",
+                "latest_compact_summary": latest_compact_summary,
+                "latest_compact_summary_display": latest_compact_summary or "none",
+            },
+            "progress": {
+                "runtime_progress": runtime_progress_summary,
+                "runtime_progress_display": runtime_progress_summary or "none",
+                "active_tool": active_tool,
+                "active_tool_name": active_tool_name,
+                "active_tool_status": active_tool_status,
+                "active_tool_input": active_tool_input,
+                "active_tool_input_display": active_tool_input or "none",
+                "last_tool_name": last_tool_name,
+                "last_tool_status": last_tool_status,
+                "last_tool_summary": last_tool_summary,
+                "last_tool_outcome": last_tool_outcome,
+                "parallel_batch_active": parallel_batch_active,
+                "parallel_batch_size": parallel_batch_size,
+                "parallel_batch": parallel_batch,
+                "last_tool_result_summary": last_result_summary,
+                "last_tool_result_summary_display": last_result_summary or "none",
+                "compact_recovery": compact_recovery_summary,
+                "compact_recovery_display": compact_recovery_summary or "none",
+                "tool_result_replacement": replacement_summary,
+                "tool_result_replacement_display": replacement_summary or "none",
+                "tool_result_artifact": (
+                    str(runtime_progress.get("runtime_tool_result_artifact_summary") or "").strip() or None
+                ),
+                "tool_result_artifact_display": (
+                    str(runtime_progress.get("runtime_tool_result_artifact_summary") or "").strip() or "none"
+                ),
+                "tool_result_microcompact": (
+                    str(runtime_progress.get("runtime_tool_result_microcompact_summary") or "").strip() or None
+                ),
+                "tool_result_microcompact_display": (
+                    str(runtime_progress.get("runtime_tool_result_microcompact_summary") or "").strip()
+                    or "none"
+                ),
+                "budget_pressure_detail": budget_pressure_detail,
+                "budget_pressure_detail_display": budget_pressure_detail or "none",
+            },
+        }
+
+    def _runtime_budget_narrative_lines(
+        self,
+        *,
+        narrative: dict[str, dict[str, Any]] | None = None,
+    ) -> list[str]:
+        narrative = narrative or self._runtime_narrative_payload()
+        budget = narrative["budget"]
+        return [
+            "runtime budget state: " + str(budget["runtime_budget_state"]),
+            "runtime budget reason: " + str(budget["runtime_budget_reason_display"]),
+            "context token source: " + str(budget["context_token_source"]),
+            "last turn token count: " + str(budget["last_turn_token_count_display"]),
+            "last turn token source: " + str(budget["last_turn_token_source"]),
+            "provider usage seen: " + str(budget["provider_usage_seen_label"]),
+            "budget pressure: " + str(budget["budget_pressure"]),
+        ]
+
+    def _runtime_compact_lifecycle_narrative_lines(
+        self,
+        *,
+        narrative: dict[str, dict[str, Any]] | None = None,
+    ) -> list[str]:
+        narrative = narrative or self._runtime_narrative_payload()
+        compact = narrative["compact"]
+        return [
+            "memory compaction: " + str(compact["memory_compaction"]),
+            "compact reason: " + str(compact["compact_reason_display"]),
+            "compact lifecycle: " + str(compact["compact_lifecycle"]),
+        ]
+
+    def _runtime_progress_narrative_lines(
+        self,
+        *,
+        narrative: dict[str, dict[str, Any]] | None = None,
+        workflow: bool = False,
+    ) -> list[str]:
+        narrative = narrative or self._runtime_narrative_payload()
+        progress = narrative["progress"]
+        lines = [
+            "runtime progress: " + str(progress["runtime_progress_display"]),
+            "active tool: " + str(progress["active_tool"]),
+        ]
+        if workflow:
+            lines.extend(
+                [
+                    "active tool input: " + str(progress["active_tool_input_display"]),
+                    "last tool outcome: " + str(progress["last_tool_outcome"]),
+                    "parallel batch: " + str(progress["parallel_batch"]),
+                    "last tool-result summary: "
+                    + str(progress["last_tool_result_summary_display"]),
+                    "budget pressure: " + str(progress["budget_pressure_detail_display"]),
+                    "compact recovery: " + str(progress["compact_recovery_display"]),
+                    "tool-result replacement: "
+                    + str(progress["tool_result_replacement_display"]),
+                    "tool-result artifact: "
+                    + str(progress["tool_result_artifact_display"]),
+                    "tool-result microcompact: "
+                    + str(progress["tool_result_microcompact_display"]),
+                ]
+            )
+        return lines
+
+    def _runtime_progress_defaults(self) -> dict[str, Any]:
+        return {
+            "runtime_active_tool_name": None,
+            "runtime_active_tool_status": "none",
+            "runtime_active_tool_input": None,
+            "runtime_last_tool_name": None,
+            "runtime_last_tool_status": "none",
+            "runtime_last_tool_summary": None,
+            "runtime_last_tool_duration_ms": None,
+            "runtime_last_tool_input": None,
+            "runtime_parallel_batch_active": False,
+            "runtime_parallel_batch_size": 0,
+            "runtime_last_result_summary": None,
+            "runtime_budget_pressure_summary": None,
+            "runtime_compact_recovery_summary": None,
+            "runtime_tool_result_replacement_summary": None,
+            "runtime_tool_result_artifact_summary": None,
+            "runtime_tool_result_microcompact_summary": None,
+            "runtime_recent_progress_summary": None,
+            "runtime_recent_progress_kind": "none",
+        }
+
+    def _runtime_waiting_tool_summary_for_event(self, event: RuntimeEvent) -> str | None:
+        risk = str(event.approval_risk_level or "").strip()
+        if risk:
+            return f"waiting for approval ({risk})"
+        return "waiting for approval"
+
+    def _runtime_last_tool_summary_for_event(self, event: RuntimeEvent) -> str | None:
+        if event.kind == "tool_finished":
+            if event.duration_ms is not None:
+                return f"ok ({event.duration_ms}ms)"
+            return "ok"
+        if event.kind == "tool_failed":
+            tool_error = self._compact_runtime_progress_text(event.message, limit=180)
+            if event.duration_ms is not None:
+                return (
+                    f"{tool_error} ({event.duration_ms}ms)"
+                    if tool_error
+                    else f"failed ({event.duration_ms}ms)"
+                )
+            return tool_error or "failed"
+        if event.kind == "tool_waiting_for_approval":
+            return self._runtime_waiting_tool_summary_for_event(event)
+        return None
+
+    def _runtime_progress_snapshot(self) -> dict[str, Any]:
+        if self._runtime_progress_surface_state is None:
+            self._runtime_progress_surface_state = self._runtime_progress_defaults()
+        return self._runtime_progress_surface_state
+
+    def _apply_runtime_progress_event_to_snapshot(
+        self,
+        snapshot: dict[str, Any],
+        event: RuntimeEvent,
+    ) -> dict[str, Any]:
+        updated = {**self._runtime_progress_defaults(), **snapshot}
+        tool_name = str(event.tool_name or "").strip() or None
+        input_summary = self._compact_runtime_progress_text(event.message)
+        if event.kind == "assistant_text":
+            assistant_summary = self._compact_runtime_progress_text(event.message)
+            if assistant_summary:
+                updated["runtime_recent_progress_summary"] = assistant_summary
+                updated["runtime_recent_progress_kind"] = "assistant"
+            return updated
+        if event.kind == "tool_batch_started":
+            updated["runtime_parallel_batch_active"] = bool(event.batch_parallel)
+            updated["runtime_parallel_batch_size"] = int(event.batch_size or 0)
+            return updated
+        if event.kind == "tool_batch_finished":
+            updated["runtime_parallel_batch_active"] = False
+            updated["runtime_parallel_batch_size"] = 0
+            return updated
+        if event.kind == "tool_waiting_for_approval":
+            waiting_summary = self._runtime_waiting_tool_summary_for_event(event)
+            updated["runtime_active_tool_name"] = tool_name
+            updated["runtime_active_tool_status"] = "waiting_for_approval"
+            updated["runtime_active_tool_input"] = input_summary
+            updated["runtime_last_tool_name"] = tool_name
+            updated["runtime_last_tool_status"] = "waiting_for_approval"
+            updated["runtime_last_tool_summary"] = waiting_summary
+            updated["runtime_last_tool_duration_ms"] = None
+            updated["runtime_last_tool_input"] = input_summary
+            updated["runtime_recent_progress_summary"] = (
+                f"{tool_name}: {waiting_summary}" if tool_name and waiting_summary else waiting_summary
+            )
+            updated["runtime_recent_progress_kind"] = "tool_waiting_for_approval"
+            return updated
+        if event.kind == "tool_started":
+            updated["runtime_active_tool_name"] = tool_name
+            updated["runtime_active_tool_status"] = "running"
+            updated["runtime_active_tool_input"] = input_summary
+            if input_summary:
+                updated["runtime_last_tool_input"] = input_summary
+            updated["runtime_recent_progress_summary"] = (
+                f"{tool_name}: {input_summary}" if tool_name and input_summary else tool_name
+            )
+            updated["runtime_recent_progress_kind"] = "tool_running"
+            return updated
+        if event.kind in {"tool_finished", "tool_failed"}:
+            tool_summary = self._runtime_last_tool_summary_for_event(event)
+            updated["runtime_active_tool_name"] = None
+            updated["runtime_active_tool_status"] = "none"
+            updated["runtime_active_tool_input"] = None
+            updated["runtime_last_tool_name"] = tool_name
+            updated["runtime_last_tool_status"] = "ok" if event.kind == "tool_finished" else "error"
+            updated["runtime_last_tool_summary"] = tool_summary
+            updated["runtime_last_tool_duration_ms"] = event.duration_ms
+            updated["runtime_recent_progress_summary"] = (
+                f"{tool_name}: {tool_summary}" if tool_name and tool_summary else tool_summary or tool_name
+            )
+            updated["runtime_recent_progress_kind"] = "tool_result"
+            return updated
+        if event.kind == "tool_result_summarized":
+            result_summary = self._compact_runtime_progress_text(event.message)
+            updated["runtime_last_result_summary"] = result_summary
+            updated["runtime_recent_progress_summary"] = result_summary
+            updated["runtime_recent_progress_kind"] = "tool_result"
+            return updated
+        if event.kind == "budget_pressure":
+            pressure_summary = self._compact_runtime_progress_text(event.message)
+            updated["runtime_budget_pressure_summary"] = pressure_summary
+            updated["runtime_recent_progress_summary"] = pressure_summary
+            updated["runtime_recent_progress_kind"] = "budget_pressure"
+            return updated
+        if event.kind in {
+            "tool_result_replacement_applied",
+            "tool_result_replacement_reapplied",
+        }:
+            replacement_summary = self._compact_runtime_progress_text(event.message)
+            updated["runtime_tool_result_replacement_summary"] = replacement_summary
+            updated["runtime_recent_progress_summary"] = replacement_summary
+            updated["runtime_recent_progress_kind"] = "tool_result_replacement"
+            return updated
+        if event.kind in {
+            "tool_result_artifact_created",
+            "tool_result_artifact_reused",
+        }:
+            artifact_summary = self._compact_runtime_progress_text(event.message)
+            updated["runtime_tool_result_artifact_summary"] = artifact_summary
+            updated["runtime_recent_progress_summary"] = artifact_summary
+            updated["runtime_recent_progress_kind"] = "tool_result_replacement"
+            return updated
+        if event.kind == "tool_result_microcompacted":
+            microcompact_summary = self._compact_runtime_progress_text(event.message)
+            updated["runtime_tool_result_microcompact_summary"] = microcompact_summary
+            updated["runtime_recent_progress_summary"] = microcompact_summary
+            updated["runtime_recent_progress_kind"] = "tool_result_replacement"
+            return updated
+        if event.kind in {"compact_recovery_started", "compact_recovery_finished"}:
+            recovery_summary = self._compact_runtime_progress_text(event.message)
+            updated["runtime_compact_recovery_summary"] = recovery_summary
+            updated["runtime_recent_progress_summary"] = recovery_summary
+            updated["runtime_recent_progress_kind"] = "compact_recovery"
+            return updated
+        return updated
+
+    def _record_runtime_progress_event(self, event: RuntimeEvent) -> None:
+        snapshot = self._runtime_progress_snapshot()
+        self._runtime_progress_surface_state = self._apply_runtime_progress_event_to_snapshot(
+            snapshot,
+            event,
+        )
+
+    def runtime_progress_surface_payload(self) -> dict[str, Any]:
+        snapshot = {**self._runtime_progress_defaults(), **self._runtime_progress_snapshot()}
+        active_status = str(snapshot.get("runtime_active_tool_status") or "none")
+        if active_status not in {"running", "waiting_for_approval"}:
+            active_status = "none"
+        last_status = str(snapshot.get("runtime_last_tool_status") or "none")
+        if last_status not in {"ok", "error", "waiting_for_approval"}:
+            last_status = "none"
+        recent_kind = str(snapshot.get("runtime_recent_progress_kind") or "none")
+        if recent_kind not in {
+            "tool_waiting_for_approval",
+            "tool_running",
+            "tool_result",
+            "budget_pressure",
+            "compact_recovery",
+            "tool_result_replacement",
+            "assistant",
+        }:
+            recent_kind = "none"
+        return {
+            **snapshot,
+            "runtime_active_tool_status": active_status,
+            "runtime_last_tool_status": last_status,
+            "runtime_recent_progress_kind": recent_kind,
+            "runtime_parallel_batch_active": bool(snapshot.get("runtime_parallel_batch_active")),
+            "runtime_parallel_batch_size": int(snapshot.get("runtime_parallel_batch_size") or 0),
+        }
+
+    def _background_runtime_progress_snapshot_from_metadata(
+        self,
+        metadata: dict[str, Any],
+    ) -> dict[str, Any]:
+        snapshot = self._runtime_progress_defaults()
+        snapshot.update(
+            {
+                "runtime_active_tool_name": metadata.get("background_runtime_active_tool_name"),
+                "runtime_active_tool_status": metadata.get("background_runtime_active_tool_status"),
+                "runtime_active_tool_input": metadata.get("background_runtime_active_tool_input"),
+                "runtime_last_tool_name": metadata.get("background_last_tool"),
+                "runtime_last_tool_status": metadata.get("background_runtime_last_tool_status"),
+                "runtime_last_tool_summary": metadata.get("background_last_tool_summary"),
+                "runtime_last_tool_duration_ms": metadata.get("background_runtime_last_tool_duration_ms"),
+                "runtime_last_tool_input": metadata.get("background_last_tool_input"),
+                "runtime_parallel_batch_active": metadata.get("background_runtime_parallel_batch_active"),
+                "runtime_parallel_batch_size": metadata.get("background_runtime_parallel_batch_size"),
+                "runtime_last_result_summary": metadata.get("background_runtime_last_result_summary")
+                or metadata.get("background_runtime_last_tool_result_summary"),
+                "runtime_budget_pressure_summary": metadata.get("background_runtime_budget_pressure_summary")
+                or metadata.get("background_runtime_last_budget_pressure"),
+                "runtime_compact_recovery_summary": metadata.get("background_runtime_compact_recovery_summary")
+                or metadata.get("background_runtime_last_compact_recovery"),
+                "runtime_tool_result_replacement_summary": metadata.get(
+                    "background_runtime_tool_result_replacement_summary"
+                ),
+                "runtime_tool_result_artifact_summary": metadata.get(
+                    "background_runtime_tool_result_artifact_summary"
+                ),
+                "runtime_tool_result_microcompact_summary": metadata.get(
+                    "background_runtime_tool_result_microcompact_summary"
+                ),
+                "runtime_recent_progress_summary": metadata.get("background_runtime_recent_progress_summary"),
+                "runtime_recent_progress_kind": metadata.get("background_runtime_recent_progress_kind"),
+            }
+        )
+        return snapshot
+
+    def _apply_background_runtime_progress_snapshot_to_metadata(
+        self,
+        metadata: dict[str, Any],
+        snapshot: dict[str, Any],
+    ) -> None:
+        metadata["background_runtime_active_tool_name"] = snapshot.get("runtime_active_tool_name")
+        metadata["background_runtime_active_tool_status"] = (
+            str(snapshot.get("runtime_active_tool_status") or "none")
+        )
+        metadata["background_runtime_active_tool_input"] = snapshot.get("runtime_active_tool_input")
+        metadata["background_last_tool"] = snapshot.get("runtime_last_tool_name") or metadata.get(
+            "background_last_tool"
+        )
+        metadata["background_runtime_last_tool_status"] = (
+            str(snapshot.get("runtime_last_tool_status") or "none")
+        )
+        metadata["background_last_tool_summary"] = snapshot.get("runtime_last_tool_summary")
+        metadata["background_runtime_last_tool_duration_ms"] = snapshot.get("runtime_last_tool_duration_ms")
+        metadata["background_last_tool_input"] = snapshot.get("runtime_last_tool_input") or metadata.get(
+            "background_last_tool_input"
+        )
+        metadata["background_runtime_parallel_batch_active"] = bool(
+            snapshot.get("runtime_parallel_batch_active")
+        )
+        metadata["background_runtime_parallel_batch_size"] = int(
+            snapshot.get("runtime_parallel_batch_size") or 0
+        )
+        metadata["background_runtime_last_result_summary"] = snapshot.get("runtime_last_result_summary")
+        metadata["background_runtime_last_tool_result_summary"] = snapshot.get(
+            "runtime_last_result_summary"
+        )
+        metadata["background_runtime_budget_pressure_summary"] = snapshot.get(
+            "runtime_budget_pressure_summary"
+        )
+        metadata["background_runtime_last_budget_pressure"] = snapshot.get(
+            "runtime_budget_pressure_summary"
+        )
+        metadata["background_runtime_compact_recovery_summary"] = snapshot.get(
+            "runtime_compact_recovery_summary"
+        )
+        metadata["background_runtime_last_compact_recovery"] = snapshot.get(
+            "runtime_compact_recovery_summary"
+        )
+        metadata["background_runtime_tool_result_replacement_summary"] = snapshot.get(
+            "runtime_tool_result_replacement_summary"
+        )
+        metadata["background_runtime_tool_result_artifact_summary"] = snapshot.get(
+            "runtime_tool_result_artifact_summary"
+        )
+        metadata["background_runtime_tool_result_microcompact_summary"] = snapshot.get(
+            "runtime_tool_result_microcompact_summary"
+        )
+        metadata["background_runtime_recent_progress_summary"] = snapshot.get(
+            "runtime_recent_progress_summary"
+        )
+        metadata["background_runtime_recent_progress_kind"] = snapshot.get(
+            "runtime_recent_progress_kind"
+        )
+
+    def _record_runtime_usage_event(self, event: RuntimeEvent) -> None:
+        if event.kind != "assistant_usage" or event.total_tokens is None:
+            return
+        self._last_runtime_turn_token_count = int(event.total_tokens)
+        self._last_runtime_turn_token_source = str(event.usage_source or "").strip() or "estimated"
+        if event.usage_source == "provider":
+            self._runtime_provider_usage_seen = True
+        self._runtime_budget_state_payload = None
+
+    def should_emit_budget_pressure_event(self, budget: dict[str, Any]) -> bool:
+        state = str(budget.get("budget_state") or "ok")
+        reason = str(budget.get("budget_reason") or "")
+        signature = (state, reason)
+        if state == "ok":
+            self._last_budget_pressure_signature = None
+            return False
+        if self._last_budget_pressure_signature == signature:
+            return False
+        self._last_budget_pressure_signature = signature
+        return True
+
+    def compaction_policy_payload(
+        self,
+        *,
+        report=None,
+        preview: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        budget = self.refresh_runtime_budget_state(report=report, preview=preview)
+        budget_surface = self.runtime_budget_surface_payload()
+        replacement_surface = self.tool_result_replacement_surface_payload()
+        artifact_surface = self.tool_result_artifact_surface_payload()
+        narrative = self._runtime_narrative_payload(
+            budget_surface=budget_surface,
+        )
+        state = str(budget.get("budget_state") or "ok")
+        if state == "warning":
+            compaction_state = "warning"
+        elif state in {"compact_needed", "hard_stop"}:
+            compaction_state = "auto-compact-ready"
+        else:
+            compaction_state = "ok"
+        return {
+            "compaction_state": compaction_state,
+            "would_compact": bool(budget.get("would_compact")),
+            "should_warn": bool(budget.get("should_warn")),
+            "should_auto_compact": state in {"compact_needed", "hard_stop"},
+            "compaction_reason": budget.get("budget_reason"),
+            "context_percentage": float(budget.get("context_percentage") or 0.0),
+            "message_count": int(budget.get("message_count") or 0),
+            "message_limit": int(budget.get("message_limit") or 1),
+            "warning_message_threshold": int(budget.get("warning_message_threshold") or 1),
+            "context_summary_chars": int(budget.get("context_summary_chars") or 0),
+            "context_summary_limit": int(budget.get("context_summary_limit") or 1),
+            "warning_summary_threshold": int(budget.get("warning_summary_threshold") or 1),
+            "auto_summary_threshold": int(budget.get("auto_summary_threshold") or 1),
+            "compact_preview_action": "/compact preview" if bool(budget.get("would_compact")) else None,
+            "compact_apply_action": "/compact" if bool(budget.get("would_compact")) else None,
+            "runtime_budget_state": narrative["budget"]["runtime_budget_state"],
+            "runtime_budget_reason": narrative["budget"]["runtime_budget_reason"],
+            "context_token_source": narrative["budget"]["context_token_source"],
+            "last_turn_token_count": narrative["budget"]["last_turn_token_count"],
+            "last_turn_token_display": narrative["budget"]["last_turn_token_count_display"],
+            "last_turn_token_source": narrative["budget"]["last_turn_token_source"],
+            "provider_usage_seen": bool(narrative["budget"]["provider_usage_seen"]),
+            "provider_usage_seen_label": narrative["budget"]["provider_usage_seen_label"],
+            "budget_pressure": narrative["budget"]["budget_pressure"],
+            "compact_lifecycle": narrative["compact"]["compact_lifecycle"],
+            "tool_result_replacements": replacement_surface["replacement_active_count"],
+            "tool_result_artifacts": artifact_surface["artifact_active_count"],
+            "replacement_aware_compaction": (
+                "yes"
+                if (
+                    replacement_surface["replacement_active_count"]
+                    or artifact_surface["artifact_active_count"]
+                )
+                else "no"
+            ),
+            "runtime_budget_narrative_lines": self._runtime_budget_narrative_lines(
+                narrative=narrative
+            ),
+        }
+
+    def _render_history_boundary_summary(self, boundary: HistoryBoundary) -> str:
+        created = boundary.created_at or "unknown"
+        kind_label = self._history_boundary_kind_label(boundary.kind)
+        if boundary.kind == "compact":
+            parts = [
+                f"{created} {kind_label}",
+                f"trigger={boundary.trigger or 'manual'}",
+                f"mode={boundary.compaction_mode or 'local_estimated_summary'}",
+                f"compacted={boundary.compacted_count}",
+                f"kept={boundary.kept_count}",
+                f"summary_chars={boundary.context_summary_chars_after}",
+            ]
+            if boundary.trigger_reason:
+                parts.append(f"reason={boundary.trigger_reason}")
+            if boundary.summary and "tool-result replacements=" in boundary.summary:
+                parts.append(f"summary={boundary.summary}")
+            if boundary.instructions:
+                parts.append(f"instruction={boundary.instructions}")
+            return " | ".join(parts)
+        if boundary.kind == "fresh_session_reset":
+            parts = [
+                f"{created} {kind_label}",
+                f"old_session_id={boundary.old_session_id or 'unknown'}",
+                f"new_session_id={boundary.new_session_id or self.state.session_id}",
+                f"messages_before={boundary.message_count_before}",
+                f"summary_chars_before={boundary.context_summary_chars_before}",
+            ]
+            return " | ".join(parts)
+        if boundary.kind == "resume":
+            return f"{created} {kind_label} | trigger={boundary.trigger or 'saved_resume'}"
+        if boundary.kind == "rewind":
+            return (
+                f"{created} {kind_label} | target_boundary_id={boundary.target_boundary_id or 'unknown'} "
+                f"| messages_after={boundary.message_count_after}"
+            )
+        return f"{created} {kind_label}"
+
+    def _history_boundary_kind_label(self, kind: str | None) -> str:
+        normalized = str(kind or "").strip().lower()
+        labels = {
+            "compact": "compact boundary",
+            "rewind": "rewind boundary",
+            "resume": "saved resume boundary",
+            "fresh_session_reset": "fresh session reset",
+        }
+        return labels.get(normalized, normalized or "boundary")
+
+    def _history_boundary_snapshot_available(self, boundary: HistoryBoundary) -> bool:
+        return boundary.snapshot_messages is not None or boundary.snapshot_context_summary is not None
+
+    def _latest_rewindable_boundary_for(
+        self,
+        boundaries: list[HistoryBoundary],
+    ) -> HistoryBoundary | None:
+        for boundary in reversed(boundaries):
+            if self._history_boundary_is_rewindable(boundary):
+                return boundary
+        return None
+
+    def _history_lifecycle_lines(
+        self,
+        boundaries: list[HistoryBoundary],
+        *,
+        latest_compact_trigger: str | None = None,
+        latest_compact_reason: str | None = None,
+        latest_compact_summary: str | None = None,
+        heading: str = "history lifecycle:",
+    ) -> list[str]:
+        latest_boundary = boundaries[-1] if boundaries else None
+        latest_rewindable = self._latest_rewindable_boundary_for(boundaries)
+        rewindable_count = sum(1 for boundary in boundaries if self._history_boundary_is_rewindable(boundary))
+        lines = [
+            heading,
+            f"- history boundaries: {len(boundaries)}",
+            f"- rewindable boundaries: {rewindable_count}",
+            "- latest boundary: "
+            + (
+                self._history_boundary_kind_label(latest_boundary.kind)
+                if latest_boundary is not None
+                else "none"
+            ),
+            "- latest rewindable boundary: "
+            + (
+                self._history_boundary_kind_label(latest_rewindable.kind)
+                if latest_rewindable is not None
+                else "none"
+            ),
+            f"- latest boundary summary: {latest_boundary.summary if latest_boundary is not None and latest_boundary.summary else 'none'}",
+            f"- latest rewindable summary: {latest_rewindable.summary if latest_rewindable is not None and latest_rewindable.summary else 'none'}",
+            f"- latest compact trigger: {latest_compact_trigger or 'none'}",
+            f"- latest compact reason: {latest_compact_reason or 'none'}",
+            f"- latest compact summary: {latest_compact_summary or 'none'}",
+        ]
+        return lines
+
+    def _history_boundary_preview_lines(
+        self,
+        boundary: HistoryBoundary,
+        *,
+        selector_index: int | None = None,
+    ) -> list[str]:
+        snapshot_messages = len(boundary.snapshot_messages or [])
+        snapshot_summary_chars = len(boundary.snapshot_context_summary or "")
+        lines = [
+            "rewind boundary:",
+            "rewind boundary preview:",
+            f"kind: {boundary.kind}",
+            f"boundary kind: {self._history_boundary_kind_label(boundary.kind)}",
+        ]
+        if selector_index is not None:
+            lines.append(f"selector_index: {selector_index}")
+        lines.extend(
+            [
+                f"boundary_id: {boundary.boundary_id}",
+                f"created_at: {boundary.created_at}",
+                f"trigger: {boundary.trigger or 'unknown'}",
+                f"rewindable: {'yes' if self._history_boundary_is_rewindable(boundary) else 'no'}",
+                f"message_count_before: {boundary.message_count_before}",
+                f"message_count_after: {boundary.message_count_after}",
+                f"context_summary_chars_before: {boundary.context_summary_chars_before}",
+                f"context_summary_chars_after: {boundary.context_summary_chars_after}",
+                f"snapshot_available: {'yes' if self._history_boundary_snapshot_available(boundary) else 'no'}",
+                f"snapshot_messages: {snapshot_messages}",
+                f"snapshot_summary_chars: {snapshot_summary_chars}",
+            ]
+        )
+        if boundary.summary:
+            lines.append(f"summary: {boundary.summary}")
+        if boundary.trigger_reason:
+            lines.append(f"trigger_reason: {boundary.trigger_reason}")
+        if boundary.compaction_mode:
+            lines.append(f"compaction_mode: {boundary.compaction_mode}")
+        if boundary.instructions:
+            lines.append(f"compact_instruction: {boundary.instructions}")
+        if boundary.compacted_count:
+            lines.append(f"compacted_count: {boundary.compacted_count}")
+        if boundary.kept_count:
+            lines.append(f"kept_count: {boundary.kept_count}")
+        if boundary.old_session_id:
+            lines.append(f"old_session_id: {boundary.old_session_id}")
+        if boundary.new_session_id:
+            lines.append(f"new_session_id: {boundary.new_session_id}")
+        if boundary.target_boundary_id:
+            lines.append(f"target_boundary_id: {boundary.target_boundary_id}")
+        return lines
+
+    def _find_history_boundary_by_id(self, boundary_id: str | None) -> HistoryBoundary | None:
+        target = str(boundary_id or "").strip()
+        if not target:
+            return None
+        for boundary in self.state.history_boundaries:
+            if boundary.boundary_id == target:
+                return boundary
+        return None
+
+    def _history_boundary_lineage_summary(self, boundary: HistoryBoundary) -> str:
+        if boundary.kind == "compact":
+            return "pre-compact restore point"
+        if boundary.kind == "resume":
+            return "post-resume restore point"
+        if boundary.kind == "fresh_session_reset":
+            return "pre-reset boundary marker"
+        if boundary.kind == "rewind":
+            target = self._find_history_boundary_by_id(boundary.target_boundary_id)
+            if target is not None:
+                return (
+                    "rewind boundary targeting "
+                    + self._history_boundary_kind_label(target.kind)
+                    + (f" ({target.boundary_id})" if target.boundary_id else "")
+                )
+            if boundary.target_boundary_id:
+                return f"rewind boundary targeting {boundary.target_boundary_id}"
+            return "rewind boundary"
+        return self._history_boundary_kind_label(boundary.kind)
+
+    def _history_boundary_compare_payload(self, boundary: HistoryBoundary) -> dict[str, Any]:
+        snapshot_messages = len(boundary.snapshot_messages or [])
+        snapshot_summary_chars = len(boundary.snapshot_context_summary or "")
+        current_messages = len(self.state.messages)
+        current_summary_chars = len(self.state.context_summary or "")
+        return {
+            "restore_message_delta_current": snapshot_messages - current_messages,
+            "restore_summary_chars_delta_current": snapshot_summary_chars - current_summary_chars,
+            "restore_message_count_current": current_messages,
+            "restore_summary_chars_current": current_summary_chars,
+            "targets_pre_compact_state": boundary.kind == "compact",
+            "targets_post_resume_state": boundary.kind == "resume",
+            "lineage_summary": self._history_boundary_lineage_summary(boundary),
+        }
+
+    def _history_boundary_compare_lines(self, boundary: HistoryBoundary) -> list[str]:
+        payload = self._history_boundary_compare_payload(boundary)
+        message_delta = int(payload["restore_message_delta_current"])
+        summary_delta = int(payload["restore_summary_chars_delta_current"])
+        message_direction = "more" if message_delta >= 0 else "fewer"
+        summary_direction = "more" if summary_delta >= 0 else "fewer"
+        lines = [
+            "timeline compare:",
+            f"- lineage: {payload['lineage_summary']}",
+            (
+                "- relative to current: "
+                f"restores {abs(message_delta)} {message_direction} message(s) and "
+                f"{abs(summary_delta)} {summary_direction} context-summary chars"
+            ),
+        ]
+        if payload["targets_pre_compact_state"]:
+            lines.append("- compare lens: this boundary targets pre-compact conversation state")
+        elif payload["targets_post_resume_state"]:
+            lines.append("- compare lens: this boundary targets post-resume conversation state")
+        elif boundary.kind == "rewind":
+            target = self._find_history_boundary_by_id(boundary.target_boundary_id)
+            if target is not None:
+                lines.append(
+                    "- compare lens: this rewind targets "
+                    + self._history_boundary_kind_label(target.kind)
+                )
+        return lines
+
+    def _history_boundary_restore_effect_lines(self, boundary: HistoryBoundary) -> list[str]:
+        semantics = self._memory_operation_semantics("rewind")
+        policy = self._memory_operation_surface_policy("rewind")
+        snapshot_messages = len(boundary.snapshot_messages or [])
+        snapshot_summary_chars = len(boundary.snapshot_context_summary or "")
+        return [
+            "restore effect:",
+            f"- restored messages: {snapshot_messages}",
+            f"- restored context summary chars: {snapshot_summary_chars}",
+            f"- conversation messages: {semantics['conversation_messages']}",
+            f"- compacted context summary: {semantics['context_summary']}",
+            f"- session identity: {semantics['session_identity']}",
+            f"- history boundaries: {semantics['history_boundaries']}",
+            f"- task/plan/file focus: {policy['task_plan_file_focus']}",
+            f"- advisor review state: {policy['advisor_review_state']}",
+            f"- symbol surface: {policy['symbol_surface']}",
+            f"- advisor configuration: {policy['advisor_configuration']}",
+        ]
+
+    def _history_boundary_lines_for(
+        self,
+        boundaries: list[HistoryBoundary],
+        *,
+        limit: int = 3,
+    ) -> list[str]:
+        visible = list(reversed(boundaries[-limit:]))
+        if not visible:
+            return []
+        lines = ["history boundaries:"]
+        for index, boundary in enumerate(visible, start=1):
+            line = f"{index}. {self._render_history_boundary_summary(boundary)}"
+            rewind_selector = self._rewind_selector_for_boundary(boundary)
+            lineage_summary = self._history_boundary_lineage_summary(boundary)
+            if lineage_summary:
+                line += f" | lineage={lineage_summary}"
+            if rewind_selector is not None:
+                line += (
+                    f" | rewind_selector={rewind_selector}"
+                    f" | rewind_show=/rewind show {rewind_selector}"
+                    f" | rewind_apply=/rewind apply {rewind_selector}"
+                )
+            lines.append(line)
+            if rewind_selector is not None:
+                lines.append(
+                    "   browse: preview restore point before applying rewind."
+                )
+        remaining = len(boundaries) - len(visible)
+        if remaining > 0:
+            lines.append(f"... {remaining} older boundary event(s)")
+        return lines
+
+    def _history_boundary_lines(self, *, limit: int = 3) -> list[str]:
+        return self._history_boundary_lines_for(self.state.history_boundaries, limit=limit)
+
+    def _normalize_memory_operation(self, operation: str) -> str:
+        normalized = operation.strip().lower().replace("-", "_")
+        aliases = {
+            "fresh_session_reset": "clear_session",
+            "session_reset": "clear_session",
+            "reset": "clear_session",
+        }
+        return aliases.get(normalized, normalized)
+
+    def _memory_operation_semantics(self, operation: str) -> dict[str, str]:
+        normalized = self._normalize_memory_operation(operation)
+        payloads = {
+            "compact": {
+                "summary": "Older conversation messages moved into compacted context summary.",
+                "conversation_messages": "compacted into a recent-window history",
+                "context_summary": "expanded with compacted history",
+                "session_identity": "preserved",
+                "history_boundaries": "appended compact boundary",
+                "task_plan_file_focus": "preserved",
+                "advisor_review_state": "preserved",
+                "symbol_surface": "preserved",
+                "advisor_configuration": "preserved",
+            },
+            "clear_history": {
+                "summary": "Conversation messages and compacted context summary were cleared in-place.",
+                "conversation_messages": "cleared",
+                "context_summary": "cleared",
+                "session_identity": "preserved",
+                "history_boundaries": "preserved",
+                "task_plan_file_focus": "preserved",
+                "advisor_review_state": "preserved",
+                "symbol_surface": "preserved",
+                "advisor_configuration": "preserved",
+            },
+            "rewind": {
+                "summary": "Conversation messages and compacted context summary were restored from a selected boundary snapshot.",
+                "conversation_messages": "restored from selected boundary snapshot",
+                "context_summary": "restored from selected boundary snapshot",
+                "session_identity": "preserved",
+                "history_boundaries": "appended rewind boundary",
+                "task_plan_file_focus": "cleared",
+                "advisor_review_state": "preserved",
+                "symbol_surface": "preserved",
+                "advisor_configuration": "preserved",
+            },
+            "clear_session": {
+                "summary": "Started a fresh local session with a new session identity.",
+                "conversation_messages": "cleared",
+                "context_summary": "cleared",
+                "session_identity": "rotated to a new session_id",
+                "history_boundaries": "started a fresh transcript with reset boundary",
+                "task_plan_file_focus": "cleared",
+                "advisor_review_state": "cleared",
+                "symbol_surface": "cleared",
+                "advisor_configuration": "preserved",
+            },
+            "resume": {
+                "summary": "Restored saved conversation state from transcript into the current live session.",
+                "conversation_messages": "restored from saved transcript",
+                "context_summary": "restored from saved transcript",
+                "session_identity": "restored saved session_id",
+                "history_boundaries": "appended resume boundary to restored transcript",
+                "task_plan_file_focus": "cleared",
+                "advisor_review_state": "restored",
+                "symbol_surface": "cleared",
+                "advisor_configuration": "restored",
+            },
+        }
+        payload = dict(payloads.get(normalized, payloads["compact"]))
+        payload["operation"] = normalized
+        return payload
+
+    def _memory_operation_payload(
+        self,
+        operation: str,
+        *,
+        boundary: HistoryBoundary | None = None,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = dict(self._memory_operation_semantics(operation))
+        payload.update(
+            {
+                "boundary_id": boundary.boundary_id if boundary is not None else None,
+                "boundary_kind": boundary.kind if boundary is not None else None,
+                "trigger": boundary.trigger if boundary is not None else None,
+                "trigger_reason": boundary.trigger_reason if boundary is not None else None,
+            }
+        )
+        return payload
+
+    def _remember_memory_operation(
+        self,
+        operation: str,
+        *,
+        boundary: HistoryBoundary | None = None,
+    ) -> dict[str, Any]:
+        payload = self._memory_operation_payload(operation, boundary=boundary)
+        self._last_memory_operation_payload = dict(payload)
+        return payload
+
+    def _current_memory_operation_payload(self) -> dict[str, Any] | None:
+        if self._last_memory_operation_payload is not None:
+            return dict(self._last_memory_operation_payload)
+        latest_boundary = self.state.history_boundaries[-1] if self.state.history_boundaries else None
+        if latest_boundary is None:
+            return None
+        operation = self._normalize_memory_operation(latest_boundary.kind)
+        if operation not in {"compact", "rewind", "clear_session", "resume"}:
+            return None
+        return self._memory_operation_payload(operation, boundary=latest_boundary)
+
+    def memory_surface_payload(self) -> dict[str, Any]:
+        boundaries = list(self.state.history_boundaries)
+        latest_boundary = boundaries[-1] if boundaries else None
+        latest_rewindable = self._latest_rewindable_boundary_for(boundaries)
+        default_rewind_selector = "1" if latest_rewindable is not None else None
+        compaction_policy = self.compaction_policy_payload()
+        budget_surface = self.runtime_budget_surface_payload()
+        replacement_surface = self.tool_result_replacement_surface_payload()
+        artifact_surface = self.tool_result_artifact_surface_payload()
+        latest_compact_boundary = self._latest_history_boundary(kind="compact")
+        narrative = self._runtime_narrative_payload(
+            budget_surface=budget_surface,
+            compaction_policy=compaction_policy,
+            latest_compact_boundary=latest_compact_boundary,
+        )
+        latest_operation = self._current_memory_operation_payload()
+        payload = {
+            "context_summary_present": bool(self.state.context_summary),
+            "context_summary_chars": len(self.state.context_summary or ""),
+            "history_boundary_count": len(boundaries),
+            "rewindable_history_boundary_count": len(self._rewindable_boundaries()),
+            "compact_boundary_count": sum(1 for item in boundaries if item.kind == "compact"),
+            "last_history_boundary_kind": latest_boundary.kind if latest_boundary is not None else None,
+            "last_history_boundary_created_at": (
+                latest_boundary.created_at if latest_boundary is not None else None
+            ),
+            "last_history_boundary_summary": latest_boundary.summary if latest_boundary is not None else None,
+            "latest_rewindable_boundary_id": (
+                latest_rewindable.boundary_id if latest_rewindable is not None else None
+            ),
+            "latest_rewindable_boundary_kind": (
+                latest_rewindable.kind if latest_rewindable is not None else None
+            ),
+            "latest_rewindable_boundary_created_at": (
+                latest_rewindable.created_at if latest_rewindable is not None else None
+            ),
+            "latest_rewindable_boundary_summary": (
+                latest_rewindable.summary if latest_rewindable is not None else None
+            ),
+            "default_rewind_selector": default_rewind_selector,
+            "rewind_show_action": (
+                f"/rewind show {default_rewind_selector}" if default_rewind_selector is not None else None
+            ),
+            "rewind_apply_action": (
+                f"/rewind apply {default_rewind_selector}" if default_rewind_selector is not None else None
+            ),
+            "memory_context_summary_present": bool(self.state.context_summary),
+            "memory_context_summary_chars": len(self.state.context_summary or ""),
+            "memory_boundary_count": len(boundaries),
+            "memory_rewindable_boundary_count": len(self._rewindable_boundaries()),
+            "memory_compact_boundary_count": sum(1 for item in boundaries if item.kind == "compact"),
+            "memory_last_boundary_kind": latest_boundary.kind if latest_boundary is not None else None,
+            "memory_last_boundary_created_at": (
+                latest_boundary.created_at if latest_boundary is not None else None
+            ),
+            "memory_last_boundary_summary": latest_boundary.summary if latest_boundary is not None else None,
+            "memory_latest_rewindable_boundary_id": (
+                latest_rewindable.boundary_id if latest_rewindable is not None else None
+            ),
+            "memory_latest_rewindable_boundary_kind": (
+                latest_rewindable.kind if latest_rewindable is not None else None
+            ),
+            "memory_latest_rewindable_boundary_created_at": (
+                latest_rewindable.created_at if latest_rewindable is not None else None
+            ),
+            "memory_latest_rewindable_boundary_summary": (
+                latest_rewindable.summary if latest_rewindable is not None else None
+            ),
+            "memory_default_rewind_selector": default_rewind_selector,
+            "memory_rewind_show_action": (
+                f"/rewind show {default_rewind_selector}" if default_rewind_selector is not None else None
+            ),
+            "memory_rewind_apply_action": (
+                f"/rewind apply {default_rewind_selector}" if default_rewind_selector is not None else None
+            ),
+        }
+        payload.update(compaction_policy)
+        payload.update(
+            {
+                "memory_compaction_state": compaction_policy["compaction_state"],
+                "memory_would_compact": bool(compaction_policy["would_compact"]),
+                "memory_should_warn": bool(compaction_policy["should_warn"]),
+                "memory_should_auto_compact": bool(compaction_policy["should_auto_compact"]),
+                "memory_compaction_reason": compaction_policy.get("compaction_reason"),
+                "memory_message_count": int(compaction_policy["message_count"]),
+                "memory_message_limit": int(compaction_policy["message_limit"]),
+                "memory_warning_message_threshold": int(
+                    compaction_policy["warning_message_threshold"]
+                ),
+                "memory_context_summary_limit": int(compaction_policy["context_summary_limit"]),
+                "memory_warning_summary_threshold": int(
+                    compaction_policy["warning_summary_threshold"]
+                ),
+                "memory_auto_summary_threshold": int(
+                    compaction_policy["auto_summary_threshold"]
+                ),
+                "memory_compact_preview_action": compaction_policy.get("compact_preview_action"),
+                "memory_compact_apply_action": compaction_policy.get("compact_apply_action"),
+                "memory_budget_state": narrative["budget"]["runtime_budget_state"],
+                "memory_budget_reason": narrative["budget"]["runtime_budget_reason"],
+                "memory_context_tokens_estimated": int(
+                    budget_surface.get("context_tokens_estimated") or 0
+                ),
+                "memory_context_percentage": float(
+                    budget_surface.get("context_percentage") or 0.0
+                ),
+                "memory_context_token_source": narrative["budget"]["context_token_source"],
+                "memory_last_turn_token_count": narrative["budget"]["last_turn_token_count"],
+                "memory_last_turn_token_source": (
+                    None
+                    if narrative["budget"]["last_turn_token_source"] == "none"
+                    else narrative["budget"]["last_turn_token_source"]
+                ),
+                "memory_provider_usage_seen": bool(narrative["budget"]["provider_usage_seen"]),
+                "memory_budget_pressure": narrative["budget"]["budget_pressure"],
+                "memory_compact_lifecycle": narrative["compact"]["compact_lifecycle"],
+                "memory_latest_compact_trigger": narrative["compact"]["latest_compact_trigger"],
+                "memory_latest_compact_reason": narrative["compact"]["latest_compact_reason"],
+                "memory_latest_compact_summary": narrative["compact"]["latest_compact_summary"],
+                "memory_tool_result_replacements": replacement_surface["replacement_active_count"],
+                "memory_tool_result_artifacts": artifact_surface["artifact_active_count"],
+                "memory_replacement_aware_compaction": (
+                    "yes"
+                    if (
+                        replacement_surface["replacement_active_count"]
+                        or artifact_surface["artifact_active_count"]
+                    )
+                    else "no"
+                ),
+                "memory_should_stop": bool(budget_surface.get("should_stop")),
+            }
+        )
+        if latest_operation is not None:
+            payload.update(
+                {
+                    "memory_last_operation": latest_operation["operation"],
+                    "memory_last_operation_summary": latest_operation["summary"],
+                    "memory_last_operation_messages": latest_operation[
+                        "conversation_messages"
+                    ],
+                    "memory_last_operation_context_summary": latest_operation[
+                        "context_summary"
+                    ],
+                    "memory_last_operation_session_identity": latest_operation[
+                        "session_identity"
+                    ],
+                    "memory_last_operation_history_boundaries": latest_operation[
+                        "history_boundaries"
+                    ],
+                    "memory_last_operation_task_plan_file_focus": latest_operation[
+                        "task_plan_file_focus"
+                    ],
+                    "memory_last_operation_advisor_review_state": latest_operation[
+                        "advisor_review_state"
+                    ],
+                    "memory_last_operation_symbol_surface": latest_operation[
+                        "symbol_surface"
+                    ],
+                    "memory_last_operation_advisor_configuration": latest_operation[
+                        "advisor_configuration"
+                    ],
+                    "memory_last_operation_boundary_kind": latest_operation.get("boundary_kind"),
+                    "memory_last_operation_boundary_id": latest_operation.get("boundary_id"),
+                    "memory_last_operation_trigger": latest_operation.get("trigger"),
+                    "memory_last_operation_trigger_reason": latest_operation.get(
+                        "trigger_reason"
+                    ),
+                }
+            )
+        return payload
+
+    def background_surface_payload(self) -> dict[str, Any]:
+        return dict(background_live_session_payload(self))
+
+    def background_registry_payload(self, limit: int = 5) -> dict[str, Any]:
+        return dict(background_registry_payload(self._workspace_anchor_cwd(), limit=limit))
+
+    def background_handoff_payload(self, limit: int = 3) -> dict[str, Any]:
+        return dict(background_handoff_payload(self._workspace_anchor_cwd(), limit=limit))
+
+    def _status_action_groups_payload(
+        self,
+        *,
+        workflow: bool = False,
+        session_id: str | None = None,
+        saved_resumable: bool = False,
+    ) -> dict[str, list[str]]:
+        background_handoff = self.background_handoff_payload()
+        groups: dict[str, list[str]] = {
+            "go_to_focused_file": self._dedupe_action_commands(
+                ["/files focused", *(['/diff focused'] if workflow else [])]
+            ),
+            "inspect_changes": self._dedupe_action_commands(
+                ["/changes working-set", *(['/files context'] if workflow else [])]
+            ),
+            "inspect_task": self._dedupe_action_commands(["/tasks active"]),
+            "inspect_active_plan": self._dedupe_action_commands(["/plan"]),
+            "inspect_history_rewind": self._dedupe_action_commands(["/history all", "/rewind"]),
+            "inspect_background_handoff": self._dedupe_action_commands(
+                [str(background_handoff.get("background_handoff_transcript_action") or "pyclaude ps")]
+            ),
+            "inspect_project_context_health": self._dedupe_action_commands(
+                ["/project-context", "/plugins", "/skills"]
+            ),
+            "inspect_runtime_health": self._dedupe_action_commands(
+                ["/mcp", "/permissions", "/workspaces current"]
+            ),
+        }
+        normalized_session_id = str(session_id or "").strip()
+        if normalized_session_id:
+            groups["inspect_sessions"] = self._dedupe_action_commands(
+                [
+                    f"/sessions show {normalized_session_id} summary",
+                    f"/sessions show {normalized_session_id} workspace",
+                ]
+            )
+            if saved_resumable:
+                groups["resume_repl"] = [f"pyclaude --resume-session {normalized_session_id} repl"]
+                groups["resume_tui"] = [f"pyclaude --resume-session {normalized_session_id} tui"]
+        return groups
+
+    def _status_action_group_order(self, *, resume: bool = False) -> tuple[str, ...]:
+        base = (
+            "go_to_focused_file",
+            "inspect_changes",
+            "inspect_task",
+            "inspect_active_plan",
+            "inspect_history_rewind",
+            "inspect_background_handoff",
+            "inspect_project_context_health",
+            "inspect_runtime_health",
+        )
+        if not resume:
+            return base
+        return (
+            *base,
+            "inspect_sessions",
+            "resume_repl",
+            "resume_tui",
+        )
+
+    def _status_action_label(self, key: str) -> str:
+        labels = {
+            "go_to_focused_file": "inspect focused file",
+            "inspect_changes": "inspect changes",
+            "inspect_task": "inspect tasks",
+            "inspect_active_plan": "inspect active plan",
+            "inspect_history_rewind": "inspect history/rewind",
+            "inspect_background_handoff": "inspect background handoff",
+            "inspect_project_context_health": "inspect project-context health",
+            "inspect_runtime_health": "inspect runtime health",
+            "inspect_sessions": "inspect sessions",
+            "resume_repl": "resume repl",
+            "resume_tui": "resume tui",
+        }
+        return labels.get(key, key)
+
+    def render_status_action_family_lines(
+        self,
+        action_groups: dict[str, list[str]],
+        *,
+        resume: bool = False,
+        line_prefix: str = "- ",
+    ) -> list[str]:
+        lines: list[str] = []
+        for key in self._status_action_group_order(resume=resume):
+            commands = [str(item).strip() for item in action_groups.get(key, []) if str(item).strip()]
+            if not commands:
+                continue
+            lines.append(f"{line_prefix}{self._status_action_label(key)}: {' | '.join(commands)}")
+        return lines
+
+    def _status_next_action_commands(self, *, workflow: bool = False) -> list[str]:
+        commands: list[str] = []
+        for key in self._status_action_group_order():
+            commands.extend(self._status_action_groups_payload(workflow=workflow).get(key, []))
+        return self._dedupe_action_commands(commands)
+
+    def _status_runtime_health_payload(self) -> dict[str, Any]:
+        counts = self._mcp_server_counts()
+        active_skills = list(self.active_skills())
+        skill_surface = self._loaded_skill_registry_payload()
+        skill_reload_state = self._skill_reload_state_payload()
+        plugin_surface = self.plugin_surface_payload()
+        plugins = self.plugin_registry.list_plugins()
+        enabled_plugins = self.plugin_registry.enabled_plugins(self.state)
+        plugin_diagnostics = self.plugin_registry.list_diagnostics()
+        project_reload = self._last_project_context_reload if isinstance(self._last_project_context_reload, dict) else {}
+        project_reload_error = str(project_reload.get("error") or "").strip()
+        permission_summary = (
+            f"mode={self.config.permission_mode} "
+            f"workspace_rules={len(self._workspace_permission_rules)} "
+            f"session_rules={len(self.permission_manager.session_rules)}"
+        )
+        permission_issue = "none"
+        if self.config.permission_mode != "default":
+            permission_issue = f"permission mode override: {self.config.permission_mode}"
+        elif self._workspace_permission_rules or self.permission_manager.session_rules:
+            permission_issue = (
+                "permission overrides active: "
+                f"workspace={len(self._workspace_permission_rules)} "
+                f"session={len(self.permission_manager.session_rules)}"
+            )
+
+        workspace_issue = "none"
+        if self.state.workspace_unavailable:
+            workspace_issue = "workspace unavailable: " + str(
+                self.state.workspace_unavailable_reason or self.state.workspace_health or "unknown"
+            )
+        elif self.state.workspace_health != "healthy":
+            workspace_issue = f"workspace health anomaly: {self.state.workspace_health}"
+        elif self.state.workspace_cleanup_status not in {"none", "completed"}:
+            workspace_issue = f"workspace cleanup status: {self.state.workspace_cleanup_status}"
+
+        mcp_health = (
+            f"servers={counts['servers']} connected={counts['connected']} "
+            f"failed={counts['failed']} retrying={counts['retrying']}"
+        )
+        mcp_issue = "none"
+        if counts["failed"] > 0:
+            mcp_issue = f"mcp failed servers: {counts['failed']}"
+        elif counts["retrying"] > 0:
+            mcp_issue = f"mcp retrying servers: {counts['retrying']}"
+
+        project_context_issue = "none"
+        if project_reload_error:
+            project_context_issue = f"project-context reload error: {project_reload_error}"
+        elif plugin_diagnostics:
+            project_context_issue = f"plugin diagnostics: {len(plugin_diagnostics)}"
+
+        runtime_health_alert = "none"
+        runtime_health_source = "none"
+        for source, issue in (
+            ("workspace", workspace_issue),
+            ("mcp", mcp_issue),
+            ("project-context", project_context_issue),
+            ("permissions", permission_issue),
+        ):
+            if issue != "none":
+                runtime_health_alert = issue
+                runtime_health_source = source
+                break
+
+        return {
+            "status_project_context_summary": (
+                f"memory={'loaded' if self.project_context.memory_content else 'none'} "
+                f"skills={len(self.project_context.skills)} plugins={len(plugins)}"
+            ),
+            "status_project_context_reload_health": self._last_project_context_reload_summary_line()
+            or "latest reload: none",
+            "status_project_context_issue": project_context_issue,
+            "status_skills_health": (
+                f"loaded={len(self.project_context.skills)} enabled={len(active_skills)} "
+                f"manual_enabled={len(self.state.enabled_skill_names)} "
+                f"manual_disabled={len(self.state.disabled_skill_names)}"
+            ),
+            "status_skill_registry_summary": skill_surface["skill_registry_summary"],
+            "status_skill_reload_state": skill_reload_state["summary"],
+            "status_skill_manual_overrides": (
+                f"enabled={skill_surface['skill_manual_enabled_count']} "
+                f"disabled={skill_surface['skill_manual_disabled_count']}"
+            ),
+            "status_skill_diagnostics": skill_surface["skill_diagnostic_count"],
+            "status_skill_prompt_summary": skill_surface["skill_prompt_composition_summary"],
+            "status_plugins_health": (
+                f"registered={plugin_surface['plugin_registry_count']} "
+                f"enabled={plugin_surface['plugin_enabled_count']} "
+                f"diagnostics={plugin_surface['plugin_diagnostic_count']}"
+            ),
+            "status_plugin_registry_summary": plugin_surface["plugin_registry_summary"],
+            "status_plugin_reload_state": plugin_surface["plugin_reload_state"].get("summary") or "latest reload: none",
+            "status_plugin_manual_overrides": (
+                f"enabled={plugin_surface['plugin_manual_enabled_count']} "
+                f"disabled={plugin_surface['plugin_manual_disabled_count']}"
+            ),
+            "status_mcp_health": mcp_health,
+            "status_mcp_issue": mcp_issue,
+            "status_permission_mode": self.config.permission_mode,
+            "status_permission_summary": permission_summary,
+            "status_permission_issue": permission_issue,
+            "status_workspace_anomaly": workspace_issue,
+            "status_workspace_cleanup_status": self.state.workspace_cleanup_status,
+            "status_workspace_unavailable": bool(self.state.workspace_unavailable),
+            "status_runtime_health_alert": runtime_health_alert,
+            "status_runtime_health_source": runtime_health_source,
+        }
+
+    def status_surface_payload(self) -> dict[str, Any]:
+        artifact = self.active_planning_artifact()
+        working_set = self.working_set_payload(limit=5)
+        focused_payload = self._current_context_focus_payload()
+        task_surfaces = self.task_surface_counts_payload()
+        explicit_entries = self._explicit_context_entries_payloads()
+        file_items = [
+            item for item in working_set.get("file_context_files", []) if isinstance(item, dict)
+        ]
+        _focused_files, _focused_index, focused_item = self._file_context_items_and_index(focused_payload)
+        explicit_counts = self._explicit_context_summary_counts(
+            entries=explicit_entries,
+            files=file_items,
+            total_file_count=len(file_items),
+        )
+        background_handoff = self.background_handoff_payload()
+        memory_payload = self.memory_surface_payload()
+        budget_surface = self.runtime_budget_surface_payload()
+        runtime_progress = self.runtime_progress_surface_payload()
+        replacement_surface = self.tool_result_replacement_surface_payload()
+        artifact_surface = self.tool_result_artifact_surface_payload()
+        narrative = self._runtime_narrative_payload(
+            budget_surface=budget_surface,
+            runtime_progress=runtime_progress,
+        )
+        execution_contract = self.execution_contract_payload()
+        usage_report = collect_context_usage(self)
+        recommended_actions = self._workspace_recommended_actions(
+            workspace_health=self.state.workspace_health,
+            workspace_label=self.state.workspace_label,
+            session_id=self.state.session_id,
+        )
+        workspace_action_fields = self._workspace_session_action_fields(
+            workspace_health=self.state.workspace_health,
+            workspace_label=self.state.workspace_label,
+            session_id=self.state.session_id,
+        )
+        active_task_total = sum(
+            count
+            for key, count in task_surfaces.items()
+            if key not in {"completed", "failed", "blocked", "stopped"}
+        )
+        task_surface_summary = (
+            ", ".join(f"{name}={count}" for name, count in sorted(task_surfaces.items()) if count)
+            if task_surfaces
+            else "none"
+        )
+        focused_path = str(focused_item.get("path") or "none") if focused_item is not None else "none"
+        focused_source = str(focused_item.get("source") or "none") if focused_item is not None else "none"
+        payload = {
+            "status_session_id": self.state.session_id,
+            "status_provider": self.config.provider,
+            "status_model": self.config.model,
+            "status_advisor_model": self.state.advisor_model or self.config.model,
+            "status_advisor_mode": self.state.advisor_mode,
+            "status_mode": execution_contract["session_execution_mode"],
+            "status_context_usage": f"{usage_report.total_tokens} / {usage_report.max_tokens} ({usage_report.percentage:.1f}%)",
+            "status_context_usage_tokens": usage_report.total_tokens,
+            "status_context_usage_max_tokens": usage_report.max_tokens,
+            "status_context_usage_percentage": usage_report.percentage,
+            "status_memory_summary": str(memory_payload.get("memory_last_operation_summary") or "none"),
+            "status_memory_compaction": str(memory_payload.get("memory_compaction_state") or "ok"),
+            "status_memory_last_operation": str(memory_payload.get("memory_last_operation") or "none"),
+            "status_memory_boundary_count": int(memory_payload.get("memory_boundary_count") or 0),
+            "status_budget_state": str(narrative["budget"]["runtime_budget_state"] or "ok"),
+            "status_budget_reason": str(
+                narrative["budget"]["runtime_budget_reason_display"] or "none"
+            ),
+            "status_context_token_source": str(
+                narrative["budget"]["context_token_source"] or "none"
+            ),
+            "status_last_turn_token_count": (
+                int(narrative["budget"]["last_turn_token_count"])
+                if narrative["budget"].get("last_turn_token_count") is not None
+                else None
+            ),
+            "status_last_turn_token_source": str(
+                narrative["budget"]["last_turn_token_source"] or "none"
+            ),
+            "status_provider_usage_seen": bool(narrative["budget"]["provider_usage_seen"]),
+            "status_budget_pressure": str(narrative["budget"]["budget_pressure"] or "ok"),
+            "status_compact_lifecycle": str(narrative["compact"]["compact_lifecycle"] or "none"),
+            "status_runtime_progress_summary": str(
+                narrative["progress"]["runtime_progress_display"] or "none"
+            ),
+            "status_runtime_progress_kind": str(
+                runtime_progress.get("runtime_recent_progress_kind") or "none"
+            ),
+            "status_runtime_active_tool_name": runtime_progress.get("runtime_active_tool_name"),
+            "status_runtime_active_tool_status": str(
+                runtime_progress.get("runtime_active_tool_status") or "none"
+            ),
+            "status_runtime_active_tool_input": runtime_progress.get("runtime_active_tool_input"),
+            "status_runtime_last_tool_name": runtime_progress.get("runtime_last_tool_name"),
+            "status_runtime_last_tool_status": str(
+                runtime_progress.get("runtime_last_tool_status") or "none"
+            ),
+            "status_runtime_last_tool_summary": runtime_progress.get("runtime_last_tool_summary"),
+            "status_runtime_parallel_batch_active": bool(
+                runtime_progress.get("runtime_parallel_batch_active")
+            ),
+            "status_runtime_parallel_batch_size": int(
+                runtime_progress.get("runtime_parallel_batch_size") or 0
+            ),
+            "status_runtime_last_result_summary": narrative["progress"]["last_tool_result_summary"],
+            "status_runtime_compact_recovery_summary": runtime_progress.get(
+                "runtime_compact_recovery_summary"
+            ),
+            "status_runtime_tool_result_replacement_summary": runtime_progress.get(
+                "runtime_tool_result_replacement_summary"
+            ),
+            "status_runtime_tool_result_artifact_summary": runtime_progress.get(
+                "runtime_tool_result_artifact_summary"
+            ),
+            "status_runtime_tool_result_microcompact_summary": runtime_progress.get(
+                "runtime_tool_result_microcompact_summary"
+            ),
+            "status_background_summary": str(
+                background_handoff.get("background_handoff_selected_completion_summary") or "none"
+            ),
+            "status_background_notification_count": int(
+                background_handoff.get("background_handoff_count") or 0
+            ),
+            "status_background_latest_handoff": str(
+                background_handoff.get("background_handoff_selected_bg_id") or "none"
+            ),
+            "status_working_set_summary": self._render_file_context_mix_line(file_items),
+            "status_working_set_file_count": len(file_items),
+            "status_focused_file_summary": f"{focused_path} ({focused_source})",
+            "status_focused_file_path": focused_path,
+            "status_focused_file_source": focused_source,
+            "status_plan_summary": artifact.goal if artifact is not None else "none",
+            "status_plan_goal": artifact.goal if artifact is not None else None,
+            "status_task_summary": task_surface_summary,
+            "status_active_task_count": active_task_total,
+            "status_task_surface_summary": task_surface_summary,
+            "status_workspace_summary": (
+                f"mode={self.state.workspace_mode} health={self.state.workspace_health} "
+                f"focused={focused_path}"
+            ),
+            "status_workspace_mode": self.state.workspace_mode,
+            "status_workspace_health": self.state.workspace_health,
+            "status_workspace_recovery": recommended_actions[0] if recommended_actions else "none",
+            "status_workspace_recommended_actions": list(recommended_actions),
+            "status_workspace_primary_action": workspace_action_fields["selected_workspace_primary_action"],
+            "status_workspace_secondary_action": workspace_action_fields["selected_workspace_secondary_action"],
+            "status_workspace_tertiary_action": workspace_action_fields["selected_workspace_tertiary_action"],
+            "status_workspace_target": workspace_action_fields["selected_workspace_target"],
+            "status_explicit_context_entry_count": explicit_counts["entry_count"],
+            "status_unresolved_explicit_context_entry_count": explicit_counts["unresolved_entry_count"],
+            "status_tool_result_replacement_summary": replacement_surface["replacement_last_summary"],
+            "status_tool_result_artifact_summary": artifact_surface["artifact_last_summary"],
+            "status_action_groups": self._status_action_groups_payload(),
+            "status_next_actions": self._status_next_action_commands(),
+        }
+        payload.update(self._status_runtime_health_payload())
+        return payload
+
+    def workspace_surface_payload(self) -> dict[str, Any]:
+        effective_cwd = self.state.effective_cwd or str(self.config.cwd)
+        health_payload = self._status_runtime_health_payload()
+        recommended_actions = self._workspace_recommended_actions(
+            workspace_health=self.state.workspace_health,
+            workspace_label=self.state.workspace_label,
+            session_id=self.state.session_id,
+        )
+        action_bundle = self.current_workspace_action_bundle()
+        return {
+            "workspace_summary": (
+                f"mode={self.state.workspace_mode} health={self.state.workspace_health} "
+                f"label={self.state.workspace_label or 'none'}"
+            ),
+            "workspace_mode": self.state.workspace_mode,
+            "workspace_label": self.state.workspace_label,
+            "workspace_health": self.state.workspace_health,
+            "workspace_created_at": self.state.workspace_created_at,
+            "workspace_original_cwd": self.state.original_cwd or str(self.config.cwd),
+            "workspace_effective_cwd": effective_cwd,
+            "workspace_effective_cwd_exists": Path(effective_cwd).exists() if effective_cwd else None,
+            "workspace_cleanup_status": self.state.workspace_cleanup_status,
+            "workspace_cleanup_error": self.state.workspace_cleanup_error,
+            "workspace_unavailable": bool(self.state.workspace_unavailable),
+            "workspace_unavailable_reason": self.state.workspace_unavailable_reason,
+            "workspace_fallback_cwd": self.state.workspace_fallback_cwd,
+            "workspace_anomaly_summary": str(health_payload.get("status_workspace_anomaly") or "none"),
+            "workspace_recovery_summary": recommended_actions[0] if recommended_actions else "none",
+            "workspace_recommended_actions": list(recommended_actions),
+            "workspace_action_bundle": {
+                "primary_action": action_bundle.get("primary_action", "none"),
+                "secondary_action": action_bundle.get("secondary_action", "none"),
+                "tertiary_action": action_bundle.get("tertiary_action", "/workspaces list"),
+                "target": action_bundle.get("target"),
+                "workspace_health": action_bundle.get("workspace_health", self.state.workspace_health),
+            },
+            "workspace_action_groups": {
+                "inspect_current_workspace": ["/workspaces current"],
+                "inspect_workspace_inventory": ["/workspaces list"],
+                "workspace_recovery": list(recommended_actions),
+            },
+        }
+
+    def file_context_surface_payload(self, *, limit: int = 5) -> dict[str, Any]:
+        payload = self.working_set_payload(limit=limit)
+        files, focused_index, focused_item = self._file_context_items_and_index(payload)
+        explicit_entries = self._explicit_context_entries_payloads()
+        explicit_counts = self._explicit_context_summary_counts(
+            entries=explicit_entries,
+            files=files,
+            total_file_count=len(files),
+        )
+        if focused_item is None:
+            focused_summary = "none"
+            focused_context_origin = "none"
+            focused_scope_reasons: list[str] = []
+            focused_file_action_groups = self._file_surface_action_groups(
+                {},
+                stay_on_surface_actions=["/files focused"],
+                inspect_focused_file_actions=["/files focused"],
+                inspect_focused_diff_actions=["/diff focused"],
+                inspect_explicit_context_actions=["/files context"],
+            )
+            focused_primary_target = None
+            focused_secondary_target = None
+            focused_has_related_change = False
+            focused_has_diff_hunks = False
+            focused_is_context_only = False
+        else:
+            focused_scope_reasons = self._file_context_scope_reasons(focused_item)
+            focused_context_origin = self._file_context_origin_label(focused_item)
+            focused_primary_target = focused_item.get("target")
+            focused_secondary_target = self._file_context_secondary_target(focused_item)
+            focused_has_related_change = bool(focused_item.get("change_id"))
+            focused_has_diff_hunks = self._file_context_diff_hunk_count(focused_item) > 0
+            focused_is_context_only = self._file_context_is_context_only(focused_item)
+            focused_summary = (
+                f"source=working_set path={str(focused_item.get('path') or 'none')} "
+                f"target={focused_item.get('target_summary') or 'none'} "
+                f"context_origin={focused_context_origin}"
+            )
+            focused_file_action_groups = self._file_surface_action_groups(
+                focused_item,
+                stay_on_surface_actions=["/files focused"],
+                inspect_focused_file_actions=["/files focused"],
+                inspect_focused_diff_actions=["/diff focused"],
+                inspect_explicit_context_actions=self._file_context_context_actions(focused_item),
+            )
+        return {
+            "working_set": dict(payload),
+            "working_set_summary": self._render_file_context_mix_line(files),
+            "focused_file": {
+                "source": "working_set",
+                "scope": payload.get("file_context_scope"),
+                "index": focused_index if focused_item is not None else 0,
+                "file_count": len(files),
+                "path": str(focused_item.get("path") or "").strip() or None if focused_item is not None else None,
+                "scope_reasons": focused_scope_reasons,
+                "context_origin": focused_context_origin,
+                "has_related_change": focused_has_related_change,
+                "has_diff_hunks": focused_has_diff_hunks,
+                "is_context_only": focused_is_context_only,
+                "primary_target": focused_primary_target,
+                "secondary_target": focused_secondary_target,
+                "summary": focused_summary,
+            },
+            "explicit_context": {
+                "entry_count": explicit_counts["entry_count"],
+                "unresolved_entry_count": explicit_counts["unresolved_entry_count"],
+                "explicit_file_count": explicit_counts["explicit_file_count"],
+                "explicit_only_file_count": explicit_counts["explicit_only_file_count"],
+                "automatic_file_count": explicit_counts["automatic_file_count"],
+                "overlapping_file_count": explicit_counts["overlapping_file_count"],
+                "compare_summary_lines": self._explicit_context_compare_summary_lines(
+                    entries=explicit_entries,
+                    files=files,
+                ),
+            },
+            "file_action_groups": focused_file_action_groups,
+        }
+
+    def send_background_followup(self, bg_id: str, prompt: str = "") -> str:
+        record = self._require_background_session_record(bg_id)
+        message = str(prompt or "").strip()
+        queued_followups = [str(item).strip() for item in (record.pending_followups or []) if str(item).strip()]
+        if not message and queued_followups:
+            message = queued_followups.pop(0)
+        if not message:
+            raise ValueError("Follow-up prompt must be a non-empty string.")
+        if not record.session_id or not record.bridge_host or not record.bridge_port:
+            raise RuntimeError(f'Background session "{record.bg_id}" is not live-attachable.')
+        client = BridgeClient(str(record.bridge_host), int(record.bridge_port))
+        try:
+            result = client.request(
+                "session.ask",
+                {
+                    "session_id": str(record.session_id),
+                    "prompt": message,
+                },
+            )
+        finally:
+            client.close()
+        update_background_session(
+            self._workspace_anchor_cwd(),
+            record.bg_id,
+            pending_followups=queued_followups,
+            latest_followup_message=message,
+            latest_followup_at=utc_now_iso(),
+            latest_followup_mode="sent",
+        )
+        output = str(result.get("output") or "").strip()
+        if output:
+            return f'Sent follow-up to background session "{record.bg_id}".\n\n{output}'
+        return f'Sent follow-up to background session "{record.bg_id}".'
+
+    def queue_background_message(self, bg_id: str, prompt: str) -> str:
+        record = self._require_background_session_record(bg_id)
+        message = str(prompt or "").strip()
+        if not message:
+            raise ValueError("Queued background message must be a non-empty string.")
+        queued_followups = [str(item).strip() for item in (record.pending_followups or []) if str(item).strip()]
+        queued_followups.append(message)
+        update_background_session(
+            self._workspace_anchor_cwd(),
+            record.bg_id,
+            pending_followups=queued_followups,
+            latest_followup_message=message,
+            latest_followup_at=utc_now_iso(),
+            latest_followup_mode="queued",
+        )
+        return (
+            f'Queued follow-up for background session "{record.bg_id}". '
+            f"pending={len(queued_followups)}"
+        )
+
+    def cancel_pending_background_followup(self, bg_id: str) -> str:
+        record = self._require_background_session_record(bg_id)
+        pending_count = len([str(item).strip() for item in (record.pending_followups or []) if str(item).strip()])
+        update_background_session(
+            self._workspace_anchor_cwd(),
+            record.bg_id,
+            pending_followups=[],
+            latest_followup_at=utc_now_iso(),
+            latest_followup_mode="canceled",
+        )
+        return (
+            f'Canceled pending follow-ups for background session "{record.bg_id}". '
+            f"cleared={pending_count}"
+        )
+
+    def _require_background_session_record(self, bg_id: str) -> BackgroundSessionRecord:
+        identifier = str(bg_id or "").strip()
+        if not identifier:
+            raise ValueError("Background session id must be provided.")
+        record = resolve_background_session(self._workspace_anchor_cwd(), identifier)
+        if record is None:
+            raise FileNotFoundError(f'No background session found for "{identifier}".')
+        return record
+
+    def _history_rewind_guidance_lines(self) -> list[str]:
+        payload = self.memory_surface_payload()
+        rewindable_count = int(payload.get("rewindable_history_boundary_count") or 0)
+        if rewindable_count <= 0:
+            return [
+                "rewind guidance:",
+                "rewind selectors count rewindable boundaries only, newest first.",
+                "No rewindable boundaries yet.",
+                "next actions:",
+                "- /compact preview",
+                "- /compact",
+            ]
+        lines = [
+            "rewind guidance:",
+            "rewind selectors count rewindable boundaries only, newest first.",
+            f"rewindable boundaries: {rewindable_count}",
+            f"default selector: {payload.get('default_rewind_selector') or 'none'}",
+        ]
+        latest_kind = str(payload.get("latest_rewindable_boundary_kind") or "").strip()
+        latest_boundary_id = str(payload.get("latest_rewindable_boundary_id") or "").strip()
+        if latest_kind or latest_boundary_id:
+            lines.append(
+                "latest rewindable boundary: "
+                + (latest_kind or "boundary")
+                + (f" ({latest_boundary_id})" if latest_boundary_id else "")
+            )
+        lines.extend(
+            [
+                "recommended flow:",
+                "- preview a boundary before applying it",
+                "next actions:",
+                "- " + str(payload.get("rewind_show_action") or "/rewind"),
+                "- " + str(payload.get("rewind_apply_action") or "/rewind"),
+                "- /rewind",
+            ]
+        )
+        return lines
+
+    def _clear_workflow_focus_payloads(self) -> None:
+        self._current_change_focus_payload = None
+        self._current_task_focus_payload = None
+        self._current_plan_focus_payload = None
+
+    def _clear_symbol_surface_state(self) -> None:
+        self._current_symbol_surface = None
+        if hasattr(self.state, "last_symbol_surface_payload"):
+            self.state.last_symbol_surface_payload = None
+
+    def _clear_advisor_review_state(self) -> None:
+        self.state.advisor_last_result = None
+        self.state.advisor_review_history.clear()
+        self.state.last_plan_drift_status = None
+        self.state.last_plan_drift_reason = None
+        self.state.last_plan_drift_context = None
+        self.state.plan_drift_count = 0
+
+    def _memory_operation_surface_policy(self, operation: str) -> dict[str, str]:
+        semantics = self._memory_operation_semantics(operation)
+        return {
+            "task_plan_file_focus": semantics["task_plan_file_focus"],
+            "advisor_review_state": semantics["advisor_review_state"],
+            "symbol_surface": semantics["symbol_surface"],
+            "advisor_configuration": semantics["advisor_configuration"],
+        }
+
+    def _apply_memory_operation_surface_policy(self, operation: str) -> dict[str, str]:
+        policy = self._memory_operation_surface_policy(operation)
+        if policy["task_plan_file_focus"] == "cleared":
+            self._clear_workflow_focus_payloads()
+        if policy["symbol_surface"] == "cleared":
+            self._clear_symbol_surface_state()
+        if policy["advisor_review_state"] == "cleared":
+            self._clear_advisor_review_state()
+        return policy
+
+    def _memory_operation_surface_policy_lines(self, operation: str) -> list[str]:
+        semantics = self._memory_operation_semantics(operation)
+        policy = self._memory_operation_surface_policy(operation)
+        return [
+            "memory preservation semantics:",
+            f"- operation: {semantics['operation']}",
+            f"- conversation messages: {semantics['conversation_messages']}",
+            f"- compacted context summary: {semantics['context_summary']}",
+            f"- session identity: {semantics['session_identity']}",
+            f"- history boundaries: {semantics['history_boundaries']}",
+            "workflow surface policy:",
+            f"- task/plan/file focus: {policy['task_plan_file_focus']}",
+            f"- advisor review state: {policy['advisor_review_state']}",
+            f"- symbol surface: {policy['symbol_surface']}",
+            f"- advisor configuration: {policy['advisor_configuration']}",
+        ]
+
+    def _rewindable_boundaries(self) -> list[HistoryBoundary]:
+        return [
+            boundary
+            for boundary in reversed(self.state.history_boundaries)
+            if self._history_boundary_is_rewindable(boundary)
+        ]
+
+    def _resolve_rewind_boundary(self, selector: str) -> tuple[int, HistoryBoundary] | None:
+        raw = selector.strip()
+        if not raw:
+            return None
+        visible = self._rewindable_boundaries()
+        if not visible:
+            return None
+        if raw.isdigit():
+            index = int(raw)
+            if 1 <= index <= len(visible):
+                return index - 1, visible[index - 1]
+            return None
+        matches = [
+            (index, boundary)
+            for index, boundary in enumerate(visible)
+            if boundary.boundary_id.startswith(raw)
+        ]
+        if len(matches) == 1:
+            return matches[0]
+        return None
+
+    def rewind_boundary_preview_payload(self, selector: str = "1") -> dict[str, Any] | None:
+        resolved = self._resolve_rewind_boundary(selector)
+        if resolved is None:
+            return None
+        index, boundary = resolved
+        semantics = self._memory_operation_semantics("rewind")
+        policy = self._memory_operation_surface_policy("rewind")
+        compare_payload = self._history_boundary_compare_payload(boundary)
+        snapshot_messages = len(boundary.snapshot_messages or [])
+        snapshot_summary_chars = len(boundary.snapshot_context_summary or "")
+        return {
+            "selector_index": index + 1,
+            "boundary_id": boundary.boundary_id,
+            "boundary_kind": boundary.kind,
+            "boundary_kind_label": self._history_boundary_kind_label(boundary.kind),
+            "created_at": boundary.created_at,
+            "trigger": boundary.trigger or "unknown",
+            "trigger_reason": boundary.trigger_reason,
+            "summary": boundary.summary or "none",
+            "rewindable": self._history_boundary_is_rewindable(boundary),
+            "message_count_before": boundary.message_count_before,
+            "message_count_after": boundary.message_count_after,
+            "context_summary_chars_before": boundary.context_summary_chars_before,
+            "context_summary_chars_after": boundary.context_summary_chars_after,
+            "snapshot_available": self._history_boundary_snapshot_available(boundary),
+            "snapshot_message_count": snapshot_messages,
+            "snapshot_summary_chars": snapshot_summary_chars,
+            "target_boundary_id": boundary.target_boundary_id,
+            "target_boundary_kind": (
+                self._find_history_boundary_by_id(boundary.target_boundary_id).kind
+                if self._find_history_boundary_by_id(boundary.target_boundary_id) is not None
+                else None
+            ),
+            "target_boundary_kind_label": (
+                self._history_boundary_kind_label(self._find_history_boundary_by_id(boundary.target_boundary_id).kind)
+                if self._find_history_boundary_by_id(boundary.target_boundary_id) is not None
+                else None
+            ),
+            "old_session_id": boundary.old_session_id,
+            "new_session_id": boundary.new_session_id,
+            "lineage_summary": compare_payload["lineage_summary"],
+            "restore_message_delta_current": compare_payload["restore_message_delta_current"],
+            "restore_summary_chars_delta_current": compare_payload["restore_summary_chars_delta_current"],
+            "restore_message_count_current": compare_payload["restore_message_count_current"],
+            "restore_summary_chars_current": compare_payload["restore_summary_chars_current"],
+            "targets_pre_compact_state": compare_payload["targets_pre_compact_state"],
+            "targets_post_resume_state": compare_payload["targets_post_resume_state"],
+            "restore_effect_summary": semantics["summary"],
+            "workflow_surface_policy": dict(policy),
+            "show_action": f"/rewind show {index + 1}",
+            "apply_action": f"/rewind apply {index + 1}",
+        }
+
+    def describe_rewind(self, selector: str = "") -> str:
+        raw = selector.strip()
+        visible = self._rewindable_boundaries()
+        if not raw or raw.lower() == "list":
+            lines = ["rewind boundaries:"]
+            if not visible:
+                lines.append("No rewindable conversation boundaries.")
+            else:
+                for index, boundary in enumerate(visible, start=1):
+                    snapshot_messages = len(boundary.snapshot_messages or [])
+                    snapshot_summary_chars = len(boundary.snapshot_context_summary or "")
+                    lines.append(
+                        f"{index}. {self._render_history_boundary_summary(boundary)} "
+                        f"| boundary_id={boundary.boundary_id} | snapshot_messages={snapshot_messages} "
+                        f"| snapshot_summary_chars={snapshot_summary_chars}"
+                    )
+                lines.extend(
+                    [
+                        "recommended flow:",
+                        "- preview a boundary before applying it",
+                        "next actions:",
+                        "- /rewind show 1",
+                        "- /rewind apply 1",
+                        "- /history messages",
+                    ]
+                )
+            return "\n".join(lines)
+        if raw.lower().startswith("show "):
+            remainder = raw.split(" ", 1)[1].strip()
+            resolved = self._resolve_rewind_boundary(remainder)
+            if resolved is None:
+                return 'No rewind boundary matched that selector.'
+            index, boundary = resolved
+            lines = [
+                *self._history_boundary_preview_lines(boundary, selector_index=index + 1),
+                *self._history_boundary_compare_lines(boundary),
+                *self._history_boundary_restore_effect_lines(boundary),
+                "next actions:",
+                f"- /rewind apply {index + 1}",
+                "- /rewind",
+                "- /history messages",
+            ]
+            return "\n".join(lines)
+        return "Usage: /rewind [list|show <n|boundary-id>|apply <n|boundary-id>]"
+
+    def rewind_to_boundary(self, selector: str) -> str:
+        resolved = self._resolve_rewind_boundary(selector)
+        if resolved is None:
+            return 'No rewind boundary matched that selector.'
+        index, boundary = resolved
+        if not self._history_boundary_is_rewindable(boundary):
+            return f'Boundary "{boundary.boundary_id}" is not rewindable.'
+        current_messages = deepcopy(self.state.messages)
+        current_summary = self.state.context_summary
+        restored_messages = deepcopy(boundary.snapshot_messages or [])
+        restored_summary = boundary.snapshot_context_summary
+        self.state.messages = restored_messages
+        self.state.context_summary = restored_summary
+        self._apply_memory_operation_surface_policy("rewind")
+        rewind_boundary = self._record_history_boundary(
+            HistoryBoundary(
+                kind="rewind",
+                trigger="manual",
+                summary=(
+                    f"Rewound conversation history to {boundary.kind or 'boundary'} "
+                    f"{boundary.boundary_id}."
+                ),
+                message_count_before=len(current_messages),
+                message_count_after=len(restored_messages),
+                context_summary_chars_before=len(current_summary or ""),
+                context_summary_chars_after=len(restored_summary or ""),
+                target_boundary_id=boundary.boundary_id,
+                snapshot_messages=current_messages,
+                snapshot_context_summary=current_summary,
+            )
+        )
+        self._remember_memory_operation("rewind", boundary=rewind_boundary)
+        self.persist_state()
+        return "\n".join(
+            [
+                "conversation rewound:",
+                f"selected boundary: {index + 1}",
+                f"target boundary id: {boundary.boundary_id}",
+                f"target boundary kind: {boundary.kind}",
+                f"restored messages: {len(restored_messages)}",
+                f"restored context summary chars: {len(restored_summary or '')}",
+                f"rewind boundary id: {rewind_boundary.boundary_id}",
+                *self._memory_operation_surface_policy_lines("rewind"),
+                "next actions:",
+                "- /history messages",
+                "- /compact status",
+                "- /status workflow",
+            ]
+        )
+
+    def _history_compaction_event_payload(
+        self,
+        preview: dict[str, Any],
+        *,
+        trigger: str,
+        applied: bool,
+        trigger_reason: str | None = None,
+    ) -> dict[str, Any]:
+        existing_summary_chars = len(self.state.context_summary or "")
+        kept_count = int(preview.get("kept_count", 0) or 0)
+        compacted_count = int(preview.get("compacted_count", 0) or 0)
+        merged_summary_chars = int(preview.get("merged_summary_chars", existing_summary_chars) or 0)
+        replacement_active = int(preview.get("replacement_records_active", 0) or 0)
+        artifact_active = int(preview.get("artifact_records_active", 0) or 0)
+        return {
+            "boundary_kind": "compact",
+            "compaction_trigger": trigger,
+            "compaction_reason": trigger_reason,
+            "compaction_mode": "local_estimated_summary",
+            "applied": applied,
+            "message_count_before": int(preview.get("message_count", 0) or 0),
+            "message_count_after": kept_count,
+            "compacted_count": compacted_count,
+            "kept_count": kept_count,
+            "existing_summary_chars": existing_summary_chars,
+            "merged_summary_chars": merged_summary_chars,
+            "tool_result_replacements": replacement_active,
+            "tool_result_artifacts": artifact_active,
+            "replacement_aware_compaction": "yes" if (replacement_active or artifact_active) else "no",
+            "instructions": str(preview.get("instructions") or "").strip() or None,
+        }
+
     def compact_history_into_context_summary(self, instructions: str | None = None) -> str:
         result = self.apply_history_compaction(persist=True, instructions=instructions)
         history_state = self._history_state_payload(
@@ -2736,6 +5334,9 @@ class Session:
                     *self._history_state_lines(history_state),
                     f"message count: {result['message_count']}",
                     f"keep last threshold: {result['keep_last']}",
+                    f"compact trigger: {result['compaction_trigger']}",
+                    f"boundary kind: {result['boundary_kind']}",
+                    *self._memory_operation_surface_policy_lines("compact"),
                     *self._compact_instruction_lines(result),
                     "next actions:",
                     "- /compact status",
@@ -2750,6 +5351,10 @@ class Session:
                 *self._history_state_lines(history_state),
                 f"compacted messages: {result['compacted_count']}",
                 f"kept messages: {result['kept_count']}",
+                f"compact trigger: {result['compaction_trigger']}",
+                f"boundary kind: {result['boundary_kind']}",
+                f"compacted summary chars after compact: {result['merged_summary_chars']}",
+                *self._memory_operation_surface_policy_lines("compact"),
                 *self._compact_instruction_lines(result),
                 "next actions:",
                 "- /compact status",
@@ -2769,6 +5374,8 @@ class Session:
         *,
         instructions: str | None = None,
     ) -> dict[str, Any]:
+        replacement_surface = self.tool_result_replacement_surface_payload()
+        artifact_surface = self.tool_result_artifact_surface_payload()
         result = build_history_compaction_result(
             HistoryCompactionRequest(
                 messages=list(self.state.messages),
@@ -2776,6 +5383,10 @@ class Session:
                 keep_last=self._history_compaction_keep_last(),
                 max_summary_chars=self.config.max_context_summary_chars,
                 instructions=instructions,
+                replacement_records_seen=int(replacement_surface["replacement_record_count"]),
+                replacement_records_active=int(replacement_surface["replacement_active_count"]),
+                artifact_records_active=int(artifact_surface["artifact_active_count"]),
+                replaced_tool_result_ids=sorted(self._tool_result_replacements),
             ),
             summarize_message=self._summarize_message,
         )
@@ -2794,19 +5405,72 @@ class Session:
         persist: bool,
         sink=None,
         instructions: str | None = None,
+        trigger: str = "manual",
+        trigger_reason: str | None = None,
     ) -> dict[str, Any]:
         preview = self._history_compaction_preview_payload(instructions=instructions)
         result = dict(preview)
-        result["applied"] = False
+        compaction_event = self._history_compaction_event_payload(
+            preview,
+            trigger=trigger,
+            applied=False,
+            trigger_reason=trigger_reason,
+        )
+        result.update(compaction_event)
         if not bool(preview.get("would_compact")):
             return result
+        message_count_before = len(self.state.messages)
+        existing_summary_chars = len(self.state.context_summary or "")
+        previous_messages = deepcopy(self.state.messages)
+        previous_summary = self.state.context_summary
         self.state.messages = list(preview["kept_messages"])
         self.state.context_summary = str(preview["merged_summary"])
+        boundary = self._record_history_boundary(
+            HistoryBoundary(
+                kind="compact",
+                trigger=trigger,
+                trigger_reason=trigger_reason,
+                summary=(
+                    f"Compacted {preview['compacted_count']} messages and kept "
+                    f"{preview['kept_count']} recent messages. "
+                    f"tool-result replacements={preview.get('replacement_records_active', 0)} "
+                    f"tool-result artifacts={preview.get('artifact_records_active', 0)} "
+                    f"replacement-aware={'yes' if preview.get('replacement_aware_compaction') else 'no'}."
+                ),
+                compaction_mode="local_estimated_summary",
+                message_count_before=message_count_before,
+                message_count_after=len(self.state.messages),
+                compacted_count=int(preview["compacted_count"]),
+                kept_count=int(preview["kept_count"]),
+                context_summary_chars_before=existing_summary_chars,
+                context_summary_chars_after=len(self.state.context_summary or ""),
+                instructions=str(preview.get("instructions") or "").strip() or None,
+                snapshot_messages=previous_messages,
+                snapshot_context_summary=previous_summary,
+            )
+        )
+        self._remember_memory_operation("compact", boundary=boundary)
+        result.update(
+            self._history_compaction_event_payload(
+                preview,
+                trigger=trigger,
+                applied=True,
+                trigger_reason=trigger_reason,
+            )
+        )
+        result["boundary_id"] = boundary.boundary_id
         event = RuntimeEvent(
             kind="context_compacted",
             message=(
                 f"compacted {preview['compacted_count']} messages into context_summary; "
                 f"kept last {preview['kept_count']} messages"
+                + (
+                    f"; tool-result replacements={preview.get('replacement_records_active', 0)}"
+                    if int(preview.get("replacement_records_active", 0) or 0) > 0
+                    else ""
+                )
+                + (f"; trigger={trigger}" if trigger and trigger != "manual" else "")
+                + (f"; reason={trigger_reason}" if trigger_reason else "")
                 + (
                     f"; instruction={preview['instructions']}"
                     if preview.get("instructions")
@@ -2820,10 +5484,15 @@ class Session:
             self._emit_runtime_event(event)
         if persist:
             self.persist_state()
-        result["applied"] = True
         return result
 
     def _describe_compact_status(self, preview: dict[str, Any]) -> str:
+        event_payload = self._history_compaction_event_payload(
+            preview,
+            trigger="manual",
+            applied=False,
+        )
+        policy_payload = self.compaction_policy_payload(preview=preview)
         history_state = self._history_state_payload(
             message_count=preview["message_count"],
             context_summary=self.state.context_summary,
@@ -2837,12 +5506,25 @@ class Session:
             f"would compact: {'yes' if preview['would_compact'] else 'no'}",
             f"messages to compact: {preview['compacted_count']}",
             f"messages to keep: {preview['kept_count']}",
+            f"compact trigger: {event_payload['compaction_trigger']}",
+            f"boundary kind: {event_payload['boundary_kind']}",
+            f"existing summary chars: {event_payload['existing_summary_chars']}",
         ]
         if bool(preview["would_compact"]):
             lines.append(
-                f"compacted context summary chars after compact: {preview['merged_summary_chars']}"
+                f"compacted context summary chars after compact: {event_payload['merged_summary_chars']}"
             )
+        lines.extend(render_compaction_policy(policy_payload).splitlines())
+        lines.extend(self._memory_operation_surface_policy_lines("compact"))
         lines.extend(self._compact_instruction_lines(preview))
+        latest_boundary = self._latest_history_boundary(kind="compact")
+        if latest_boundary is not None:
+            lines.extend(
+                [
+                    "last compact boundary:",
+                    "- " + self._render_history_boundary_summary(latest_boundary),
+                ]
+            )
         lines.extend(
             [
                 "next actions:",
@@ -2854,6 +5536,12 @@ class Session:
         return "\n".join(lines)
 
     def _describe_compact_preview(self, preview: dict[str, Any]) -> str:
+        event_payload = self._history_compaction_event_payload(
+            preview,
+            trigger="manual",
+            applied=False,
+        )
+        policy_payload = self.compaction_policy_payload(preview=preview)
         history_state = self._history_state_payload(
             message_count=preview["message_count"],
             context_summary=self.state.context_summary,
@@ -2867,8 +5555,13 @@ class Session:
             f"would compact: {'yes' if preview['would_compact'] else 'no'}",
             f"messages to compact: {preview['compacted_count']}",
             f"messages to keep: {preview['kept_count']}",
-            f"compacted context summary chars after compact: {preview['merged_summary_chars']}",
+            f"compact trigger: {event_payload['compaction_trigger']}",
+            f"boundary kind: {event_payload['boundary_kind']}",
+            f"existing summary chars: {event_payload['existing_summary_chars']}",
+            f"compacted context summary chars after compact: {event_payload['merged_summary_chars']}",
         ]
+        lines.extend(render_compaction_policy(policy_payload).splitlines())
+        lines.extend(self._memory_operation_surface_policy_lines("compact"))
         lines.extend(self._compact_instruction_lines(preview))
         compacted_lines = list(preview["compacted_lines"])
         if compacted_lines:
@@ -2892,113 +5585,15 @@ class Session:
             return []
         return [f"compact instruction: {instructions}"]
 
+    # Change/history workflow surface proxies
     def _history_section_lines(self, *, limit: int = 12) -> dict[str, list[str]]:
-        audit_lines = self._recent_workspace_audit_history_lines()
-        task_history_lines = self._recent_task_activity_lines()
-        visible_messages = self.state.messages[-limit:]
-        history_state = self._history_state_payload(
-            message_count=len(self.state.messages),
-            context_summary=self.state.context_summary,
-        )
-        message_lines: list[str] = []
-        message_lines.extend(self._history_state_lines(history_state, include_summary_preview=True))
-        for index, message in enumerate(visible_messages, start=1):
-            role = message.get("role", "unknown")
-            summary = self._summarize_message(message)
-            message_lines.append(f"{index}. {role}: {summary}")
-        if not visible_messages:
-            if history_state["history_cleared"]:
-                message_lines.append("History has been cleared.")
-            else:
-                message_lines.append("No active messages in current history.")
-        change_lines: list[str] = []
-        undo_text = self.describe_change_stack(limit=min(limit, 5))
-        if undo_text != "No recorded workspace changes.":
-            change_lines.extend(["recent changes:", *undo_text.splitlines()])
-        working_set_text = self.describe_working_set(limit=min(limit, 5))
-        if working_set_text:
-            if change_lines:
-                change_lines.append("")
-            change_lines.extend(working_set_text.splitlines())
-        focused_lines = self._history_focus_summary_lines()
-        if focused_lines:
-            if change_lines:
-                change_lines.append("")
-            change_lines.extend(focused_lines)
-        sections: dict[str, list[str]] = {}
-        if message_lines:
-            sections["messages"] = ["recent messages:", *message_lines]
-        if audit_lines:
-            sections["workspace"] = ["workspace audit:", *audit_lines]
-        if task_history_lines:
-            sections["tasks"] = ["recent task activity:", *task_history_lines]
-        if change_lines:
-            sections["changes"] = change_lines
-        return sections
+        return workflow_history_section_lines(self, limit=limit)
 
     def _history_focus_summary_lines(self) -> list[str]:
-        payload = self._current_context_focus_payload()
-        _files, _bounded_index, focused_item = self._file_context_items_and_index(payload)
-        if focused_item is None:
-            return []
-        path = str(focused_item.get("path") or "").strip()
-        if not path:
-            return []
-        source = str(focused_item.get("source") or "").strip()
-        action_groups = self._file_context_item_action_groups(
-            focused_item,
-            stay_on_surface_actions=[
-                "/history changes",
-                "/files focused",
-                "/diff focused",
-                "/status workflow",
-            ],
-        )
-        return self.render_surface_metadata_section(
-            "focused file context:",
-            summary_fields=[
-                ("focused file", path),
-                ("source", source or None),
-                ("diff hunks", self._file_context_diff_hunk_count(focused_item)),
-            ],
-            action_groups=action_groups,
-            action_order=("go_to_change", "go_to_task", "go_to_plan", "stay_on_surface"),
-        )
+        return workflow_history_focus_summary_lines(self)
 
     def describe_recent_changes(self, limit: int = 5) -> str:
-        changes = self.state.recent_change_sets[-limit:]
-        redos = self.state.undone_change_sets[-limit:]
-        if not changes and not redos:
-            return "No recorded workspace changes."
-        lines = []
-        if changes:
-            lines.extend(
-                self._render_change_stack_lines(
-                    list(reversed(changes)),
-                    title="Undo stack:",
-                    redo=False,
-                )
-            )
-        if redos:
-            if lines:
-                lines.append("")
-            lines.extend(
-                self._render_change_stack_lines(
-                    list(reversed(redos)),
-                    title="Redo stack:",
-                    include_file_preview=False,
-                    redo=True,
-                )
-            )
-        working_set_lines = self._render_file_context_lines(
-            self.working_set_payload(limit=limit),
-            title="Working set",
-        )
-        if working_set_lines:
-            if lines:
-                lines.append("")
-            lines.extend(working_set_lines)
-        return "\n".join(lines)
+        return workflow_describe_recent_changes(self, limit=limit)
 
     def _render_change_stack_lines(
         self,
@@ -3008,49 +5603,16 @@ class Session:
         include_file_preview: bool = True,
         redo: bool = False,
     ) -> list[str]:
-        lines = [title]
-        for index, change in enumerate(changes, start=1):
-            visible_files = self._visible_change_files(change)
-            lines.append(
-                f"{index}. {change.change_id}  tool={change.tool_name}  files={len(visible_files)}  "
-                f"created={change.created_at}  kind={change.change_kind}  "
-                f"undoable={'yes' if change.undoable else 'no'}"
-            )
-            lines.append(f"   summary: {change.summary}")
-            if include_file_preview:
-                for file_change in visible_files[:3]:
-                    lines.append("   - " + self._render_file_change_summary(file_change))
-                if len(visible_files) > 3:
-                    lines.append(f"   - ... {len(visible_files) - 3} more file(s)")
-            lines.extend(
-                "   " + line
-                for line in self._render_action_group_lines(
-                    self._change_stack_entry_action_groups(
-                        selected_index=index - 1,
-                        limit=len(changes),
-                        redo=redo,
-                    ),
-                    line_prefix="- ",
-                    ordered_keys=("go_to_change", "go_to_task", "go_to_plan", "stay_on_surface"),
-                )
-            )
-        return lines
-
-    def describe_change_stack(self, *, redo: bool = False, limit: int = 5) -> str:
-        stack = self._visible_change_stack(redo=redo, limit=limit)
-        if not stack:
-            return (
-                "No undone workspace changes."
-                if redo
-                else "No recorded workspace changes."
-            )
-        lines = self._render_change_stack_lines(
-            stack,
-            title="Redo stack:" if redo else "Undo stack:",
-            include_file_preview=not redo,
+        return workflow_render_change_stack_lines(
+            self,
+            changes,
+            title=title,
+            include_file_preview=include_file_preview,
             redo=redo,
         )
-        return "\n".join(lines)
+
+    def describe_change_stack(self, *, redo: bool = False, limit: int = 5) -> str:
+        return workflow_describe_change_stack(self, redo=redo, limit=limit)
 
     def _visible_change_stack(
         self,
@@ -3058,10 +5620,7 @@ class Session:
         redo: bool = False,
         limit: int | None = None,
     ) -> list[WorkspaceChangeSet]:
-        stack = self.state.undone_change_sets if redo else self.state.recent_change_sets
-        if limit is None:
-            return list(reversed(stack))
-        return list(reversed(stack[-limit:]))
+        return workflow_visible_change_stack(self, redo=redo, limit=limit)
 
     def resolve_change_stack_index(
         self,
@@ -3070,55 +5629,29 @@ class Session:
         redo: bool = False,
         limit: int | None = None,
     ) -> int | None:
-        raw = selector.strip()
-        if not raw:
-            return None
-        visible = self._visible_change_stack(redo=redo, limit=limit)
-        if not visible:
-            return None
-        prefer_index = raw.isdigit() and len(raw) <= 2
-        if prefer_index:
-            selected_index = int(raw)
-            if 1 <= selected_index <= len(visible):
-                return selected_index - 1
-            return None
-        matches = [
-            index
-            for index, change in enumerate(visible)
-            if change.change_id.startswith(raw)
-        ]
-        if len(matches) == 1:
-            return matches[0]
-        return None
+        return workflow_resolve_change_stack_index(
+            self,
+            selector,
+            redo=redo,
+            limit=limit,
+        )
 
     def describe_working_set(self, limit: int = 5) -> str:
-        lines = self._render_file_context_lines(
-            self.working_set_payload(limit=limit),
-            title="Working set",
-        )
-        if not lines:
-            return "\n".join(
-                [
-                    "Working set:",
-                    "- file_count: 0",
-                ]
-            )
-        return "\n".join(lines)
+        return workflow_describe_working_set(self, limit=limit)
 
     def recent_change_entries(self, limit: int = 5) -> list[str]:
-        changes = list(reversed(self.state.recent_change_sets[-limit:]))
-        return [self._render_change_entry(change) for change in changes]
+        return workflow_recent_change_entries(self, limit=limit)
 
     def recent_redo_entries(self, limit: int = 5) -> list[str]:
-        changes = list(reversed(self.state.undone_change_sets[-limit:]))
-        return [self._render_change_entry(change) for change in changes]
+        return workflow_recent_redo_entries(self, limit=limit)
 
     def selected_change_file_count(self, *, index: int = 0, limit: int = 5, redo: bool = False) -> int:
-        visible = self._visible_change_stack(redo=redo, limit=limit)
-        if not visible:
-            return 0
-        selected = visible[max(0, min(index, len(visible) - 1))]
-        return len(self._visible_change_files(selected))
+        return workflow_selected_change_file_count(
+            self,
+            index=index,
+            limit=limit,
+            redo=redo,
+        )
 
     def selected_change_detail(
         self,
@@ -3129,73 +5662,14 @@ class Session:
         redo: bool = False,
         preserve_current_focus: bool = False,
     ) -> str:
-        visible = self._visible_change_stack(redo=redo, limit=limit)
-        if not visible:
-            return "No selected change."
-        selected = visible[max(0, min(index, len(visible) - 1))]
-        counts = self._count_change_actions(selected)
-        visible_files = self._visible_change_files(selected)
-        resolved_file_index = file_index
-        if visible_files and preserve_current_focus:
-            resolved_file_index = self.preferred_selected_change_file_index(
-                index=index,
-                redo=redo,
-                limit=limit,
-                fallback=file_index,
-            )
-        clamped_file_index = max(0, min(resolved_file_index, len(visible_files) - 1)) if visible_files else 0
-        lines = [
-            f"change: {selected.change_id}",
-            f"tool: {selected.tool_name}",
-            f"kind: {selected.change_kind}",
-            f"undoable: {'yes' if selected.undoable else 'no'}",
-            f"files: {len(visible_files)}",
-            (
-                "actions: "
-                f"create={counts['create']} "
-                f"update={counts['update']} "
-                f"delete={counts['delete']} "
-                f"move={counts['move']}"
-            ),
-            f"summary: {selected.summary}",
-        ]
-        if visible_files:
-            lines.append("")
-            lines.append("")
-            lines.append("Files")
-            for current_index, file_change in enumerate(visible_files[:8], start=1):
-                marker = ">" if current_index - 1 == clamped_file_index else " "
-                lines.append(f"{marker} {current_index}. {self._describe_file_change(file_change)}")
-            if len(visible_files) > 8:
-                lines.append(f"  ... {len(visible_files) - 8} more file(s)")
-            focused = visible_files[clamped_file_index]
-            lines.append("")
-            lines.append(f"Focused file ({clamped_file_index + 1}/{len(visible_files)})")
-            lines.append(self._render_file_change_detail(focused))
-            metadata = self.selected_change_detail_metadata(
-                index=index,
-                file_index=clamped_file_index,
-                limit=limit,
-                redo=redo,
-                preserve_current_focus=False,
-            )
-            context_lines = self._render_file_context_lines(
-                metadata,
-                title="Focused file context",
-            )
-            if context_lines:
-                lines.append("")
-                lines.extend(context_lines)
-            lines.append("")
-            lines.extend(
-                self._render_selected_change_next_action_lines(
-                    selected,
-                    focused_path=focused.path,
-                    file_index=clamped_file_index,
-                    redo=redo,
-                )
-            )
-        return "\n".join(lines)
+        return workflow_selected_change_detail(
+            self,
+            index=index,
+            file_index=file_index,
+            limit=limit,
+            redo=redo,
+            preserve_current_focus=preserve_current_focus,
+        )
 
     def _coerce_target_dict(self, target: EditorTarget | dict[str, Any] | None) -> dict[str, Any] | None:
         if isinstance(target, EditorTarget):
@@ -3321,11 +5795,21 @@ class Session:
     ) -> dict[str, int]:
         entry_payloads = entries if entries is not None else self._explicit_context_entries_payloads()
         file_items = files if files is not None else []
-        explicit_file_count = sum(
-            1
-            for item in file_items
-            if isinstance(item, dict) and "explicit context path" in self._file_context_scope_reasons(item)
-        )
+        explicit_only_file_count = 0
+        overlapping_file_count = 0
+        explicit_file_count = 0
+        for item in file_items:
+            if not isinstance(item, dict):
+                continue
+            reasons = self._file_context_scope_reasons(item)
+            has_explicit = "explicit context path" in reasons
+            has_automatic = any(reason != "explicit context path" for reason in reasons)
+            if has_explicit:
+                explicit_file_count += 1
+            if has_explicit and has_automatic:
+                overlapping_file_count += 1
+            elif has_explicit:
+                explicit_only_file_count += 1
         automatic_file_count = 0
         if total_file_count is not None:
             automatic_file_count = max(0, total_file_count - explicit_file_count)
@@ -3335,8 +5819,29 @@ class Session:
                 1 for entry in entry_payloads if not bool(entry.get("resolved", False))
             ),
             "explicit_file_count": explicit_file_count,
+            "explicit_only_file_count": explicit_only_file_count,
+            "overlapping_file_count": overlapping_file_count,
             "automatic_file_count": automatic_file_count,
         }
+
+    def _explicit_context_compare_summary_lines(
+        self,
+        *,
+        entries: list[dict[str, Any]] | None = None,
+        files: list[dict[str, Any]] | None = None,
+        total_file_count: int | None = None,
+    ) -> list[str]:
+        counts = self._explicit_context_summary_counts(
+            entries=entries,
+            files=files,
+            total_file_count=total_file_count,
+        )
+        return [
+            f"explicit-only files: {counts['explicit_only_file_count']}",
+            f"automatic-only files: {counts['automatic_file_count']}",
+            f"overlapping files: {counts['overlapping_file_count']}",
+            f"unresolved explicit entries: {counts['unresolved_entry_count']}",
+        ]
 
     def _explicit_context_file_context_items(self, *, limit: int = 50) -> list[dict[str, Any]]:
         known_items = self._dedupe_file_context_items(
@@ -3434,6 +5939,9 @@ class Session:
             f"entry_count: {counts['entry_count']}",
             f"unresolved entry count: {counts['unresolved_entry_count']}",
             f"explicit-context-contributed files: {counts['explicit_file_count']}",
+            f"explicit-only files: {counts['explicit_only_file_count']}",
+            f"automatic-only files: {counts['automatic_file_count']}",
+            f"overlapping files: {counts['overlapping_file_count']}",
         ]
         if not entries:
             return "\n".join(lines + ["No explicit context entries."])
@@ -3448,7 +5956,9 @@ class Session:
                 "   next_actions: "
                 + "; ".join(
                     [
-                        "go_to_context=/files explicit | /files context",
+                        "inspect_explicit_context=/files explicit | /files context",
+                        "inspect_automatic_context=/files auto",
+                        "cleanup_explicit_context=/add-dir remove <n> | /add-dir clear",
                         "stay_on_surface=/add-dir list | /files context",
                     ]
                 )
@@ -4020,6 +6530,16 @@ class Session:
     def _file_context_scope_reasons(self, item: dict[str, Any]) -> list[str]:
         return [str(reason) for reason in item.get("scope_reasons", []) if str(reason).strip()]
 
+    def _file_context_origin_label(self, item: dict[str, Any]) -> str:
+        reasons = self._file_context_scope_reasons(item)
+        has_explicit = "explicit context path" in reasons
+        has_automatic = any(reason != "explicit context path" for reason in reasons)
+        if has_explicit and has_automatic:
+            return "explicit+automatic"
+        if has_explicit:
+            return "explicit-only"
+        return "automatic-only"
+
     def _file_context_diff_hunk_count(self, target_source: dict[str, Any]) -> int:
         explicit = target_source.get("diff_target_count")
         if explicit not in (None, ""):
@@ -4222,6 +6742,7 @@ class Session:
             "stack_label": "change stack",
         }
 
+    # File-context selection/rendering proxies
     def render_focused_file_context_lines(
         self,
         payload: dict[str, Any] | None,
@@ -4273,6 +6794,24 @@ class Session:
             self,
             item,
             stay_on_surface_actions=stay_on_surface_actions,
+        )
+
+    def _file_surface_action_groups(
+        self,
+        item: dict[str, Any],
+        *,
+        stay_on_surface_actions: list[str],
+        inspect_focused_file_actions: list[str] | None = None,
+        inspect_focused_diff_actions: list[str] | None = None,
+        inspect_explicit_context_actions: list[str] | None = None,
+    ) -> dict[str, list[str]]:
+        return workflow_build_file_surface_action_groups(
+            self,
+            item,
+            stay_on_surface_actions=stay_on_surface_actions,
+            inspect_focused_file_actions=inspect_focused_file_actions,
+            inspect_focused_diff_actions=inspect_focused_diff_actions,
+            inspect_explicit_context_actions=inspect_explicit_context_actions,
         )
 
     def _file_context_context_actions(self, item: dict[str, Any]) -> list[str]:
@@ -4327,50 +6866,11 @@ class Session:
         *,
         filter_label: str,
     ) -> str:
-        files = [item for item in (payload or {}).get("file_context_files", []) if isinstance(item, dict)]
-        lines = [
-            "working set files:",
-            f"filter: {filter_label}",
-            f"file_count: {len(files)}",
-        ]
-        if not files:
-            return "\n".join(lines + ["No matching working-set files."])
-        for index, item in enumerate(files, start=1):
-            lines.append("")
-            lines.append(f"{index}. {item['path']}")
-            scope_reasons = self._file_context_scope_reasons(item)
-            if scope_reasons:
-                lines.append("- in scope because: " + ", ".join(scope_reasons))
-            related_change = str(item.get("change_id") or "").strip()
-            change_navigation = self._resolve_change_navigation_for_file_context_item(item)
-            if related_change:
-                if change_navigation is not None:
-                    lines.append(f"- related change: {related_change} ({change_navigation['stack_label']})")
-                else:
-                    lines.append(f"- related change: {related_change}")
-            else:
-                lines.append("- related change: none")
-            lines.append(f"- diff hunks: {self._file_context_diff_hunk_count(item)}")
-            lines.append("- context-only: " + ("yes" if self._file_context_is_context_only(item) else "no"))
-            primary_target = item.get("target")
-            if isinstance(primary_target, dict):
-                lines.append("- primary target: " + self._format_target_summary(primary_target))
-            else:
-                lines.append("- primary target: none")
-            secondary_target = self._file_context_secondary_target(item)
-            if isinstance(secondary_target, dict):
-                lines.append("- secondary target: " + self._format_target_summary(secondary_target))
-            else:
-                lines.append("- secondary target: none")
-            lines.extend(
-                self._render_file_context_action_group_lines(
-                    item,
-                    stay_on_surface_actions=self._context_stay_on_surface_actions(),
-                    line_prefix="- ",
-                    ordered_keys=("go_to_change", "go_to_task", "go_to_plan", "stay_on_surface"),
-                )
-            )
-        return "\n".join(lines)
+        return workflow_render_context_inventory_text(
+            self,
+            payload,
+            filter_label=filter_label,
+        )
 
     def _file_context_item_matches_path(
         self,
@@ -4880,6 +7380,50 @@ class Session:
             ordered_keys=ordered_keys,
         )
 
+    def _render_file_surface_action_group_lines(
+        self,
+        item: dict[str, Any],
+        *,
+        stay_on_surface_actions: list[str],
+        inspect_focused_file_actions: list[str] | None = None,
+        inspect_focused_diff_actions: list[str] | None = None,
+        inspect_explicit_context_actions: list[str] | None = None,
+        heading: str = "next_actions:",
+        line_prefix: str = "- ",
+        ordered_keys: tuple[str, ...] | None = None,
+    ) -> list[str]:
+        return workflow_render_file_surface_action_group_lines(
+            self,
+            item,
+            stay_on_surface_actions=stay_on_surface_actions,
+            inspect_focused_file_actions=inspect_focused_file_actions,
+            inspect_focused_diff_actions=inspect_focused_diff_actions,
+            inspect_explicit_context_actions=inspect_explicit_context_actions,
+            heading=heading,
+            line_prefix=line_prefix,
+            ordered_keys=ordered_keys,
+        )
+
+    def _render_file_surface_action_group_summary(
+        self,
+        item: dict[str, Any],
+        *,
+        stay_on_surface_actions: list[str],
+        inspect_focused_file_actions: list[str] | None = None,
+        inspect_focused_diff_actions: list[str] | None = None,
+        inspect_explicit_context_actions: list[str] | None = None,
+        ordered_keys: tuple[str, ...] | None = None,
+    ) -> str:
+        return workflow_render_file_surface_action_group_summary(
+            self,
+            item,
+            stay_on_surface_actions=stay_on_surface_actions,
+            inspect_focused_file_actions=inspect_focused_file_actions,
+            inspect_focused_diff_actions=inspect_focused_diff_actions,
+            inspect_explicit_context_actions=inspect_explicit_context_actions,
+            ordered_keys=ordered_keys,
+        )
+
     def render_resolved_file_context_sections(
         self,
         context_selection: dict[str, Any] | None,
@@ -4902,24 +7446,13 @@ class Session:
         file_index: int,
         redo: bool,
     ) -> list[str]:
-        selector = selected.change_id[:8]
-        command_prefix = "/changes show redo " if redo else "/changes show "
-        base_command = f"{command_prefix}{selector}"
-        stay_actions = self._dedupe_action_commands(
-            [base_command, f"{base_command} file {file_index + 1}", "/changes working-set"]
+        return workflow_render_selected_change_next_action_lines(
+            self,
+            selected,
+            focused_path=focused_path,
+            file_index=file_index,
+            redo=redo,
         )
-        task_actions = self._related_task_commands_for_change_path(focused_path)
-        plan_actions = self._related_plan_commands_for_change_path(focused_path)
-        return [
-            *self._render_action_group_lines(
-                {
-                    "go_to_task": task_actions,
-                    "go_to_plan": plan_actions,
-                    "stay_on_surface": stay_actions,
-                },
-                ordered_keys=("go_to_task", "go_to_plan", "stay_on_surface"),
-            )
-        ]
 
     def _change_stack_entry_action_groups(
         self,
@@ -4928,73 +7461,16 @@ class Session:
         limit: int,
         redo: bool,
     ) -> dict[str, list[str]]:
-        visible = self._visible_change_stack(redo=redo, limit=limit)
-        if not visible:
-            return {
-                "go_to_change": [],
-                "go_to_task": [],
-                "go_to_plan": [],
-                "stay_on_surface": [],
-            }
-        bounded_index = max(0, min(selected_index, len(visible) - 1))
-        selected = visible[bounded_index]
-        selector = selected.change_id[:8]
-        command_prefix = "/changes show redo " if redo else "/changes show "
-        base_command = f"{command_prefix}{selector}"
-        payload = self.selected_change_detail_metadata(
-            index=bounded_index,
+        return workflow_change_stack_entry_action_groups(
+            self,
+            selected_index=selected_index,
             limit=limit,
             redo=redo,
-            preserve_current_focus=True,
-        )
-        _files, focused_index, focused_item = self._file_context_items_and_index(payload)
-        stay_actions = [base_command, "/changes list", "/changes working-set"]
-        if focused_item is None:
-            return {
-                "go_to_change": [base_command],
-                "go_to_task": [],
-                "go_to_plan": [],
-                "stay_on_surface": self._dedupe_action_commands(stay_actions),
-            }
-        stay_actions.insert(1, f"{base_command} file {focused_index + 1}")
-        return self._file_context_item_action_groups(
-            focused_item,
-            stay_on_surface_actions=stay_actions,
         )
 
+    # Summary surface proxies
     def describe_provider(self, *, section: str = "summary") -> str:
-        if section not in {"summary", "capabilities", "advisor"}:
-            return "Usage: /model [summary|capabilities|advisor]"
-        capabilities = getattr(self.provider, "capabilities", None)
-        if capabilities is None:
-            capability_text = (
-                f"provider: {self.config.provider}\n"
-                f"model: {self.config.model}\n"
-                "notes: provider does not declare capabilities"
-            )
-        else:
-            capability_text = format_capabilities(capabilities)
-        if section == "capabilities":
-            return capability_text
-        if section == "advisor":
-            advisor_model = self.state.advisor_model or self.config.model
-            relationship = (
-                "shared-runtime-model"
-                if not self.state.advisor_model or self.state.advisor_model == self.config.model
-                else "separate-advisor-model"
-            )
-            return "\n".join(
-                [
-                    "current session:",
-                    f"provider: {self.config.provider}",
-                    f"runtime model: {self.config.model}",
-                    f"advisor_model: {advisor_model}",
-                    f"advisor_mode: {self.state.advisor_mode}",
-                    f"advisor_relationship: {relationship}",
-                    "active_plan: " + ("yes" if self.active_planning_artifact() is not None else "no"),
-                ]
-            )
-        return capability_text
+        return workflow_describe_provider(self, section=section)
 
     def describe_project_context(self, *, section: str = "summary") -> str:
         if section not in {"summary", "memory", "skills", "plugins", "reload-status"}:
@@ -5010,7 +7486,7 @@ class Session:
         return self._describe_project_context_summary()
 
     def _describe_project_context_summary(self) -> str:
-        skill_groups = self._loaded_skill_groups()
+        skill_surface = self._loaded_skill_registry_payload()
         plugins = self.plugin_registry.list_plugins()
         diagnostics = self.plugin_registry.list_diagnostics()
         enabled_plugins = self.plugin_registry.enabled_plugins(self.state)
@@ -5019,10 +7495,7 @@ class Session:
             "project memory: " + ("loaded" if self.project_context.memory_content else "none"),
             "memory path: "
             + (str(self.project_context.memory_path) if self.project_context.memory_path is not None else "none"),
-            f"loaded skills: {len(self.project_context.skills)}",
-            f"active auto-enabled skills: {len(skill_groups['active_auto'])}",
-            f"active manually enabled skills: {len(skill_groups['active_manual'])}",
-            f"inactive loaded skills: {len(skill_groups['inactive'])}",
+            *self._skill_registry_summary_lines(skill_surface),
             f"plugins enabled: {len(enabled_plugins)}",
             f"plugins registered: {len(plugins)}",
             f"plugin diagnostics: {len(diagnostics)}",
@@ -5030,16 +7503,7 @@ class Session:
         latest_reload = self._last_project_context_reload_summary_line()
         if latest_reload:
             lines.append(latest_reload)
-        lines.extend(
-            [
-                "next_actions:",
-                "- /project-context memory",
-                "- /project-context skills",
-                "- /project-context plugins",
-                "- /memory",
-                "- /context",
-            ]
-        )
+        lines.extend(self._skill_registry_next_actions(project_context_summary=True))
         return "\n".join(lines)
 
     def describe_project_memory(self) -> str:
@@ -5077,6 +7541,288 @@ class Session:
             return ["enabled", "auto"]
         return ["inactive"]
 
+    def _loaded_skill_source_payload(self, skill) -> dict[str, str]:
+        if getattr(skill, "source", None) == "project-local":
+            return {
+                "source": "project-local",
+                "source_label": "project-local",
+                "source_owner": "workspace",
+            }
+        if getattr(skill, "source", None) == "plugin":
+            owner = str(getattr(skill, "source_owner", "") or "unknown")
+            return {
+                "source": "plugin",
+                "source_label": f"plugin-contributed ({owner})",
+                "source_owner": owner,
+            }
+        return {
+            "source": "builtin",
+            "source_label": "builtin",
+            "source_owner": str(getattr(skill, "source_owner", "") or "runtime"),
+        }
+
+    def _loaded_skill_manual_override_state(self, skill) -> str:
+        if skill.name in set(self.state.enabled_skill_names):
+            return "manual-enabled"
+        if skill.name in set(self.state.disabled_skill_names):
+            return "manual-disabled"
+        return "inherited"
+
+    def _loaded_skill_payload(self, skill) -> dict[str, Any]:
+        source_payload = self._loaded_skill_source_payload(skill)
+        status_parts = self._loaded_skill_status_parts(skill)
+        if status_parts == ["disabled"]:
+            status = "disabled"
+        elif status_parts == ["inactive"]:
+            status = "inactive"
+        else:
+            status = "enabled"
+        return {
+            "name": skill.name,
+            "path": str(skill.path),
+            "description": skill.description,
+            "tags": list(skill.tags),
+            "tags_summary": ",".join(skill.tags) if skill.tags else "none",
+            "content_preview": compact_multiline_text(skill.content, max_lines=2, max_chars=140),
+            "status": status,
+            "status_parts": list(status_parts),
+            "source": source_payload["source"],
+            "source_label": source_payload["source_label"],
+            "source_owner": source_payload["source_owner"],
+            "auto_enable_state": "auto-enabled" if skill.auto_enable else "manual-only",
+            "manual_override_state": self._loaded_skill_manual_override_state(skill),
+        }
+
+    def _loaded_skill_registry_payload(self) -> dict[str, Any]:
+        groups = self._loaded_skill_groups()
+        entries = [self._loaded_skill_payload(skill) for skill in self.project_context.skills]
+        diagnostics = list(getattr(self.project_context, "skill_diagnostics", []))
+        reload_state = self._skill_reload_state_payload()
+        project_local_count = sum(1 for item in entries if item["source"] == "project-local")
+        plugin_contributed_count = sum(1 for item in entries if item["source"] == "plugin")
+        builtin_count = sum(1 for item in entries if item["source"] == "builtin")
+        enabled_count = sum(1 for item in entries if item["status"] == "enabled")
+        disabled_count = sum(1 for item in entries if item["status"] == "disabled")
+        inactive_count = sum(1 for item in entries if item["status"] == "inactive")
+        auto_enabled_names = [skill.name for skill in groups["active_auto"]]
+        manually_enabled_names = [skill.name for skill in groups["active_manual"]]
+        inactive_names = [skill.name for skill in groups["inactive"]]
+        return {
+            "skill_registry_summary": (
+                f"registered={len(entries)} enabled={enabled_count} "
+                f"inactive={inactive_count + disabled_count} diagnostics={len(diagnostics)}"
+            ),
+            "skill_registry_count": len(entries),
+            "skill_enabled_count": enabled_count,
+            "skill_disabled_count": disabled_count,
+            "skill_inactive_count": inactive_count,
+            "skill_diagnostic_count": len(diagnostics),
+            "skill_auto_enabled_count": len(groups["active_auto"]),
+            "skill_manual_enabled_count": len(groups["active_manual"]),
+            "skill_manual_disabled_count": len(
+                [
+                    entry
+                    for entry in entries
+                    if entry["manual_override_state"] == "manual-disabled"
+                ]
+            ),
+            "skill_prompt_composition_summary": (
+                f"auto_enabled={len(auto_enabled_names)} "
+                f"manual_enabled={len(manually_enabled_names)} "
+                f"inactive={len(inactive_names)}"
+            ),
+            "skill_project_local_count": project_local_count,
+            "skill_plugin_contributed_count": plugin_contributed_count,
+            "skill_builtin_count": builtin_count,
+            "skill_auto_enabled_names": auto_enabled_names,
+            "skill_manual_enabled_names": manually_enabled_names,
+            "skill_inactive_names": inactive_names,
+            "skill_entries": entries,
+            "skill_diagnostics": [
+                {
+                    "name": diagnostic.name,
+                    "source": diagnostic.source,
+                    "source_label": (
+                        f"plugin-contributed ({diagnostic.source_owner})"
+                        if diagnostic.source == "plugin"
+                        else diagnostic.source
+                    ),
+                    "source_owner": diagnostic.source_owner,
+                    "path": str(diagnostic.path),
+                    "error": diagnostic.error,
+                }
+                for diagnostic in diagnostics
+            ],
+            "skill_reload_state": reload_state["summary"],
+            "skill_reload_state_payload": reload_state,
+        }
+
+    def _skill_registry_summary_lines(
+        self,
+        payload: dict[str, Any],
+        *,
+        include_source_counts: bool = False,
+        include_prompt_lists: bool = False,
+    ) -> list[str]:
+        lines = [
+            f"skill registry: {payload['skill_registry_summary']}",
+            "manual skill overrides: "
+            + (
+                f"enabled={payload['skill_manual_enabled_count']} "
+                f"disabled={payload['skill_manual_disabled_count']}"
+            ),
+            f"skill prompt composition: {payload['skill_prompt_composition_summary']}",
+            f"skill reload state: {payload['skill_reload_state']}",
+            f"skill diagnostics: {payload['skill_diagnostic_count']}",
+        ]
+        if include_source_counts:
+            lines.insert(
+                1,
+                "skill sources: "
+                + (
+                    f"project_local={payload['skill_project_local_count']} "
+                    f"plugin_contributed={payload['skill_plugin_contributed_count']} "
+                    f"builtin={payload['skill_builtin_count']}"
+                ),
+            )
+        if include_prompt_lists:
+            lines.extend(
+                [
+                    "prompt-active auto-enabled skills: "
+                    + (
+                        ", ".join(payload["skill_auto_enabled_names"])
+                        if payload["skill_auto_enabled_names"]
+                        else "none"
+                    ),
+                    "prompt-active manually enabled skills: "
+                    + (
+                        ", ".join(payload["skill_manual_enabled_names"])
+                        if payload["skill_manual_enabled_names"]
+                        else "none"
+                    ),
+                    "loaded inactive skills: "
+                    + (
+                        ", ".join(payload["skill_inactive_names"])
+                        if payload["skill_inactive_names"]
+                        else "none"
+                    ),
+                ]
+            )
+        return lines
+
+    def _skill_diagnostic_lines(self, payload: dict[str, Any]) -> list[str]:
+        diagnostics = payload.get("skill_diagnostics")
+        if not isinstance(diagnostics, list) or not diagnostics:
+            return ["- none"]
+        lines: list[str] = []
+        for diagnostic in diagnostics:
+            if not isinstance(diagnostic, dict):
+                continue
+            lines.append(
+                f"{diagnostic['name']}: skill_status=invalid skill_source={diagnostic['source_label']} "
+                f"path={diagnostic['path']} error={diagnostic['error']}"
+            )
+        return lines or ["- none"]
+
+    def _skill_registry_next_actions(self, *, project_context_summary: bool = False) -> list[str]:
+        if project_context_summary:
+            return [
+                "next_actions:",
+                "- /project-context memory",
+                "- /project-context skills",
+                "- /project-context plugins",
+                "- /memory",
+                "- /context",
+            ]
+        return [
+            "next_actions:",
+            "- /project-context skills",
+            "- /skills-reload",
+            "- /project-context reload-status",
+        ]
+
+    def skills_surface_payload(self) -> dict[str, Any]:
+        payload = self._loaded_skill_registry_payload()
+        selected_skill_name = (
+            next(
+                (
+                    item["name"]
+                    for item in payload["skill_entries"]
+                    if item.get("status") == "enabled"
+                ),
+                None,
+            )
+            or (payload["skill_entries"][0]["name"] if payload["skill_entries"] else None)
+        )
+        selected_skill = next(
+            (
+                item
+                for item in payload["skill_entries"]
+                if item.get("name") == selected_skill_name
+            ),
+            None,
+        )
+        skill_entries = []
+        for item in payload["skill_entries"]:
+            next_actions = [
+                self._skill_toggle_command(str(item["name"])),
+                "/project-context skills",
+                "/project-context reload-status",
+            ]
+            if item.get("source") == "plugin":
+                owner = str(item.get("source_owner") or "").strip()
+                if owner:
+                    next_actions.insert(1, f"/plugin show {owner}")
+            skill_entries.append({**item, "next_actions": next_actions})
+        return {
+            "skill_registry_summary": payload["skill_registry_summary"],
+            "skill_registry_count": payload["skill_registry_count"],
+            "skill_enabled_count": payload["skill_enabled_count"],
+            "skill_disabled_count": payload["skill_disabled_count"],
+            "skill_inactive_count": payload["skill_inactive_count"],
+            "skill_diagnostic_count": payload["skill_diagnostic_count"],
+            "skill_auto_enabled_count": payload["skill_auto_enabled_count"],
+            "skill_manual_enabled_count": payload["skill_manual_enabled_count"],
+            "skill_manual_disabled_count": payload["skill_manual_disabled_count"],
+            "skill_prompt_composition_summary": payload["skill_prompt_composition_summary"],
+            "skill_auto_enabled_names": list(payload["skill_auto_enabled_names"]),
+            "skill_manual_enabled_names": list(payload["skill_manual_enabled_names"]),
+            "skill_inactive_names": list(payload["skill_inactive_names"]),
+            "skill_project_local_count": payload["skill_project_local_count"],
+            "skill_plugin_contributed_count": payload["skill_plugin_contributed_count"],
+            "skill_builtin_count": payload["skill_builtin_count"],
+            "skill_entries": skill_entries,
+            "skill_diagnostics": list(payload["skill_diagnostics"]),
+            "skill_selected_name": selected_skill_name,
+            "skill_selected_summary": (
+                f"{selected_skill_name} ({selected_skill.get('source_label')}, {selected_skill.get('auto_enable_state')})"
+                if isinstance(selected_skill, dict) and selected_skill_name
+                else "none"
+            ),
+            "skill_reload_state": dict(payload["skill_reload_state_payload"]),
+            "skill_action_groups": {
+                "inspect_skill_registry": ["/skills"],
+                "inspect_project_context_skills": ["/project-context skills"],
+                "inspect_skill_reload_state": ["/project-context reload-status", "/skills-reload"],
+                "inspect_selected_skill": (
+                    ["/project-context skills"] if selected_skill_name else []
+                ),
+                "toggle_selected_skill": (
+                    [self._skill_toggle_command(selected_skill_name)] if selected_skill_name else []
+                ),
+            },
+        }
+
+    def _skill_toggle_command(self, skill_name: str) -> str:
+        known_skill_names = {skill.name for skill in self.project_context.skills}
+        if skill_name in known_skill_names and skill_name not in set(self.state.disabled_skill_names):
+            if skill_name in set(self.state.enabled_skill_names):
+                return f"/skills-disable {skill_name}"
+            skill = next((item for item in self.project_context.skills if item.name == skill_name), None)
+            if skill is not None and skill.auto_enable:
+                return f"/skills-disable {skill_name}"
+        return f"/skills-enable {skill_name}"
+
     def _loaded_skill_groups(self) -> dict[str, list[Any]]:
         groups: dict[str, list[Any]] = {
             "active_auto": [],
@@ -5094,48 +7840,232 @@ class Session:
         return groups
 
     def _render_loaded_skill_lines(self, skill) -> list[str]:
-        status = ",".join(self._loaded_skill_status_parts(skill))
-        preview = compact_multiline_text(skill.content, max_lines=2, max_chars=140)
-        description = f" description={skill.description}" if skill.description else ""
-        tags = f" tags={','.join(skill.tags)}" if skill.tags else ""
-        if "disabled" in status:
+        payload = self._loaded_skill_payload(skill)
+        if payload["status"] == "disabled":
             toggle_command = f"/skills-enable {skill.name}"
         else:
             toggle_command = f"/skills-disable {skill.name}"
+        next_actions = [toggle_command, "/project-context skills", "/context-refresh"]
+        if str(payload["source"]).startswith("plugin:"):
+            source_owner = str(payload["source_owner"])
+            next_actions.insert(1, f"/plugin show {source_owner}")
         return [
-            f"- {skill.name}: status={status} path={skill.path}{description}{tags} content={preview}",
+            f"- {payload['name']}: "
+            f"skill_status={payload['status']} "
+            f"skill_source={payload['source_label']} "
+            f"skill_auto_enable_state={payload['auto_enable_state']} "
+            f"manual_override={payload['manual_override_state']} "
+            f"skill_tags={payload['tags_summary']} "
+            f"path={payload['path']} "
+            + (f"description={payload['description']} " if payload["description"] else "")
+            + f"content={payload['content_preview']}",
             "  next_actions: "
-            + " | ".join([toggle_command, "/project-context skills", "/context-refresh"]),
+            + " | ".join(next_actions),
         ]
 
     def describe_loaded_skills(self) -> str:
-        groups = self._loaded_skill_groups()
-        lines = ["loaded skills:"]
+        payload = self._loaded_skill_registry_payload()
+        lines = ["skill registry:"]
         if not self.project_context.skills:
             lines.extend(
                 [
-                    "No project skills loaded.",
+                    "No skills registered.",
+                    "skill diagnostics:",
+                    "- none",
                     "next_actions:",
                     "- /project-context",
                     "- /context-refresh",
                 ]
             )
             return "\n".join(lines)
-        sections = (
-            ("active auto-enabled skills", groups["active_auto"]),
-            ("active manually enabled skills", groups["active_manual"]),
-            ("inactive loaded skills", groups["inactive"]),
+        lines.extend(
+            self._skill_registry_summary_lines(
+                payload,
+                include_source_counts=True,
+                include_prompt_lists=True,
+            )
         )
-        for label, skills in sections:
-            lines.append(f"{label}:")
-            if not skills:
-                lines.append("- none")
-                continue
-            for skill in skills:
-                lines.extend(self._render_loaded_skill_lines(skill))
+        lines.append("skill diagnostics:")
+        lines.extend(self._skill_diagnostic_lines(payload))
+        lines.append("registered skills:")
+        for skill in self.project_context.skills:
+            lines.extend(self._render_loaded_skill_lines(skill))
+        lines.extend(self._skill_registry_next_actions())
+        return "\n".join(lines)
+
+    def agent_definition_payloads(self) -> list[dict[str, str]]:
+        return [
+            self._resolved_agent_definition_payload(definition)
+            for definition in self.agent_registry.list_effective_definitions()
+        ]
+
+    def _builtin_agent_definition(self, name: str) -> AgentDefinition | None:
+        return self._session_factory.agent_registry.get_definition(name)
+
+    def _resolved_agent_definition_payload(self, definition: AgentDefinition) -> dict[str, str]:
+        base_definition = self._builtin_agent_definition(definition.based_on) if definition.based_on else None
+        builtin_shadow_target = self._builtin_agent_definition(definition.name) if definition.source == "project-local" else None
+        inherited_policy = self.state.session_command_policy_name or "inherit-session"
+        active_skills = list(self.active_skills())
+        memory_loaded = "yes" if bool(self.project_context.memory_content) else "no"
+        manual_enabled_count = len(self.state.enabled_skill_names)
+        execution = definition.execution or (base_definition.execution if base_definition is not None else None) or "foreground"
+        model_override = definition.model_override or (base_definition.model_override if base_definition is not None else None)
+        tool_policy = definition.tool_policy or (base_definition.tool_policy if base_definition is not None else None)
+        project_memory = definition.project_memory or (base_definition.project_memory if base_definition is not None else "inherit")
+        skills_mode = definition.skills_mode or (base_definition.skills_mode if base_definition is not None else "inherit")
+        enabled_skill_names = (
+            list(definition.enabled_skills)
+            if definition.enabled_skills
+            else list(base_definition.enabled_skills) if base_definition is not None and base_definition.enabled_skills else []
+        )
+        if definition.source == "project-local" and builtin_shadow_target is not None:
+            override_state = "override"
+        elif definition.source == "project-local":
+            override_state = "added"
+        else:
+            override_state = "base"
+        if project_memory == "disable":
+            memory_summary = "project_memory=disabled sharing=none"
+        else:
+            sharing_mode = "snapshot" if execution == "background-session+snapshot" else "session"
+            writes_blocked = " writes=blocked" if (tool_policy or inherited_policy) == "read-only-subagent" else ""
+            memory_summary = f"project_memory={memory_loaded} sharing={sharing_mode}{writes_blocked}"
+        if skills_mode == "explicit":
+            skills_summary = "mode=explicit enabled=" + (", ".join(enabled_skill_names) if enabled_skill_names else "none")
+        else:
+            skills_summary = f"mode=inherit enabled={len(active_skills)} manual_enabled={manual_enabled_count}"
+        return {
+            "name": definition.name,
+            "source": definition.source,
+            "effective": "yes",
+            "override_state": override_state,
+            "based_on": definition.based_on or "none",
+            "execution": execution,
+            "model_override": model_override or f"inherit-session ({self.config.model})",
+            "tool_policy": tool_policy or inherited_policy,
+            "memory_summary": memory_summary,
+            "skills_summary": skills_summary,
+            "notes": definition.notes or (base_definition.notes if base_definition is not None else "") or "none",
+        }
+
+    def agent_definition_diagnostic_payloads(self) -> list[dict[str, str]]:
+        return [
+            {
+                "name": diagnostic.name,
+                "source": diagnostic.source,
+                "path": str(diagnostic.path),
+                "error": diagnostic.error,
+            }
+            for diagnostic in self.agent_registry.list_diagnostics()
+        ]
+
+    def agent_definition_source_summary_payloads(self) -> list[dict[str, str]]:
+        grouped: dict[str, dict[str, Any]] = {}
+        for source in self.agent_registry.source_names():
+            grouped[source] = {
+                "source": source,
+                "definition_count": 0,
+                "effective_count": 0,
+                "shadowed_count": 0,
+                "source_root": self.agent_registry.get_source_root(source),
+            }
+        for payload in self.agent_definition_payloads():
+            bucket = grouped[payload["source"]]
+            bucket["definition_count"] += 1
+            bucket["effective_count"] += 1
+        for shadowed in self.agent_registry.list_shadowed_definitions():
+            bucket = grouped.setdefault(
+                shadowed.source,
+                {
+                    "source": shadowed.source,
+                    "definition_count": 0,
+                    "effective_count": 0,
+                    "shadowed_count": 0,
+                    "source_root": self.agent_registry.get_source_root(shadowed.source),
+                },
+            )
+            bucket["definition_count"] += 1
+            bucket["shadowed_count"] += 1
+        source_order = {"project-local": 0, "builtin": 1}
+        rendered: list[dict[str, str]] = []
+        for source in sorted(grouped, key=lambda item: (source_order.get(item, 99), item)):
+            bucket = grouped[source]
+            rendered.append(
+                {
+                    "source": source,
+                    "definition_count": str(bucket["definition_count"]),
+                    "effective_count": str(bucket["effective_count"]),
+                    "shadowed_count": str(bucket["shadowed_count"]),
+                    "source_root": str(bucket["source_root"]) if bucket["source_root"] is not None else source,
+                }
+            )
+        return rendered
+
+    def describe_agents(self) -> str:
+        lines = ["agent definitions:"]
+        payloads = self.agent_definition_payloads()
+        if not payloads:
+            lines.extend(
+                [
+                    "No agent definitions available.",
+                    "next_actions:",
+                    "- /tasks",
+                    "- /project-context",
+                ]
+            )
+            return "\n".join(lines)
+        lines.append("source summary:")
+        for source_payload in self.agent_definition_source_summary_payloads():
+            lines.append(
+                f"- {source_payload['source']}: definitions={source_payload['definition_count']} "
+                f"effective={source_payload['effective_count']} shadowed={source_payload['shadowed_count']} "
+                f"root={source_payload['source_root']}"
+            )
+        lines.append("effective definitions:")
+        for payload in payloads:
+            lines.append(
+                f"- {payload['name']}: source={payload['source']} effective={payload['effective']} "
+                f"override_state={payload['override_state']} based_on={payload['based_on']} "
+                f"execution={payload['execution']} model_override={payload['model_override']} tool_policy={payload['tool_policy']} "
+                f"memory={payload['memory_summary']} skills={payload['skills_summary']} "
+                f"notes={payload['notes']}"
+            )
+        lines.append("diagnostics:")
+        diagnostics = self.agent_definition_diagnostic_payloads()
+        if diagnostics:
+            for diagnostic in diagnostics:
+                lines.append(
+                    f"- {diagnostic['name']}: source={diagnostic['source']} path={diagnostic['path']} "
+                    f"error={diagnostic['error']}"
+                )
+        else:
+            lines.append("- none")
+        lines.extend(
+            [
+                "resolution:",
+                "- source_order: project-local > builtin",
+                "- shadowing_policy: same-name project-local replaces builtin",
+                "- skills_resolution: inherit or explicit list",
+                "- memory_resolution: inherit or disable",
+                "- model_resolution: definitions inherit the active session model unless explicitly overridden",
+            ]
+        )
+        lines.extend(
+            [
+                "next_actions:",
+                "- /tasks",
+                "- /task show <id>",
+                "- /project-context",
+                "- /config",
+                "- /model",
+            ]
+        )
         return "\n".join(lines)
 
     def _plugin_contribution_labels(self, plugin: Any) -> list[str]:
+        if hasattr(plugin, "contribution_types"):
+            return list(plugin.contribution_types())
         labels: list[str] = []
         if plugin.commands:
             labels.append("commands")
@@ -5147,42 +8077,148 @@ class Session:
             labels.append("hooks/config-only")
         return labels
 
+    def _plugin_source_label(self, source: str) -> str:
+        return "project-local external" if source == "external" else source
+
+    def _plugin_reload_state_payload(self) -> dict[str, Any]:
+        status = self._last_project_context_reload if isinstance(self._last_project_context_reload, dict) else {}
+        error = str(status.get("error") or "").strip()
+        return {
+            "timestamp": str(status.get("timestamp") or "unknown"),
+            "plugin_state_changed": bool(status.get("plugin_state_changed")),
+            "plugin_registry_changed": bool(status.get("plugin_registry_changed")),
+            "enabled_plugin_set_changed": bool(status.get("enabled_plugin_set_changed")),
+            "plugin_diagnostics_changed": bool(status.get("plugin_diagnostics_changed")),
+            "plugin_contributions_changed": bool(status.get("plugin_contributions_changed")),
+            "error": error or None,
+            "summary": self._last_project_context_reload_summary_line() or "latest reload: none",
+        }
+
+    def plugin_surface_payload(self) -> dict[str, Any]:
+        plugins = self.plugin_registry.list_plugins()
+        diagnostics = self.plugin_registry.list_diagnostics()
+        summary = self.plugin_registry.registry_summary_payload(self.state)
+        plugin_entries = [
+            {
+                **self.plugin_registry.plugin_entry_payload(plugin, self.state),
+                "next_actions": [
+                    f"/plugin show {plugin.name}",
+                    self._plugin_toggle_command(plugin.name),
+                    "/project-context plugins",
+                ],
+            }
+            for plugin in plugins
+        ]
+        diagnostic_entries = [
+            {
+                **self.plugin_registry.diagnostic_entry_payload(diagnostic),
+                "next_actions": ["/project-context plugins", "/context-refresh"],
+            }
+            for diagnostic in diagnostics
+        ]
+        selected_plugin_name = (
+            next(
+                (
+                    plugin["name"]
+                    for plugin in plugin_entries
+                    if plugin.get("status") == "enabled"
+                ),
+                None,
+            )
+            or (plugin_entries[0]["name"] if plugin_entries else None)
+        )
+        selected_plugin = next(
+            (plugin for plugin in plugin_entries if plugin.get("name") == selected_plugin_name),
+            None,
+        )
+        reload_state = self._plugin_reload_state_payload()
+        return {
+            "plugin_registry_summary": (
+                f"registered={summary['registry_count']} enabled={summary['enabled_count']} "
+                f"disabled={summary['disabled_count']} diagnostics={summary['diagnostic_count']}"
+            ),
+            "plugin_registry_count": summary["registry_count"],
+            "plugin_enabled_count": summary["enabled_count"],
+            "plugin_disabled_count": summary["disabled_count"],
+            "plugin_diagnostic_count": summary["diagnostic_count"],
+            "plugin_manual_enabled_count": summary["manual_enabled_count"],
+            "plugin_manual_disabled_count": summary["manual_disabled_count"],
+            "plugin_builtin_count": summary["builtin_count"],
+            "plugin_project_local_count": summary["project_local_count"],
+            "plugin_enabled_names": list(summary["enabled_plugin_names"]),
+            "plugin_disabled_names": list(summary["disabled_plugin_names"]),
+            "plugin_manual_enabled_names": list(summary["manual_enabled_plugin_names"]),
+            "plugin_manual_disabled_names": list(summary["manual_disabled_plugin_names"]),
+            "plugin_entries": plugin_entries,
+            "plugin_diagnostics": diagnostic_entries,
+            "plugin_selected_name": selected_plugin_name,
+            "plugin_selected_summary": (
+                f"{selected_plugin_name} ({selected_plugin.get('contribution_summary')})"
+                if isinstance(selected_plugin, dict) and selected_plugin_name
+                else "none"
+            ),
+            "plugin_reload_state": reload_state,
+            "plugin_action_groups": {
+                "inspect_plugin_registry": ["/plugins"],
+                "inspect_project_context_plugins": ["/project-context plugins"],
+                "inspect_plugin_reload_state": ["/project-context reload-status", "/context-refresh"],
+                "inspect_selected_plugin": (
+                    [f"/plugin show {selected_plugin_name}"] if selected_plugin_name else []
+                ),
+                "toggle_selected_plugin": (
+                    [self._plugin_toggle_command(selected_plugin_name)] if selected_plugin_name else []
+                ),
+            },
+        }
+
     def _plugin_toggle_command(self, plugin_name: str) -> str:
         if self.plugin_registry.is_enabled(plugin_name, self.state):
             return f"/plugin disable {plugin_name}"
         return f"/plugin enable {plugin_name}"
 
     def describe_plugins(self) -> str:
-        plugins = self.plugin_registry.list_plugins()
-        diagnostics = self.plugin_registry.list_diagnostics()
-        if not plugins and not diagnostics:
-            return "plugin contributions:\nNo plugins registered."
-        lines = ["plugin contributions:"]
-        for plugin in plugins:
-            status = "enabled" if self.plugin_registry.is_enabled(plugin.name, self.state) else "disabled"
-            default = "default=enabled" if plugin.default_enabled else "default=disabled"
-            path_text = f" path={plugin.path}" if plugin.path is not None else ""
-            contributions = ",".join(self._plugin_contribution_labels(plugin))
-            next_actions = " | ".join(
-                [
-                    f"/plugin show {plugin.name}",
-                    "/project-context plugins",
-                    self._plugin_toggle_command(plugin.name),
-                ]
-            )
-            lines.append(
-                f"{plugin.name}: status={status} source={plugin.source} "
-                f"version={plugin.version} {default} contributions={contributions} "
-                f"commands={len(plugin.commands)} skills={len(plugin.skills)} "
-                f"mcp_servers={len(plugin.mcp_servers)} hooks={len(plugin.hooks)} "
-                f"description={plugin.description}{path_text} next_actions={next_actions}"
-            )
-        for diagnostic in diagnostics:
-            lines.append(
-                f"{diagnostic.name}: status=invalid source={diagnostic.source} "
-                f"path={diagnostic.path} error={diagnostic.error} "
-                f"next_actions=/project-context plugins | /context-refresh"
-            )
+        payload = self.plugin_surface_payload()
+        if not payload["plugin_entries"] and not payload["plugin_diagnostics"]:
+            return "plugin registry:\nNo plugins registered."
+        lines = [
+            "plugin registry:",
+            f"plugin registry: {payload['plugin_registry_summary']}",
+            "plugin sources: "
+            + f"builtin={payload['plugin_builtin_count']} project_local={payload['plugin_project_local_count']}",
+            "manual plugin overrides: "
+            + (
+                f"enabled={payload['plugin_manual_enabled_count']} "
+                f"disabled={payload['plugin_manual_disabled_count']}"
+            ),
+            "plugin reload state: "
+            + str(payload["plugin_reload_state"].get("summary") or "latest reload: none"),
+        ]
+        if payload["plugin_entries"]:
+            lines.append("registered plugins:")
+            for plugin in payload["plugin_entries"]:
+                next_actions = " | ".join(str(item) for item in plugin.get("next_actions", []) if str(item).strip())
+                default = "default=enabled" if plugin.get("default_enabled") else "default=disabled"
+                path_text = f" path={plugin.get('path')}" if plugin.get("path") else ""
+                lines.append(
+                    f"{plugin['name']}: plugin_status={plugin['status']} plugin_source={plugin['source_label']} "
+                    f"version={plugin['version']} {default} manual_override={plugin['manual_override_state']} "
+                    f"plugin_contributions={plugin['contribution_summary']} "
+                    f"commands={plugin['command_count']} skills={plugin['skill_count']} "
+                    f"mcp_servers={plugin['mcp_server_count']} hooks={plugin['hook_count']} "
+                    f"description={plugin['description']}{path_text} next_actions={next_actions}"
+                )
+        lines.append("plugin diagnostics:")
+        if payload["plugin_diagnostics"]:
+            for diagnostic in payload["plugin_diagnostics"]:
+                next_actions = " | ".join(
+                    str(item) for item in diagnostic.get("next_actions", []) if str(item).strip()
+                )
+                lines.append(
+                    f"{diagnostic['name']}: plugin_status=invalid plugin_source={diagnostic['source_label']} "
+                    f"path={diagnostic['path']} error={diagnostic['error']} next_actions={next_actions}"
+                )
+        else:
+            lines.append("- none")
         return "\n".join(lines)
 
     def describe_plugin(self, name: str) -> str:
@@ -5193,48 +8229,47 @@ class Session:
         if plugin is None:
             diagnostic = self.plugin_registry.get_diagnostic(plugin_name)
             if diagnostic is not None:
+                diagnostic_payload = self.plugin_registry.diagnostic_entry_payload(diagnostic)
                 return "\n".join(
                     [
-                        f"name: {diagnostic.name}",
-                        "status: invalid",
-                        f"source: {diagnostic.source}",
-                        f"path: {diagnostic.path}",
-                        f"error: {diagnostic.error}",
+                        "plugin diagnostics:",
+                        f"name: {diagnostic_payload['name']}",
+                        "plugin status: invalid",
+                        f"plugin source: {diagnostic_payload['source_label']}",
+                        f"path: {diagnostic_payload['path']}",
+                        f"error: {diagnostic_payload['error']}",
                         "next_actions:",
                         "- /project-context plugins",
                         "- /context-refresh",
                     ]
                 )
             return f'Unknown plugin "{plugin_name}".'
-        status = "enabled" if self.plugin_registry.is_enabled(plugin.name, self.state) else "disabled"
-        default = "enabled" if plugin.default_enabled else "disabled"
+        payload = self.plugin_registry.plugin_entry_payload(plugin, self.state)
         lines = [
-            f"name: {plugin.name}",
-            f"plugin_id: {plugin.plugin_id}",
-            f"status: {status}",
-            f"default_enabled: {default}",
-            f"version: {plugin.version}",
-            f"source: {plugin.source}",
-            f"description: {plugin.description}",
-            "path: " + (str(plugin.path) if plugin.path is not None else "none"),
-            f"commands: {len(plugin.commands)}",
-            f"skills: {len(plugin.skills)}",
-            f"mcp_servers: {len(plugin.mcp_servers)}",
-            f"hooks: {len(plugin.hooks)}",
-            "contributes commands: " + ("yes" if plugin.commands else "no"),
-            "contributes skills: " + ("yes" if plugin.skills else "no"),
-            "contributes mcp servers: " + ("yes" if plugin.mcp_servers else "no"),
-            "contributes hooks/config-only behavior: "
-            + ("yes" if plugin.hooks or not (plugin.commands or plugin.skills or plugin.mcp_servers) else "no"),
+            "plugin registry detail:",
+            f"name: {payload['name']}",
+            f"plugin_id: {payload['plugin_id']}",
+            f"plugin status: {payload['status']}",
+            "default_enabled: " + ("enabled" if payload["default_enabled"] else "disabled"),
+            f"manual_override_state: {payload['manual_override_state']}",
+            f"version: {payload['version']}",
+            f"plugin source: {payload['source_label']}",
+            f"description: {payload['description']}",
+            "path: " + (str(payload.get("path")) if payload.get("path") is not None else "none"),
+            f"plugin contributions: {payload['contribution_summary']}",
+            f"commands: {payload['command_count']}",
+            f"skills: {payload['skill_count']}",
+            f"mcp_servers: {payload['mcp_server_count']}",
+            f"hooks: {payload['hook_count']}",
         ]
-        if plugin.commands:
-            lines.append("command_names: " + ", ".join(command.name for command in plugin.commands))
-        if plugin.skills:
-            lines.append("skill_names: " + ", ".join(skill.name for skill in plugin.skills))
-        if plugin.mcp_servers:
-            lines.append("mcp_server_names: " + ", ".join(server.name for server in plugin.mcp_servers))
-        if plugin.hooks:
-            lines.append("hook_names: " + ", ".join(plugin.hooks))
+        if payload["command_names"]:
+            lines.append("command_names: " + ", ".join(str(item) for item in payload["command_names"]))
+        if payload["skill_names"]:
+            lines.append("skill_names: " + ", ".join(str(item) for item in payload["skill_names"]))
+        if payload["mcp_server_names"]:
+            lines.append("mcp_server_names: " + ", ".join(str(item) for item in payload["mcp_server_names"]))
+        if payload["hook_names"]:
+            lines.append("hook_names: " + ", ".join(str(item) for item in payload["hook_names"]))
         lines.extend(
             [
                 "next_actions:",
@@ -5252,9 +8287,42 @@ class Session:
             "memory_content": self.project_context.memory_content,
             "skill_names": tuple(sorted(skill.name for skill in self.project_context.skills)),
             "enabled_skill_names": tuple(sorted(skill.name for skill in self.active_skills())),
+            "skill_diagnostic_names": tuple(
+                sorted(
+                    f"{diagnostic.source}:{diagnostic.source_owner}:{diagnostic.name}"
+                    for diagnostic in getattr(self.project_context, "skill_diagnostics", [])
+                )
+            ),
+            "skill_resolution_fingerprints": tuple(
+                sorted(
+                    f"{skill.name}:{getattr(skill, 'source', 'project-local')}:"
+                    f"{getattr(skill, 'source_owner', 'workspace')}:{'auto' if skill.auto_enable else 'manual'}"
+                    for skill in self.project_context.skills
+                )
+            ),
+            "skill_content_fingerprints": tuple(
+                sorted(
+                    f"{skill.name}:{hash(skill.content)}:{skill.description}:{','.join(skill.tags)}"
+                    for skill in self.project_context.skills
+                )
+            ),
             "plugin_names": tuple(sorted(self.plugin_registry.known_plugin_names())),
             "enabled_plugin_names": tuple(
                 sorted(plugin.name for plugin in self.plugin_registry.enabled_plugins(self.state))
+            ),
+            "plugin_diagnostic_names": tuple(
+                sorted(f"{diagnostic.source}:{diagnostic.name}" for diagnostic in self.plugin_registry.list_diagnostics())
+            ),
+            "plugin_contribution_fingerprints": tuple(
+                sorted(
+                    f"{plugin.name}:{plugin.source}:{plugin.contribution_summary()}:"
+                    f"{len(plugin.commands)}:{len(plugin.skills)}:{len(plugin.mcp_servers)}:{len(plugin.hooks)}"
+                    for plugin in self.plugin_registry.list_plugins()
+                )
+            ),
+            "agent_definition_names": tuple(sorted(self.agent_registry.known_definition_names())),
+            "agent_diagnostic_names": tuple(
+                sorted(f"{diagnostic.source}:{diagnostic.name}" for diagnostic in self.agent_registry.list_diagnostics())
             ),
         }
 
@@ -5272,9 +8340,45 @@ class Session:
                 or before.get("memory_content") != after.get("memory_content")
             ),
             "skill_set_changed": before.get("skill_names") != after.get("skill_names"),
+            "skill_registry_changed": before.get("skill_names") != after.get("skill_names"),
+            "enabled_skill_set_changed": (
+                before.get("enabled_skill_names") != after.get("enabled_skill_names")
+            ),
+            "skill_diagnostics_changed": (
+                before.get("skill_diagnostic_names") != after.get("skill_diagnostic_names")
+            ),
+            "skill_resolution_changed": (
+                before.get("skill_resolution_fingerprints") != after.get("skill_resolution_fingerprints")
+            ),
+            "skill_content_changed": (
+                before.get("skill_content_fingerprints") != after.get("skill_content_fingerprints")
+            ),
+            "skill_state_changed": (
+                before.get("skill_names") != after.get("skill_names")
+                or before.get("enabled_skill_names") != after.get("enabled_skill_names")
+                or before.get("skill_diagnostic_names") != after.get("skill_diagnostic_names")
+                or before.get("skill_resolution_fingerprints") != after.get("skill_resolution_fingerprints")
+                or before.get("skill_content_fingerprints") != after.get("skill_content_fingerprints")
+            ),
+            "plugin_registry_changed": before.get("plugin_names") != after.get("plugin_names"),
+            "enabled_plugin_set_changed": (
+                before.get("enabled_plugin_names") != after.get("enabled_plugin_names")
+            ),
+            "plugin_diagnostics_changed": (
+                before.get("plugin_diagnostic_names") != after.get("plugin_diagnostic_names")
+            ),
+            "plugin_contributions_changed": (
+                before.get("plugin_contribution_fingerprints") != after.get("plugin_contribution_fingerprints")
+            ),
             "plugin_state_changed": (
                 before.get("enabled_plugin_names") != after.get("enabled_plugin_names")
                 or before.get("plugin_names") != after.get("plugin_names")
+                or before.get("plugin_diagnostic_names") != after.get("plugin_diagnostic_names")
+                or before.get("plugin_contribution_fingerprints") != after.get("plugin_contribution_fingerprints")
+            ),
+            "agent_definition_changed": (
+                before.get("agent_definition_names") != after.get("agent_definition_names")
+                or before.get("agent_diagnostic_names") != after.get("agent_diagnostic_names")
             ),
             "before": before,
             "after": after,
@@ -5291,7 +8395,16 @@ class Session:
             "latest reload: "
             f"{timestamp} memory_changed={self._yes_no(status.get('memory_changed'))} "
             f"skill_set_changed={self._yes_no(status.get('skill_set_changed'))} "
+            f"skill_state_changed={self._yes_no(status.get('skill_state_changed'))} "
+            f"enabled_skill_set_changed={self._yes_no(status.get('enabled_skill_set_changed'))} "
+            f"skill_diagnostics_changed={self._yes_no(status.get('skill_diagnostics_changed'))} "
+            f"skill_resolution_changed={self._yes_no(status.get('skill_resolution_changed'))} "
+            f"skill_content_changed={self._yes_no(status.get('skill_content_changed'))} "
             f"plugin_state_changed={self._yes_no(status.get('plugin_state_changed'))} "
+            f"plugin_registry_changed={self._yes_no(status.get('plugin_registry_changed'))} "
+            f"plugin_diagnostics_changed={self._yes_no(status.get('plugin_diagnostics_changed'))} "
+            f"plugin_contributions_changed={self._yes_no(status.get('plugin_contributions_changed'))} "
+            f"agent_definition_changed={self._yes_no(status.get('agent_definition_changed'))} "
             f"errors={'none' if not error else error}"
         )
 
@@ -5316,20 +8429,71 @@ class Session:
             f"timestamp: {status.get('timestamp') or 'unknown'}",
             f"memory changed: {self._yes_no(status.get('memory_changed'))}",
             f"skill set changed: {self._yes_no(status.get('skill_set_changed'))}",
+            f"skill state changed: {self._yes_no(status.get('skill_state_changed'))}",
+            f"enabled skill set changed: {self._yes_no(status.get('enabled_skill_set_changed'))}",
+            f"skill diagnostics changed: {self._yes_no(status.get('skill_diagnostics_changed'))}",
+            f"skill resolution changed: {self._yes_no(status.get('skill_resolution_changed'))}",
+            f"skill content changed: {self._yes_no(status.get('skill_content_changed'))}",
             f"plugin state changed: {self._yes_no(status.get('plugin_state_changed'))}",
+            f"plugin registry changed: {self._yes_no(status.get('plugin_registry_changed'))}",
+            f"enabled plugin set changed: {self._yes_no(status.get('enabled_plugin_set_changed'))}",
+            f"plugin diagnostics changed: {self._yes_no(status.get('plugin_diagnostics_changed'))}",
+            f"plugin contributions changed: {self._yes_no(status.get('plugin_contributions_changed'))}",
+            f"agent definition changed: {self._yes_no(status.get('agent_definition_changed'))}",
             "errors: " + ("none" if not error else error),
             "before memory path: " + (str(before.get("memory_path") or "none")),
             "after memory path: " + (str(after.get("memory_path") or "none")),
             "before skills: " + str(len(before.get("skill_names") or ())),
             "after skills: " + str(len(after.get("skill_names") or ())),
+            "before enabled skills: " + str(len(before.get("enabled_skill_names") or ())),
+            "after enabled skills: " + str(len(after.get("enabled_skill_names") or ())),
+            "before skill diagnostics: " + str(len(before.get("skill_diagnostic_names") or ())),
+            "after skill diagnostics: " + str(len(after.get("skill_diagnostic_names") or ())),
             "before enabled plugins: " + str(len(before.get("enabled_plugin_names") or ())),
             "after enabled plugins: " + str(len(after.get("enabled_plugin_names") or ())),
+            "before plugin diagnostics: " + str(len(before.get("plugin_diagnostic_names") or ())),
+            "after plugin diagnostics: " + str(len(after.get("plugin_diagnostic_names") or ())),
+            "before agent definitions: " + str(len(before.get("agent_definition_names") or ())),
+            "after agent definitions: " + str(len(after.get("agent_definition_names") or ())),
+            "before agent diagnostics: " + str(len(before.get("agent_diagnostic_names") or ())),
+            "after agent diagnostics: " + str(len(after.get("agent_diagnostic_names") or ())),
             "next_actions:",
             "- /project-context",
+            "- /skills",
+            "- /plugins",
             "- /context-refresh",
             "- /skills-reload",
+            "- /agents",
         ]
         return "\n".join(lines)
+
+    def _skill_reload_state_payload(self) -> dict[str, Any]:
+        status = self._last_project_context_reload if isinstance(self._last_project_context_reload, dict) else {}
+        error = str(status.get("error") or "").strip()
+        return {
+            "summary": (
+                "latest reload: "
+                + (
+                    "none"
+                    if not status
+                    else (
+                        f"{status.get('timestamp') or 'unknown'} "
+                        f"skill_state_changed={self._yes_no(status.get('skill_state_changed'))} "
+                        f"enabled_skill_set_changed={self._yes_no(status.get('enabled_skill_set_changed'))} "
+                        f"skill_diagnostics_changed={self._yes_no(status.get('skill_diagnostics_changed'))} "
+                        f"skill_resolution_changed={self._yes_no(status.get('skill_resolution_changed'))} "
+                        f"skill_content_changed={self._yes_no(status.get('skill_content_changed'))} "
+                        f"errors={'none' if not error else error}"
+                    )
+                )
+            ),
+            "skill_state_changed": bool(status.get("skill_state_changed", False)),
+            "enabled_skill_set_changed": bool(status.get("enabled_skill_set_changed", False)),
+            "skill_diagnostics_changed": bool(status.get("skill_diagnostics_changed", False)),
+            "skill_resolution_changed": bool(status.get("skill_resolution_changed", False)),
+            "skill_content_changed": bool(status.get("skill_content_changed", False)),
+            "error": error or None,
+        }
 
     def _yes_no(self, value: Any) -> str:
         return "yes" if bool(value) else "no"
@@ -6444,132 +9608,9 @@ class Session:
     def record_plan_drift_context(self, context: str) -> None:
         self._advisor_component.record_plan_drift_context(context)
 
+    # Summary surface proxies
     def describe_config(self, *, section: str = "summary") -> str:
-        if section not in {"summary", "workspace", "runtime", "permissions", "plugins", "mcp"}:
-            return "Usage: /config [summary|workspace|runtime|permissions|plugins|mcp]"
-        counts = self._mcp_server_counts()
-        checklist_stats = self.checklist_stats()
-        execution_contract = self.execution_contract_payload()
-        effective_cwd = self.state.effective_cwd or str(self.config.cwd)
-        workspace_effective_exists = Path(effective_cwd).exists() if effective_cwd else False
-        recommended_actions = self._workspace_recommended_actions(
-            workspace_health=self.state.workspace_health,
-            workspace_label=self.state.workspace_label,
-            session_id=self.state.session_id,
-        )
-        workspace_action_fields = self._workspace_session_action_fields(
-            workspace_health=self.state.workspace_health,
-            workspace_label=self.state.workspace_label,
-            session_id=self.state.session_id,
-        )
-        workspace_lines = [
-            f"cwd: {self.config.cwd}",
-            f"original_cwd: {self.state.original_cwd or self.config.transcript_cwd or self.config.cwd}",
-            f"effective_cwd: {effective_cwd}",
-            f"workspace_mode: {self.state.workspace_mode}",
-            f"workspace_label: {self.state.workspace_label or 'none'}",
-            f"workspace_created_at: {self.state.workspace_created_at or 'none'}",
-            f"workspace_health: {self.state.workspace_health}",
-            f"workspace_cleanup_status: {self.state.workspace_cleanup_status}",
-            f"workspace_cleanup_error: {self.state.workspace_cleanup_error or 'none'}",
-            f"workspace_effective_cwd_exists: {'yes' if workspace_effective_exists else 'no'}",
-            f"workspace_unavailable: {'yes' if self.state.workspace_unavailable else 'no'}",
-            f"workspace_unavailable_reason: {self.state.workspace_unavailable_reason or 'none'}",
-            f"workspace_fallback_cwd: {self.state.workspace_fallback_cwd or 'none'}",
-            "workspace_recommended_action: " + (recommended_actions[0] if recommended_actions else "none"),
-            "workspace_recommended_actions: "
-            + (", ".join(recommended_actions) if recommended_actions else "none"),
-            f"selected_workspace_primary_action: {workspace_action_fields['selected_workspace_primary_action']}",
-            f"selected_workspace_secondary_action: {workspace_action_fields['selected_workspace_secondary_action']}",
-            f"selected_workspace_tertiary_action: {workspace_action_fields['selected_workspace_tertiary_action']}",
-            f"selected_workspace_target: {workspace_action_fields['selected_workspace_target']}",
-            *self._render_orphaned_workspace_lines(),
-            f"primary action: {workspace_action_fields['selected_workspace_primary_action']}",
-            f"secondary action: {workspace_action_fields['selected_workspace_secondary_action']}",
-            f"tertiary action: {workspace_action_fields['selected_workspace_tertiary_action']}",
-        ]
-        mcp_lines = [
-            f"provider: {self.config.provider}",
-            f"mcp_config_path: {self.config.mcp_config_path}",
-            f"mcp_servers: {counts['servers']}",
-            f"mcp_connected_servers: {counts['connected']}",
-            f"mcp_failed_servers: {counts['failed']}",
-            f"mcp_retrying_servers: {counts['retrying']}",
-        ]
-        plugin_lines = [
-            f"project_memory: {'loaded' if self.project_context.memory_content else 'none'}",
-            f"project_plugins: {len(self.plugin_registry.list_plugins())}",
-            f"enabled_plugins: {len(self.plugin_registry.enabled_plugins(self.state))}",
-            f"manual_enabled_plugins: {len(self.state.enabled_plugin_names)}",
-            f"manual_disabled_plugins: {len(self.state.disabled_plugin_names)}",
-            f"project_skills: {len(self.project_context.skills)}",
-            f"enabled_skills: {len(self.active_skills())}",
-            f"manual_enabled_skills: {len(self.state.enabled_skill_names)}",
-            f"manual_disabled_skills: {len(self.state.disabled_skill_names)}",
-        ]
-        permission_lines = [
-            f"permission_config_path: {self._permission_config_path()}",
-            f"workspace_permission_rules: {len(self._workspace_permission_rules)}",
-            f"session_permission_rules: {len(self.permission_manager.session_rules)}",
-            f"permission_mode: {self.config.permission_mode}",
-        ]
-        runtime_lines = [
-            f"provider: {self.config.provider}",
-            f"model: {self.config.model}",
-            f"advisor_model: {self.state.advisor_model or 'none'}",
-            f"advisor_mode: {self.state.advisor_mode}",
-            f"advisor_reviews: {len(self.state.advisor_review_history)}",
-            f"advisor_blocks: {self.advisor_block_count()}",
-            f"planning_artifacts: {len(self.planning_artifacts())}",
-            "active_planning_artifact_id: " + str(self.state.active_planning_artifact_id or "none"),
-            f"recent_change_sets: {len(self.state.recent_change_sets)}",
-            f"redo_change_sets: {len(self.state.undone_change_sets)}",
-            f"session_checklist_tasks: {checklist_stats['total']}",
-            f"session_checklist_in_progress: {checklist_stats['in_progress']}",
-            *self._symbol_surface_config_fields(),
-            f"execution_constraints: {self.state.active_execution_constraint}",
-            f"session_execution_mode: {execution_contract['session_execution_mode']}",
-            "session_command_policy_name: "
-            + str(execution_contract["session_command_policy_name"] or "none"),
-            "session_command_policy_source: "
-            + str(execution_contract["session_command_policy_source"] or "none"),
-            "session_command_policy_allowed_tools: "
-            + (
-                ", ".join(execution_contract["session_command_policy_allowed_tool_names"])
-                if execution_contract["session_command_policy_allowed_tool_names"]
-                else "none"
-            ),
-            "session_command_policy_allowed_bash_prefixes: "
-            + (
-                ", ".join(execution_contract["session_command_policy_allowed_bash_prefixes"])
-                if execution_contract["session_command_policy_allowed_bash_prefixes"]
-                else "none"
-            ),
-            "session_command_policy_require_read_only_subagents: "
-            + ("yes" if execution_contract["session_command_policy_require_read_only_subagents"] else "no"),
-            f"last_plan_drift_summary: {self._recent_plan_drift_summary() or 'none'}",
-            f"max_tokens: {self.config.max_tokens}",
-            f"max_turns: {self.config.max_turns}",
-            f"max_tool_rounds_per_turn: {self.config.max_tool_rounds_per_turn}",
-            f"max_history_messages: {self.config.max_history_messages}",
-            f"history_keep_last_messages: {self.config.history_keep_last_messages}",
-            f"max_context_summary_chars: {self.config.max_context_summary_chars}",
-            f"session_id: {self.state.session_id}",
-        ]
-        planning_lines = self.describe_planning_lifecycle()[2:]
-        if section == "workspace":
-            return "\n".join(["current session:", *workspace_lines])
-        if section == "runtime":
-            return "\n".join(["current session:", *runtime_lines, *planning_lines])
-        if section == "permissions":
-            return "\n".join(["current session:", *permission_lines])
-        if section == "plugins":
-            return "\n".join(["current session:", *plugin_lines])
-        if section == "mcp":
-            return "\n".join(["current session:", *mcp_lines])
-        lines = [*workspace_lines, *mcp_lines, *plugin_lines, *permission_lines, *runtime_lines]
-        lines.extend(planning_lines)
-        return "\n".join(lines)
+        return workflow_describe_config(self, section=section)
 
     def describe_saved_sessions(
         self,
@@ -6615,8 +9656,8 @@ class Session:
             )
             cleanup_status = item.workspace_cleanup_status or "none"
             workspace_bits = [
-                f"workspace={workspace_mode}",
-                f"health={workspace_health}",
+                f"workspace_state=mode:{workspace_mode}",
+                f"workspace_health={workspace_health}",
                 f"label={workspace_label}",
             ]
             workspace_bits.append(f"origin={origin_cwd}")
@@ -6632,6 +9673,16 @@ class Session:
                 workspace_bits.append("unavailable=yes")
                 if item.workspace_fallback_cwd:
                     workspace_bits.append(f"fallback={item.workspace_fallback_cwd}")
+            if item.history_boundary_count:
+                workspace_bits.append(f"boundaries={item.history_boundary_count}")
+            if item.last_history_boundary_kind:
+                workspace_bits.append(
+                    "latest_boundary=" + self._history_boundary_kind_label(item.last_history_boundary_kind)
+                )
+            if item.last_compact_boundary_trigger:
+                workspace_bits.append(f"last_compact={item.last_compact_boundary_trigger}")
+            if item.last_compact_boundary_reason:
+                workspace_bits.append(f"compact_reason={item.last_compact_boundary_reason}")
             recommended_actions = self._workspace_recommended_actions(
                 workspace_health=workspace_health,
                 workspace_label=None if workspace_label == "-" else workspace_label,
@@ -6705,30 +9756,51 @@ class Session:
         return candidate, state
 
     def _render_saved_session_workspace_detail(self, summary: TranscriptSummary) -> str:
+        anomaly_summary = self._workspace_anomaly_summary(
+            workspace_health=summary.workspace_health or "healthy",
+            workspace_cleanup_status=summary.workspace_cleanup_status or "none",
+            workspace_unavailable=bool(summary.workspace_unavailable),
+            workspace_unavailable_reason=summary.workspace_unavailable_reason,
+            workspace_fallback_cwd=summary.workspace_fallback_cwd,
+        )
+        recommended_actions = self._workspace_recommended_actions(
+            workspace_health=summary.workspace_health or "healthy",
+            workspace_label=summary.workspace_label,
+            session_id=summary.session_id,
+        )
         action_fields = self._workspace_session_action_fields(
             workspace_health=summary.workspace_health or "healthy",
             workspace_label=summary.workspace_label,
             session_id=summary.session_id,
         )
+        action_groups = self._status_action_groups_payload(
+            session_id=summary.session_id,
+            saved_resumable=True,
+        )
         lines = [
             "saved session workspace:",
             f"session_id: {summary.session_id}",
-            f"workspace mode: {summary.workspace_mode or 'main'}",
-            f"workspace health: {summary.workspace_health or 'healthy'}",
-            f"workspace label: {summary.workspace_label or 'none'}",
-            f"origin cwd: {summary.original_cwd or summary.cwd or '-'}",
-            f"effective cwd: {summary.effective_cwd or summary.cwd or '-'}",
-            f"fallback cwd: {summary.workspace_fallback_cwd or 'none'}",
-            f"workspace unavailable: {'yes' if summary.workspace_unavailable else 'no'}",
-            f"unavailable reason: {summary.workspace_unavailable_reason or 'none'}",
-            f"workspace cleanup status: {summary.workspace_cleanup_status or 'none'}",
-            "primary action: " + action_fields["selected_workspace_primary_action"],
-            "secondary action: " + action_fields["selected_workspace_secondary_action"],
-            "tertiary action: " + action_fields["selected_workspace_tertiary_action"],
+            "workspace state:",
+            "- workspace state: "
+            + f"mode={summary.workspace_mode or 'main'} health={summary.workspace_health or 'healthy'}",
+            f"- workspace label: {summary.workspace_label or 'none'}",
+            f"- origin cwd: {summary.original_cwd or summary.cwd or '-'}",
+            f"- effective cwd: {summary.effective_cwd or summary.cwd or '-'}",
+            f"- fallback cwd: {summary.workspace_fallback_cwd or 'none'}",
+            f"- workspace unavailable: {'yes' if summary.workspace_unavailable else 'no'}",
+            f"- workspace cleanup status: {summary.workspace_cleanup_status or 'none'}",
+            "workspace anomaly:",
+            f"- workspace anomaly: {anomaly_summary}",
+            f"- workspace unavailable reason: {summary.workspace_unavailable_reason or 'none'}",
+            "workspace recovery:",
+            f"- workspace recovery: {recommended_actions[0] if recommended_actions else 'none'}",
+            "- workspace_recommended_actions: "
+            + (", ".join(recommended_actions) if recommended_actions else "none"),
+            "- primary action: " + action_fields["selected_workspace_primary_action"],
+            "- secondary action: " + action_fields["selected_workspace_secondary_action"],
+            "- tertiary action: " + action_fields["selected_workspace_tertiary_action"],
             "next actions:",
-            f"- pyclaude --resume-session {summary.session_id} repl",
-            f"- pyclaude --resume-session {summary.session_id} tui",
-            f"- /sessions show {summary.session_id} summary",
+            *self.render_status_action_family_lines(action_groups, resume=True),
         ]
         return "\n".join(lines)
 
@@ -6753,8 +9825,25 @@ class Session:
             saved_resumable=True,
             stay_on_surface=f"/sessions show {summary.session_id} summary | /sessions show {summary.session_id} workspace",
         )
+        action_groups = self._status_action_groups_payload(
+            session_id=summary.session_id,
+            saved_resumable=True,
+        )
         explicit_entry_count = len(state.explicit_context_entries)
         unresolved_explicit_count = sum(1 for entry in state.explicit_context_entries if not entry.resolved)
+        compact_boundary_count = sum(1 for item in state.history_boundaries if item.kind == "compact")
+        anomaly_summary = self._workspace_anomaly_summary(
+            workspace_health=summary.workspace_health or "healthy",
+            workspace_cleanup_status=summary.workspace_cleanup_status or "none",
+            workspace_unavailable=bool(summary.workspace_unavailable),
+            workspace_unavailable_reason=summary.workspace_unavailable_reason,
+            workspace_fallback_cwd=summary.workspace_fallback_cwd,
+        )
+        recommended_actions = self._workspace_recommended_actions(
+            workspace_health=summary.workspace_health or "healthy",
+            workspace_label=summary.workspace_label,
+            session_id=summary.session_id,
+        )
         lines = [
             "saved session:",
             f"session_id: {summary.session_id}",
@@ -6763,13 +9852,16 @@ class Session:
             f"provider: {summary.provider or 'unknown'}",
             f"model: {summary.model or 'unknown'}",
             *self._history_state_lines(history_state),
-            f"workspace mode: {summary.workspace_mode or 'main'}",
-            f"workspace health: {summary.workspace_health or 'healthy'}",
+            "workspace state: "
+            + f"mode={summary.workspace_mode or 'main'} health={summary.workspace_health or 'healthy'}",
             f"workspace label: {summary.workspace_label or 'none'}",
             f"workspace fallback cwd: {summary.workspace_fallback_cwd or 'none'}",
             f"workspace unavailable: {'yes' if summary.workspace_unavailable else 'no'}",
+            f"workspace anomaly: {anomaly_summary}",
+            "workspace recovery: " + (recommended_actions[0] if recommended_actions else "none"),
             f"recorded changes: {len(state.recent_change_sets)}",
             f"redo changes: {len(state.undone_change_sets)}",
+            f"compact boundaries: {compact_boundary_count}",
             f"planning artifacts: {len(planning_artifacts)}",
             f"advisor activity: {len(state.advisor_review_history)} review(s)",
             f"explicit context entries: {explicit_entry_count}",
@@ -6788,10 +9880,18 @@ class Session:
             f"go_to_saved_resume: {continuation['go_to_saved_resume']}",
             f"stay_on_surface: {continuation['stay_on_surface']}",
             "next actions:",
-            f"- pyclaude --resume-session {summary.session_id} repl",
-            f"- pyclaude --resume-session {summary.session_id} tui",
-            f"- /sessions show {summary.session_id} workspace",
+            *self.render_status_action_family_lines(action_groups, resume=True),
         ]
+        lines.extend(
+            self._history_lifecycle_lines(
+                state.history_boundaries,
+                latest_compact_trigger=summary.last_compact_boundary_trigger,
+                latest_compact_reason=summary.last_compact_boundary_reason,
+                latest_compact_summary=summary.last_compact_boundary_summary,
+            )
+        )
+        if state.history_boundaries:
+            lines.extend(self._history_boundary_lines_for(state.history_boundaries, limit=3))
         if compact:
             return "\n".join(lines)
         lines[1:1] = [
@@ -6815,15 +9915,7 @@ class Session:
         return "\n".join(lines)
 
     def describe_status(self, *, section: str = "summary") -> str:
-        if section not in {"summary", "workspace", "workflow", "resume"}:
-            return "Usage: /status [summary|workspace|workflow|resume]"
-        if section == "workspace":
-            return self.describe_current_workspace()
-        if section == "workflow":
-            return self._describe_status_workflow()
-        if section == "resume":
-            return self._describe_status_resume()
-        return self._describe_status_summary()
+        return workflow_describe_status(self, section=section)
 
     def describe_context(self, *, section: str = "summary") -> str:
         if section == "summary":
@@ -6896,464 +9988,85 @@ class Session:
         return self._describe_diff_summary()
 
     def _describe_status_summary(self) -> str:
-        artifact = self.active_planning_artifact()
-        working_set = self.working_set_payload(limit=5)
-        focused_payload = self._current_context_focus_payload()
-        task_surfaces = self.task_surface_counts_payload()
-        checklist_stats = self.checklist_stats()
-        explicit_entries = self._explicit_context_entries_payloads()
-        file_items = [
-            item for item in working_set.get("file_context_files", []) if isinstance(item, dict)
-        ]
-        _focused_files, _focused_index, focused_item = self._file_context_items_and_index(focused_payload)
-        explicit_counts = self._explicit_context_summary_counts(
-            entries=explicit_entries,
-            files=file_items,
-            total_file_count=len(file_items),
-        )
-        history_state = self._history_state_payload(
-            message_count=len(self.state.messages),
-            context_summary=self.state.context_summary,
-        )
-        focused_path = str(focused_item.get("path") or "none") if focused_item is not None else "none"
-        focused_source = str(focused_item.get("source") or "none") if focused_item is not None else "none"
-        file_count = int(working_set.get("file_context_file_count") or 0)
-        active_task_total = sum(
-            count
-            for key, count in task_surfaces.items()
-            if key not in {"completed", "failed", "blocked", "stopped"}
-        )
-        lines = [
-            "current session:",
-            f"session_id: {self.state.session_id}",
-            f"provider: {self.config.provider}",
-            f"model: {self.config.model}",
-            f"workspace health: {self.state.workspace_health}",
-            f"workspace mode: {self.state.workspace_mode}",
-            f"active plan: {artifact.goal if artifact is not None else 'none'}",
-            f"advisor mode: {self.state.advisor_mode}",
-            *self._history_state_lines(history_state),
-            f"recorded changes: {len(self.state.recent_change_sets)}",
-            f"redo changes: {len(self.state.undone_change_sets)}",
-            f"working set files: {file_count}",
-            self._render_file_context_mix_line(file_items),
-            f"focused file: {focused_path}",
-            f"focused file source: {focused_source}",
-            f"explicit context entries: {explicit_counts['entry_count']}",
-            f"unresolved explicit context entries: {explicit_counts['unresolved_entry_count']}",
-            f"explicit-context files: {explicit_counts['explicit_file_count']}",
-            f"active task surfaces: {active_task_total}",
-            f"checklist in progress: {checklist_stats['in_progress']}",
-            "next actions:",
-            "- /files focused",
-            "- /diff focused",
-            "- /tasks active",
-            "- /changes working-set",
-            "- /plan",
-            "- /add-dir list",
-            "- /files explicit",
-            "- /workspaces current",
-            "- /history all",
-        ]
-        return "\n".join(lines)
+        return workflow_describe_status_summary(self)
 
     def _describe_context_summary(self) -> str:
-        return render_context_usage(collect_context_usage(self))
-
-    def _describe_context_inventory(self) -> str:
-        payload = self.working_set_payload(limit=20)
-        return self._render_context_inventory_text(payload, filter_label="all")
-
-    def _describe_context_filtered(self, *, reason: str, label: str) -> str:
-        payload = self._filtered_working_set_payload(reason=reason)
-        return self._render_context_inventory_text(payload, filter_label=label)
-
-    def _describe_context_auto(self) -> str:
-        payload = self.working_set_payload(limit=20)
-        files = [item for item in payload.get("file_context_files", []) if isinstance(item, dict)]
-        filtered = [
-            item
-            for item in files
-            if "explicit context path" not in self._file_context_scope_reasons(item)
-        ]
-        return self._render_context_inventory_text(
-            self._file_context_payload_from_files(filtered, scope="session"),
-            filter_label="auto",
+        report = collect_context_usage(self)
+        replacement_surface = self.tool_result_replacement_surface_payload()
+        replacement_surface.update(self.tool_result_artifact_surface_payload())
+        return render_context_usage(
+            report,
+            system_prompt_surface=self.system_prompt_surface_payload(),
+            replacement_surface=replacement_surface,
+        ) + "\n\n" + render_compaction_policy(
+            self.compaction_policy_payload(report=report)
         )
 
+    # File-context inventory/focused/diff surface proxies
+    def _describe_context_inventory(self) -> str:
+        return workflow_describe_context_inventory(self)
+
+    def _describe_context_filtered(self, *, reason: str, label: str) -> str:
+        return workflow_describe_context_filtered(self, reason=reason, label=label)
+
+    def _describe_context_auto(self) -> str:
+        return workflow_describe_context_auto(self)
+
     def _describe_context_focused(self) -> str:
-        payload = self._current_context_focus_payload()
-        files, _index, focused_item = self._file_context_items_and_index(payload)
-        if not files or focused_item is None:
-            return "\n".join(
-                [
-                    "focused file context:",
-                    "No focused file context.",
-                    "next actions:",
-                    "- /files context",
-                    "- /status workflow",
-                ]
-            )
-        lines = self._render_context_focused_lines(payload, title="focused file")
-        return "\n".join(lines) if lines else "No focused file context."
+        return workflow_describe_context_focused(self)
 
     def _working_set_files_payload(self) -> dict[str, Any]:
-        return self.working_set_payload(limit=20)
+        return workflow_working_set_files_payload(self)
 
     def _diff_working_set_payload(self) -> dict[str, Any]:
-        payload = self._working_set_files_payload()
-        files = [item for item in payload.get("file_context_files", []) if isinstance(item, dict)]
-        filtered = [
-            item
-            for item in files
-            if bool(item.get("has_diff_hunks")) or self._file_context_diff_hunk_count(item) > 0
-        ]
-        return self._file_context_payload_from_files(filtered, scope="session")
+        return workflow_diff_working_set_payload(self)
 
     def _render_files_inventory_text(
         self,
         payload: dict[str, Any] | None,
         *,
         filter_label: str,
+        summary_lines: list[str] | None = None,
     ) -> str:
-        files = [item for item in (payload or {}).get("file_context_files", []) if isinstance(item, dict)]
-        lines = [
-            "working set files:",
-            f"filter: {filter_label}",
-            f"file_count: {len(files)}",
-        ]
-        if not files:
-            return "\n".join(lines + ["No matching working-set files."])
-        lines.append(self._render_file_context_mix_line(files))
-        for index, item in enumerate(files, start=1):
-            scope_reasons = self._file_context_scope_reasons(item)
-            related_change = str(item.get("change_id") or "").strip() or "none"
-            lines.append(
-                f"{index}. {item['path']}  "
-                + f"in_scope_because={', '.join(scope_reasons) if scope_reasons else 'none'}  "
-                + f"related_change={related_change}  "
-                + f"diff_hunks={self._file_context_diff_hunk_count(item)}  "
-                + f"context_only={'yes' if self._file_context_is_context_only(item) else 'no'}"
-            )
-            lines.append(
-                "   next_actions: "
-                + self._render_file_context_action_group_summary(
-                    item,
-                    stay_on_surface_actions=self._files_stay_on_surface_actions(),
-                    extra_actions={"go_to_context": self._file_context_context_actions(item)},
-                    ordered_keys=(
-                        "go_to_change",
-                        "go_to_task",
-                        "go_to_plan",
-                        "go_to_context",
-                        "stay_on_surface",
-                    ),
-                )
-            )
-        return "\n".join(lines)
+        return workflow_render_files_inventory_text(
+            self,
+            payload,
+            filter_label=filter_label,
+            summary_lines=summary_lines,
+        )
 
     def _describe_files_inventory(self) -> str:
-        return self._render_files_inventory_text(
-            self._working_set_files_payload(),
-            filter_label="all",
-        )
+        return workflow_describe_files_inventory(self)
 
     def _describe_files_changes(self) -> str:
-        payload = self._working_set_files_payload()
-        files = [item for item in payload.get("file_context_files", []) if isinstance(item, dict)]
-        filtered = [
-            item
-            for item in files
-            if bool(item.get("has_related_change")) or bool(item.get("has_diff_hunks"))
-        ]
-        filtered_payload = self._reorder_payload_to_current_focus(
-            self._file_context_payload_from_files(filtered, scope="session"),
-            required_reason="recent change",
-        )
-        return self._render_files_inventory_text(
-            filtered_payload,
-            filter_label="changes",
-        )
+        return workflow_describe_files_changes(self)
 
     def _describe_files_filtered(self, *, reason: str, label: str) -> str:
-        payload = self._reorder_payload_to_current_focus(
-            self._filtered_working_set_payload(reason=reason),
-            required_reason=reason,
-        )
-        return self._render_files_inventory_text(
-            payload,
-            filter_label=label,
-        )
+        return workflow_describe_files_filtered(self, reason=reason, label=label)
 
     def _describe_files_auto(self) -> str:
-        payload = self._working_set_files_payload()
-        files = [item for item in payload.get("file_context_files", []) if isinstance(item, dict)]
-        filtered = [
-            item
-            for item in files
-            if "explicit context path" not in self._file_context_scope_reasons(item)
-        ]
-        filtered_payload = self._reorder_payload_to_current_focus(
-            self._file_context_payload_from_files(filtered, scope="session"),
-        )
-        return self._render_files_inventory_text(
-            filtered_payload,
-            filter_label="auto",
-        )
+        return workflow_describe_files_auto(self)
 
     def _describe_files_focused(self) -> str:
-        payload = self._current_context_focus_payload()
-        files, _index, focused_item = self._file_context_items_and_index(payload)
-        if not files or focused_item is None:
-            return "\n".join(
-                [
-                    "focused file:",
-                    "No focused file context.",
-                    "next_actions:",
-                    "- /files",
-                    "- /status workflow",
-                ]
-            )
-        lines = self._render_context_focused_lines(payload, title="focused file")
-        return "\n".join(lines) if lines else "No focused file context."
+        return workflow_describe_files_focused(self)
 
     def _describe_files_show(self, *, selected_index: int) -> str:
-        payload = self._working_set_files_payload()
-        files, _bounded_index, focused_item = self._file_context_items_and_index(
-            payload,
-            selected_index=selected_index,
-        )
-        if not files or focused_item is None or selected_index >= len(files):
-            return "Usage: /files [context|working-set|focused|changes|tasks|plan|explicit|auto|show <n>]"
-        reordered = self._reordered_file_context_payload(payload, selected_index=selected_index)
-        lines = self._render_context_focused_lines(reordered, title="focused file")
-        return "\n".join(lines) if lines else "Usage: /files [context|working-set|focused|changes|tasks|plan|explicit|auto|show <n>]"
+        return workflow_describe_files_show(self, selected_index=selected_index)
 
     def _describe_diff_summary(self) -> str:
-        payload = self._working_set_files_payload()
-        files = [item for item in payload.get("file_context_files", []) if isinstance(item, dict)]
-        diff_backed_count = sum(
-            1 for item in files if bool(item.get("has_diff_hunks")) or self._file_context_diff_hunk_count(item) > 0
-        )
-        focused_payload = self._current_context_focus_payload()
-        _focused_files, _focused_index, focused_item = self._file_context_items_and_index(focused_payload)
-        focused_path = str(focused_item.get("path") or "none") if focused_item is not None else "none"
-        focused_diff_hunks = self._file_context_diff_hunk_count(focused_item) if focused_item is not None else 0
-        lines = [
-            "diff summary:",
-            f"recorded undo-stack changes: {len(self.state.recent_change_sets)}",
-            f"recorded redo-stack changes: {len(self.state.undone_change_sets)}",
-            f"diff-backed working-set files: {diff_backed_count}",
-            self._render_file_context_mix_line(files),
-            f"focused file: {focused_path}",
-            f"focused diff hunks: {focused_diff_hunks}",
-            "next actions:",
-            "- /diff focused",
-            "- /diff working-set",
-            "- /files focused",
-            "- /changes working-set",
-        ]
-        return "\n".join(lines)
+        return workflow_describe_diff_summary(self)
 
     def _describe_diff_focused(self) -> str:
-        payload = self._current_context_focus_payload()
-        files, _index, focused_item = self._file_context_items_and_index(payload)
-        if not files or focused_item is None:
-            return "\n".join(
-                [
-                    "focused diff:",
-                    "No focused file context.",
-                    "next actions:",
-                    "- /diff working-set",
-                    "- /status workflow",
-                ]
-            )
-        lines = self._render_context_focused_lines(payload, title="focused file")
-        actions = self._file_context_item_action_groups(
-            focused_item,
-            stay_on_surface_actions=self._diff_stay_on_surface_actions(),
-        )
-        if lines:
-            lines[-1] = "- stay_on_surface: " + (
-                " | ".join(actions["stay_on_surface"]) if actions["stay_on_surface"] else "none"
-            )
-        if self._file_context_diff_hunk_count(focused_item) <= 0:
-            lines.append("- diff status: no diff hunks on focused file")
-            return "\n".join(lines)
-        return "\n".join(lines)
+        return workflow_describe_diff_focused(self)
 
     def _describe_diff_working_set(self) -> str:
-        payload = self._reorder_payload_to_current_focus(
-            self._diff_working_set_payload(),
-            required_reason="recent change",
-        )
-        files = [item for item in payload.get("file_context_files", []) if isinstance(item, dict)]
-        lines = [
-            "diff-backed working set:",
-            f"file_count: {len(files)}",
-        ]
-        if not files:
-            return "\n".join(lines + ["No diff-backed working-set files."])
-        lines.append(self._render_file_context_mix_line(files))
-        for index, item in enumerate(files, start=1):
-            related_change = str(item.get("change_id") or "").strip() or "none"
-            lines.append(f"{index}. {item['path']}")
-            lines.append(f"- related change: {related_change}")
-            lines.append(f"- diff hunks: {self._file_context_diff_hunk_count(item)}")
-            lines.extend(
-                self._render_file_context_action_group_lines(
-                    item,
-                    stay_on_surface_actions=self._diff_stay_on_surface_actions(),
-                    line_prefix="- ",
-                    ordered_keys=("go_to_change", "go_to_task", "go_to_plan", "stay_on_surface"),
-                )
-            )
-            if index < len(files):
-                lines.append("")
-        return "\n".join(lines)
+        return workflow_describe_diff_working_set(self)
 
     def _describe_status_workflow(self) -> str:
-        task_surfaces = self.task_surface_counts_payload()
-        artifact = self.active_planning_artifact()
-        explicit_entries = self._explicit_context_entries_payloads()
-        working_set_payload = self.working_set_payload(limit=3)
-        focused_payload = self._current_context_focus_payload()
-        file_items = [
-            item for item in working_set_payload.get("file_context_files", []) if isinstance(item, dict)
-        ]
-        _focused_files, _focused_index, focused_item = self._file_context_items_and_index(focused_payload)
-        explicit_counts = self._explicit_context_summary_counts(
-            entries=explicit_entries,
-            files=file_items,
-            total_file_count=len(file_items),
-        )
-        history_state = self._history_state_payload(
-            message_count=len(self.state.messages),
-            context_summary=self.state.context_summary,
-        )
-        task_surface_summary = (
-            ", ".join(f"{name}={count}" for name, count in sorted(task_surfaces.items()) if count)
-            if task_surfaces
-            else "none"
-        )
-        lines = ["workflow status:"]
-        lines.extend(self._history_state_lines(history_state))
-        lines.extend(
-            self.render_summary_field_lines(
-                [
-                    ("recorded changes", len(self.state.recent_change_sets)),
-                    ("redo changes", len(self.state.undone_change_sets)),
-                    ("task surfaces", task_surface_summary),
-                    ("planning artifacts", len(self.planning_artifacts())),
-                    ("active plan goal", artifact.goal if artifact is not None else "none"),
-                    ("advisor activity", len(self.state.advisor_review_history)),
-                    ("explicit context entries", explicit_counts["entry_count"]),
-                    ("unresolved explicit context entries", explicit_counts["unresolved_entry_count"]),
-                    ("explicit-context files", explicit_counts["explicit_file_count"]),
-                ],
-            )
-        )
-        lines.append(self._render_file_context_mix_line(file_items))
-        if focused_item is not None:
-            lines.extend(
-                self.render_summary_field_lines(
-                    [
-                        ("focused file", str(focused_item.get("path") or "none")),
-                        ("focused file source", str(focused_item.get("source") or "none")),
-                        ("focused diff hunks", self._file_context_diff_hunk_count(focused_item)),
-                    ],
-                )
-            )
-        working_set_lines = self._render_file_context_lines(
-            working_set_payload,
-            title="Working set",
-        )
-        if working_set_lines:
-            lines.append("")
-            lines.extend(working_set_lines)
-        status_action_groups = (
-            self._file_context_item_action_groups(
-                focused_item,
-                stay_on_surface_actions=[
-                    "/status workflow",
-                    "/files focused",
-                    "/diff focused",
-                    "/changes working-set",
-                    "/files explicit",
-                    "/files context",
-                ],
-            )
-            if focused_item is not None
-            else {
-                "go_to_change": [],
-                "go_to_task": [],
-                "go_to_plan": [],
-                "stay_on_surface": [
-                    "/status workflow",
-                    "/files focused",
-                    "/diff focused",
-                    "/changes working-set",
-                    "/files explicit",
-                    "/files context",
-                ],
-            }
-        )
-        status_action_groups["go_to_change"] = self._dedupe_action_commands(
-            [*status_action_groups.get("go_to_change", []), "/changes working-set"]
-        )
-        status_action_groups["go_to_task"] = self._dedupe_action_commands(
-            [*status_action_groups.get("go_to_task", []), "/tasks active"]
-        )
-        status_action_groups["go_to_plan"] = self._dedupe_action_commands(
-            [*status_action_groups.get("go_to_plan", []), "/plan"]
-        )
-        lines.append("")
-        lines.extend(
-            self._render_action_group_lines(
-                status_action_groups,
-                ordered_keys=("go_to_change", "go_to_task", "go_to_plan", "stay_on_surface"),
-            )
-        )
-        return "\n".join(lines)
+        return workflow_describe_status_workflow(self)
 
     def _describe_status_resume(self) -> str:
-        session_id = self.state.session_id
-        history_state = self._history_state_payload(
-            message_count=len(self.state.messages),
-            context_summary=self.state.context_summary,
-        )
-        saved_summary = self.describe_saved_sessions(selector=session_id, section="summary")
-        saved_resumable = not saved_summary.startswith("No saved session found")
-        continuation = self._saved_resume_semantics(
-            session_id=session_id,
-            saved_resumable=saved_resumable,
-            stay_on_surface="/status resume | /sessions show latest",
-        )
-        resume_path = f"pyclaude --resume-session {session_id} repl" if saved_resumable else "unavailable"
-        resume_tui_path = f"pyclaude --resume-session {session_id} tui" if saved_resumable else "unavailable"
-        lines = [
-            "resume status:",
-            f"current session_id: {session_id}",
-            *self._history_state_lines(history_state),
-            f"resume path: {resume_path}",
-            f"resume tui path: {resume_tui_path}",
-            f"continuation category: {continuation['continuation_category']}",
-            f"go_to_live_attach: {continuation['go_to_live_attach']}",
-            f"go_to_saved_resume: {continuation['go_to_saved_resume']}",
-            f"stay_on_surface: {continuation['stay_on_surface']}",
-        ]
-        if saved_resumable:
-            lines.extend(["", saved_summary])
-        else:
-            lines.extend(
-                [
-                    "saved session: not yet persisted",
-                    "next actions:",
-                    "- /status resume",
-                    "- /sessions show latest",
-                ]
-            )
-        return "\n".join(lines)
+        return workflow_describe_status_resume(self)
 
     def get_python_symbol_index(self) -> PythonProjectIndex:
         return self._runtime_context.get_python_symbol_index()
@@ -7667,13 +10380,21 @@ class Session:
     def _symbol_surface_config_fields(self) -> list[str]:
         return self._symbol_surface_component._symbol_surface_config_fields()
 
-    def clear_history(self) -> None:
+    def clear_history(self) -> str:
         self.state.messages.clear()
         self.state.context_summary = None
+        self._remember_memory_operation("clear_history")
         self.persist_state()
+        return "\n".join(
+            [
+                "Cleared conversation history only for this session.",
+                *self._memory_operation_surface_policy_lines("clear_history"),
+            ]
+        )
 
     def clear_session_reset(self) -> dict[str, Any]:
         self.persist_state()
+        previous_state = self.state
         old_session_id = self.state.session_id
         preserved_task_records = deepcopy(self.state.saved_task_records)
         preserved_task_surface_counts = deepcopy(self.state.saved_task_surface_counts)
@@ -7691,11 +10412,24 @@ class Session:
             session_id=self.state.session_id,
         )
         self._latest_checklist_duplicate_guard = None
-        self._current_symbol_surface = None
-        self._current_change_focus_payload = None
-        self._current_task_focus_payload = None
-        self._current_plan_focus_payload = None
+        self._apply_memory_operation_surface_policy("clear_session")
         self._last_project_context_reload = None
+        boundary = self._record_history_boundary(
+            HistoryBoundary(
+                kind="fresh_session_reset",
+                trigger="session_reset",
+                summary="Started a fresh local session after resetting prior conversation state.",
+                message_count_before=len(previous_state.messages),
+                message_count_after=0,
+                context_summary_chars_before=len(previous_state.context_summary or ""),
+                context_summary_chars_after=0,
+                old_session_id=old_session_id,
+                new_session_id=self.state.session_id,
+                snapshot_messages=deepcopy(previous_state.messages),
+                snapshot_context_summary=previous_state.context_summary,
+            )
+        )
+        self._remember_memory_operation("clear_session", boundary=boundary)
         self.persist_state()
         transcript_root = self.config.transcript_cwd or self.config.cwd
         transcript_path = get_session_path(transcript_root, self.state.session_id)
@@ -7706,7 +10440,8 @@ class Session:
             "text": (
                 "Started a fresh local session.\n"
                 f"old_session_id: {old_session_id}\n"
-                f"new_session_id: {self.state.session_id}"
+                f"new_session_id: {self.state.session_id}\n"
+                + "\n".join(self._memory_operation_surface_policy_lines("clear_session"))
             ),
         }
 
@@ -7763,11 +10498,8 @@ class Session:
         self.clear_history()
         self.state.recent_change_sets.clear()
         self.state.undone_change_sets.clear()
-        self._current_symbol_surface = None
-        self._current_change_focus_payload = None
-        self._current_task_focus_payload = None
-        self._current_plan_focus_payload = None
-        self.state.last_symbol_surface_payload = None
+        self._clear_symbol_surface_state()
+        self._clear_workflow_focus_payloads()
         self.persist_state()
         return (
             "Cleared session workflow state: history, recorded changes, and symbol surface."
@@ -7865,6 +10597,7 @@ class Session:
         before = self._project_context_reload_snapshot()
         try:
             self._refresh_plugin_runtime()
+            self._refresh_agent_registry()
             self.persist_state()
         except Exception as exc:
             error = f"{type(exc).__name__}: {exc}"
@@ -7878,8 +10611,13 @@ class Session:
             f"memory={memory_status} skills={len(self.project_context.skills)} "
             f"enabled={len(self.active_skills())} "
             f"memory_changed={self._yes_no(status.get('memory_changed'))} "
-            f"skill_set_changed={self._yes_no(status.get('skill_set_changed'))} "
-            f"plugin_state_changed={self._yes_no(status.get('plugin_state_changed'))}"
+            f"skill_state_changed={self._yes_no(status.get('skill_state_changed'))} "
+            f"enabled_skill_set_changed={self._yes_no(status.get('enabled_skill_set_changed'))} "
+            f"skill_diagnostics_changed={self._yes_no(status.get('skill_diagnostics_changed'))} "
+            f"skill_resolution_changed={self._yes_no(status.get('skill_resolution_changed'))} "
+            f"skill_content_changed={self._yes_no(status.get('skill_content_changed'))} "
+            f"plugin_state_changed={self._yes_no(status.get('plugin_state_changed'))} "
+            f"agent_definition_changed={self._yes_no(status.get('agent_definition_changed'))}"
         )
 
     def add_permission_rule(self, decision: str, scope: str, value: str) -> str:
@@ -8279,6 +11017,8 @@ class Session:
         self._runtime_context.replace_plugin_registry(plugin_registry, self.state)
         self._reconcile_plugin_state()
         self._reconcile_skill_state()
+        self._invalidate_runtime_prompt_inspection()
+        self._invalidate_tool_schema_cache()
         if self._session_factory.load_mcp_from_config:
             self._runtime_context.replace_mcp_registry(
                 self._session_factory.load_mcp_registry_from_config(
@@ -8287,6 +11027,9 @@ class Session:
                     plugin_registry=plugin_registry,
                 )
             )
+
+    def _refresh_agent_registry(self) -> None:
+        self._agent_registry = self._session_factory.resolve_agent_registry(self.config.cwd)
 
     def is_bash_command_allowed(self, command: str) -> bool:
         return self.evaluate_bash_command_policy(command).allowed
@@ -8334,6 +11077,7 @@ class Session:
         if raw not in names:
             names.add(raw)
             self.state.activated_deferred_tool_names = sorted(names)
+            self._invalidate_runtime_prompt_inspection()
             self.persist_state()
         return True
 
@@ -8509,6 +11253,7 @@ class Session:
             plugin_registry=plugin_registry,
         )
         self._runtime_context.replace_mcp_registry(new_registry)
+        self._invalidate_tool_schema_cache()
         self.persist_state()
         if self.mcp_registry is None:
             return "Reloaded MCP configuration. No servers configured."
@@ -8575,6 +11320,7 @@ class Session:
             return f'Unknown MCP server "{server_name}".'
         server = self.mcp_registry.reconnect_server(server_name)
         self._runtime_context.replace_mcp_registry(self.mcp_registry)
+        self._invalidate_tool_schema_cache()
         self.persist_state()
         if server.status != "connected":
             retry_in = self.mcp_registry.retry_wait_seconds(server_name)
@@ -8808,6 +11554,7 @@ class Session:
                 "ultraplan_scout",
                 definition.description,
                 parent_session_id=self.state.session_id,
+                **self._task_background_metadata(),
                 provider=self.config.provider,
                 model=self.config.model,
                 cwd=str(self.config.cwd),
@@ -8868,42 +11615,173 @@ class Session:
 
     def _build_background_task_sink(self, task_id: str):
         def sink(event: RuntimeEvent) -> None:
+            runtime_metadata = self._background_runtime_progress_metadata(task_id, event)
             summary = self._summarize_runtime_event(event)
-            if summary:
-                metadata: dict[str, Any] = {}
-                permission_context = PermissionDisplayContext(
-                    decision_reason=event.decision_reason or "",
-                    permission_rules=event.permission_rules,
-                    command_mode_name=event.command_mode_name or "",
-                    command_mode_allowed_prefixes=event.command_mode_allowed_prefixes,
-                    command_mode_violating_segment=event.command_mode_violating_segment or "",
-                    command_mode_violating_segment_index=event.command_mode_violating_segment_index,
-                    command_mode_complex_features=event.command_mode_complex_features,
+            metadata: dict[str, Any] = dict(runtime_metadata)
+            permission_context = PermissionDisplayContext(
+                decision_reason=event.decision_reason or "",
+                permission_rules=event.permission_rules,
+                command_mode_name=event.command_mode_name or "",
+                command_mode_allowed_prefixes=event.command_mode_allowed_prefixes,
+                command_mode_violating_segment=event.command_mode_violating_segment or "",
+                command_mode_violating_segment_index=event.command_mode_violating_segment_index,
+                command_mode_complex_features=event.command_mode_complex_features,
+            )
+            if has_permission_display_context(permission_context):
+                metadata.update(
+                    {
+                        "permission_display_decision_reason": permission_context.decision_reason,
+                        "permission_display_permission_rules": list(permission_context.permission_rules),
+                        "permission_display_command_mode_name": permission_context.command_mode_name,
+                        "permission_display_command_mode_allowed_prefixes": list(
+                            permission_context.command_mode_allowed_prefixes
+                        ),
+                        "permission_display_command_mode_violating_segment": (
+                            permission_context.command_mode_violating_segment
+                        ),
+                        "permission_display_command_mode_violating_segment_index": (
+                            permission_context.command_mode_violating_segment_index
+                        ),
+                        "permission_display_command_mode_complex_features": list(
+                            permission_context.command_mode_complex_features
+                        ),
+                    }
                 )
-                if has_permission_display_context(permission_context):
-                    metadata.update(
-                        {
-                            "permission_display_decision_reason": permission_context.decision_reason,
-                            "permission_display_permission_rules": list(permission_context.permission_rules),
-                            "permission_display_command_mode_name": permission_context.command_mode_name,
-                            "permission_display_command_mode_allowed_prefixes": list(
-                                permission_context.command_mode_allowed_prefixes
-                            ),
-                            "permission_display_command_mode_violating_segment": (
-                                permission_context.command_mode_violating_segment
-                            ),
-                            "permission_display_command_mode_violating_segment_index": (
-                                permission_context.command_mode_violating_segment_index
-                            ),
-                            "permission_display_command_mode_complex_features": list(
-                                permission_context.command_mode_complex_features
-                            ),
-                        }
-                    )
+            if summary:
                 self.task_manager.set_progress(task_id, summary, **metadata)
                 self.task_manager.append_output(task_id, summary + "\n")
+            elif metadata:
+                self.task_manager.update_metadata(task_id, **metadata)
 
         return sink
+
+    def _background_runtime_progress_metadata(
+        self,
+        task_id: str,
+        event: RuntimeEvent,
+    ) -> dict[str, Any]:
+        task = self.task_manager.get(task_id)
+        existing = dict(task.metadata or {}) if task is not None else {}
+        metadata = dict(existing)
+        timestamp = datetime.now(UTC).isoformat()
+
+        if event.kind == "assistant_usage" and event.total_tokens is not None:
+            total_tokens = int(event.total_tokens)
+            metadata["background_token_count"] = int(metadata.get("background_token_count", 0) or 0) + total_tokens
+            if event.usage_source == "provider":
+                metadata["background_runtime_provider_usage_seen"] = True
+                metadata["background_token_count_source"] = "provider"
+            elif metadata.get("background_runtime_provider_usage_seen"):
+                metadata["background_token_count_source"] = "provider"
+            else:
+                metadata["background_token_count_source"] = "estimated"
+            metadata["background_runtime_turn_token_source"] = event.usage_source or "estimated"
+            metadata["background_progress_updated_at"] = timestamp
+            return metadata
+
+        if event.kind == "task_progress":
+            metadata["background_runtime_last_task_progress"] = self._compact_runtime_progress_text(event.message)
+        elif event.kind == "assistant_text":
+            metadata["background_runtime_last_assistant_activity"] = self._compact_runtime_progress_text(event.message)
+        elif event.kind == "tool_started":
+            metadata["background_tool_use_count"] = int(metadata.get("background_tool_use_count", 0) or 0) + 1
+        elif event.kind in {"tool_finished", "tool_failed"}:
+            if metadata.get("background_runtime_turn_token_source") != "provider":
+                tool_summary = self._background_last_tool_summary_for_event(event)
+                metadata["background_token_count"] = int(metadata.get("background_token_count", 0) or 0) + (
+                    self._estimate_runtime_progress_tokens(str(tool_summary or ""))
+                )
+                if not metadata.get("background_runtime_provider_usage_seen"):
+                    metadata["background_token_count_source"] = "estimated"
+
+        runtime_snapshot = self._background_runtime_progress_snapshot_from_metadata(metadata)
+        runtime_snapshot = self._apply_runtime_progress_event_to_snapshot(runtime_snapshot, event)
+        self._apply_background_runtime_progress_snapshot_to_metadata(metadata, runtime_snapshot)
+
+        recent_activity, recent_kind = self._background_recent_activity_from_metadata(metadata)
+        metadata["background_recent_activity"] = recent_activity
+        metadata["background_recent_activity_kind"] = recent_kind
+        metadata["background_progress_summary"] = recent_activity
+        metadata["background_progress_updated_at"] = timestamp
+        if not metadata.get("background_token_count_source"):
+            token_count = int(metadata.get("background_token_count", 0) or 0)
+            metadata["background_token_count_source"] = "estimated" if token_count > 0 else "none"
+        return metadata
+
+    def _background_recent_activity_from_metadata(
+        self,
+        metadata: dict[str, Any],
+    ) -> tuple[str | None, str | None]:
+        runtime_summary = self._compact_runtime_progress_text(
+            str(metadata.get("background_runtime_recent_progress_summary") or "")
+        )
+        runtime_kind = str(metadata.get("background_runtime_recent_progress_kind") or "").strip()
+        if runtime_summary and runtime_kind == "compact_recovery":
+            return runtime_summary, "compact_recovery"
+        if runtime_summary and runtime_kind == "budget_pressure":
+            return runtime_summary, "budget_pressure"
+        if runtime_summary and runtime_kind == "tool_result_replacement":
+            return runtime_summary, "tool_result_replacement"
+        if runtime_summary and runtime_kind == "tool_waiting_for_approval":
+            return runtime_summary, "tool_waiting_for_approval"
+        if runtime_summary and runtime_kind == "tool_running":
+            return runtime_summary, "tool_running"
+        if runtime_summary and runtime_kind == "tool_result":
+            return runtime_summary, "tool_result"
+        task_progress = self._compact_runtime_progress_text(
+            str(metadata.get("background_runtime_last_task_progress") or "")
+        )
+        if task_progress:
+            return task_progress, "task_progress"
+        last_tool = str(metadata.get("background_last_tool") or "").strip()
+        last_tool_summary = self._compact_runtime_progress_text(
+            str(metadata.get("background_last_tool_summary") or "")
+        )
+        assistant_activity = self._compact_runtime_progress_text(
+            str(metadata.get("background_runtime_last_assistant_activity") or "")
+        )
+        if runtime_summary and runtime_kind == "assistant":
+            return runtime_summary, "assistant_text"
+        if assistant_activity:
+            return assistant_activity, "assistant_text"
+        if last_tool_summary:
+            return (
+                f"{last_tool}: {last_tool_summary}" if last_tool else last_tool_summary,
+                "tool_finished",
+            )
+        return None, None
+
+    def _background_last_tool_summary_for_event(self, event: RuntimeEvent) -> str | None:
+        if event.kind == "tool_finished":
+            if event.duration_ms is not None:
+                return f"ok ({event.duration_ms}ms)"
+            return "ok"
+        if event.kind == "tool_failed":
+            tool_error = self._compact_runtime_progress_text(event.message, limit=180)
+            if event.duration_ms is not None:
+                return f"{tool_error} ({event.duration_ms}ms)" if tool_error else f"failed ({event.duration_ms}ms)"
+            return tool_error or "failed"
+        return None
+
+    def _background_waiting_tool_summary_for_event(self, event: RuntimeEvent) -> str | None:
+        risk = str(event.approval_risk_level or "").strip()
+        if risk:
+            return f"waiting for approval ({risk})"
+        return "waiting for approval"
+
+    def _compact_runtime_progress_text(self, text: str, *, limit: int = 180) -> str | None:
+        stripped = text.strip()
+        if not stripped:
+            return None
+        if len(stripped) <= limit:
+            return stripped
+        return stripped[: limit - 3] + "..."
+
+    def _estimate_runtime_progress_tokens(self, text: str) -> int:
+        stripped = text.strip()
+        if not stripped:
+            return 0
+        return (len(stripped) + 3) // 4
 
     def _task_permission_display_context(self, metadata: dict[str, Any]) -> PermissionDisplayContext:
         rules = metadata.get("permission_display_permission_rules") or ()
@@ -8959,6 +11837,26 @@ class Session:
             return f"[assistant->tools] {event.message}"
         if event.kind == "assistant_tool_result_ready":
             return f"[tools->assistant] {event.message}"
+        if event.kind == "tool_result_summarized":
+            return f"[tool:summary] {event.message}"
+        if event.kind == "tool_result_replacement_applied":
+            return f"[replacement] {event.message}"
+        if event.kind == "tool_result_replacement_reapplied":
+            return f"[replacement] {event.message}"
+        if event.kind == "tool_result_artifact_created":
+            return f"[artifact:create] {event.message}"
+        if event.kind == "tool_result_artifact_reused":
+            return f"[artifact:reuse] {event.message}"
+        if event.kind == "tool_result_microcompacted":
+            return f"[microcompact] {event.message}"
+        if event.kind == "tool_batch_started":
+            return f"[tool:batch:start] {event.message}"
+        if event.kind == "tool_batch_finished":
+            return f"[tool:batch:done] {event.message}"
+        if event.kind == "tool_waiting_for_approval":
+            tool_name = event.tool_name or "unknown"
+            risk = f" risk={event.approval_risk_level}" if event.approval_risk_level else ""
+            return f"[tool:waiting] {tool_name}{risk} {event.message}"
         if event.kind == "tool_started":
             tool_name = event.tool_name or "unknown"
             return f"[tool:start] {tool_name} {event.message}"
@@ -8986,6 +11884,12 @@ class Session:
             return summary
         if event.kind == "provider_retry":
             return f"[provider:retry] {event.message}"
+        if event.kind == "budget_pressure":
+            return f"[budget] {event.message}"
+        if event.kind == "compact_recovery_started":
+            return f"[recovery:start] {event.message}"
+        if event.kind == "compact_recovery_finished":
+            return f"[recovery:done] {event.message}"
         if event.kind == "context_compacted":
             return f"[context] {event.message}"
         if event.kind == "tool_result":

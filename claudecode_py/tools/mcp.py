@@ -27,6 +27,9 @@ class McpToolAdapter(BaseTool):
         )
         self.input_schema = reference.tool.input_schema
 
+    def schema_source(self) -> str:
+        return "mcp"
+
     def execute(self, tool_input: dict[str, Any], ctx):
         server = ctx.session.ensure_mcp_server_connected(self.reference.server_name)
         if server is None:

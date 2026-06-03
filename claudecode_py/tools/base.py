@@ -146,6 +146,9 @@ class BaseTool(ABC):
     def is_deferred(self) -> bool:
         return self.deferred
 
+    def schema_source(self) -> str:
+        return "builtin"
+
     def matches_search_query(self, query: str) -> bool:
         normalized = query.casefold().strip()
         if not normalized:

@@ -420,6 +420,13 @@ class ServiceDispatcher:
             **self._execution_contract_metadata_for_session(session),
             **self._planning_surface_metadata_for_session(session),
             **self._task_surface_metadata_for_session(session),
+            **self._memory_metadata_for_session(session),
+            **self._background_metadata_for_session(session),
+            **self._background_registry_metadata_for_session(session),
+            **self._background_handoff_metadata_for_session(session),
+            **self._skills_metadata_for_session(session),
+            **self._plugin_metadata_for_session(session),
+            **self._status_metadata_for_session(session),
         }
 
     def _session_resume(self, params: dict[str, Any]) -> dict[str, Any]:
@@ -472,6 +479,13 @@ class ServiceDispatcher:
             **self._execution_contract_metadata_for_session(session),
             **self._planning_surface_metadata_for_session(session),
             **self._task_surface_metadata_for_session(session),
+            **self._memory_metadata_for_session(session),
+            **self._background_metadata_for_session(session),
+            **self._background_registry_metadata_for_session(session),
+            **self._background_handoff_metadata_for_session(session),
+            **self._skills_metadata_for_session(session),
+            **self._plugin_metadata_for_session(session),
+            **self._status_metadata_for_session(session),
             **self._checklist_duplicate_metadata_for_session(session),
             **self._symbol_surface_metadata_for_session(session),
             **self._file_context_metadata_for_session(session),
@@ -497,6 +511,13 @@ class ServiceDispatcher:
                     **self._execution_contract_metadata_for_session(session),
                     **self._planning_surface_metadata_for_session(session),
                     **self._task_surface_metadata_for_session(session),
+                    **self._memory_metadata_for_session(session),
+                    **self._background_metadata_for_session(session),
+                    **self._background_registry_metadata_for_session(session),
+                    **self._background_handoff_metadata_for_session(session),
+                    **self._skills_metadata_for_session(session),
+                    **self._plugin_metadata_for_session(session),
+                    **self._status_metadata_for_session(session),
                     **self._symbol_surface_metadata_for_session(session),
                     **self._file_context_metadata_for_session(session),
                 }
@@ -563,6 +584,7 @@ class ServiceDispatcher:
             "workspace_tertiary_action": action_bundle["tertiary_action"],
             "workspace_action_target": action_bundle["target"],
             "workspace_effective_cwd_exists": Path(effective_cwd).exists() if effective_cwd else None,
+            "workspace_surface": dict(session.workspace_surface_payload()),
         }
 
     def _symbol_surface_metadata_for_session(self, session: Session) -> dict[str, Any]:
@@ -651,6 +673,29 @@ class ServiceDispatcher:
             "has_task_surface": any(int(value) > 0 for value in counts.values()),
         }
 
+    def _memory_metadata_for_session(self, session: Session) -> dict[str, Any]:
+        payload = dict(session.memory_surface_payload())
+        payload["context_summary"] = session.state.context_summary
+        return payload
+
+    def _background_metadata_for_session(self, session: Session) -> dict[str, Any]:
+        return dict(session.background_surface_payload())
+
+    def _background_registry_metadata_for_session(self, session: Session) -> dict[str, Any]:
+        return dict(session.background_registry_payload())
+
+    def _background_handoff_metadata_for_session(self, session: Session) -> dict[str, Any]:
+        return dict(session.background_handoff_payload())
+
+    def _plugin_metadata_for_session(self, session: Session) -> dict[str, Any]:
+        return {"plugin_surface": dict(session.plugin_surface_payload())}
+
+    def _skills_metadata_for_session(self, session: Session) -> dict[str, Any]:
+        return {"skills_surface": dict(session.skills_surface_payload())}
+
+    def _status_metadata_for_session(self, session: Session) -> dict[str, Any]:
+        return dict(session.status_surface_payload())
+
     def _file_context_metadata_for_session(self, session: Session) -> dict[str, Any]:
         payload = session.working_set_payload()
         return {
@@ -663,6 +708,7 @@ class ServiceDispatcher:
             "working_set_primary_path": payload.get("file_context_primary_path"),
             "working_set_primary_target": payload.get("file_context_primary_target"),
             "working_set_primary_diff_targets": payload.get("file_context_primary_diff_targets"),
+            "file_context_surface": dict(session.file_context_surface_payload()),
             **self._focused_file_context_metadata_for_payload(payload, source="working_set"),
         }
 
@@ -1116,6 +1162,8 @@ class ServiceDispatcher:
             text = session.describe_project_memory()
         elif view == "loaded_skills":
             text = session.describe_loaded_skills()
+        elif view == "agents":
+            text = session.describe_agents()
         elif view == "mcp_tool_diagnostic":
             text = session.describe_mcp_tool_diagnostic(
                 self._require_string(params, "server"),
@@ -1214,8 +1262,37 @@ class ServiceDispatcher:
         if not isinstance(action, str) or not action:
             raise ServiceError(-32602, "action must be a non-empty string.")
         if action == "clear_history":
-            session.clear_history()
-            text = "Cleared conversation history only for this session."
+            text = session.clear_history()
+        elif action == "background_send_followup":
+            text = session.send_background_followup(
+                str(params.get("bg_id", "")),
+                str(params.get("prompt", "")),
+            )
+        elif action == "background_queue_message":
+            text = session.queue_background_message(
+                str(params.get("bg_id", "")),
+                str(params.get("prompt", "")),
+            )
+        elif action == "background_cancel_pending_followup":
+            text = session.cancel_pending_background_followup(str(params.get("bg_id", "")))
+        elif action == "describe_rewind":
+            args = str(params.get("args", ""))
+            text = session.describe_rewind(args)
+            response = {
+                "action": action,
+                "text": text,
+                "rewind_mode": self._rewind_mode_from_args(args),
+                "rewindable_boundary_count": int(
+                    session.memory_surface_payload().get("rewindable_history_boundary_count") or 0
+                ),
+                "default_rewind_selector": session.memory_surface_payload().get("default_rewind_selector"),
+            }
+            preview = self._rewind_preview_metadata_for_args(session, args)
+            if preview is not None:
+                response.update(preview)
+            return response
+        elif action == "rewind_to_boundary":
+            text = session.rewind_to_boundary(str(params.get("args", "")))
         elif action == "clear_session_reset":
             result = session.clear_session_reset()
             new_session_id = str(result.get("session_id") or session.state.session_id)
@@ -1333,6 +1410,68 @@ class ServiceDispatcher:
                 data={"type": "invalid_params", "field": "action"},
             )
         return {"action": action, "text": text}
+
+    def _rewind_mode_from_args(self, args: str) -> str:
+        raw = str(args or "").strip()
+        if not raw or raw.lower() == "list":
+            return "list"
+        if raw.lower().startswith("show "):
+            return "show"
+        if raw.lower().startswith("apply "):
+            return "apply"
+        return "unknown"
+
+    def _rewind_preview_metadata_for_args(
+        self,
+        session: Session,
+        args: str,
+    ) -> dict[str, Any] | None:
+        raw = str(args or "").strip()
+        selector = ""
+        if raw.lower().startswith("show "):
+            selector = raw.split(" ", 1)[1].strip()
+        elif not raw or raw.lower() == "list":
+            selector = str(session.memory_surface_payload().get("default_rewind_selector") or "").strip()
+        if not selector:
+            return None
+        payload = session.rewind_boundary_preview_payload(selector)
+        if not isinstance(payload, dict) or not payload:
+            return None
+        workflow_surface_policy = payload.get("workflow_surface_policy")
+        return {
+            "selector": payload.get("selector_index"),
+            "boundary_id": payload.get("boundary_id"),
+            "boundary_kind": payload.get("boundary_kind"),
+            "boundary_kind_label": payload.get("boundary_kind_label"),
+            "trigger": payload.get("trigger"),
+            "trigger_reason": payload.get("trigger_reason"),
+            "created_at": payload.get("created_at"),
+            "summary": payload.get("summary"),
+            "rewindable": bool(payload.get("rewindable")),
+            "message_count_before": int(payload.get("message_count_before") or 0),
+            "message_count_after": int(payload.get("message_count_after") or 0),
+            "context_summary_chars_before": int(payload.get("context_summary_chars_before") or 0),
+            "context_summary_chars_after": int(payload.get("context_summary_chars_after") or 0),
+            "snapshot_available": bool(payload.get("snapshot_available")),
+            "snapshot_message_count": int(payload.get("snapshot_message_count") or 0),
+            "snapshot_summary_chars": int(payload.get("snapshot_summary_chars") or 0),
+            "target_boundary_id": payload.get("target_boundary_id"),
+            "target_boundary_kind": payload.get("target_boundary_kind"),
+            "target_boundary_kind_label": payload.get("target_boundary_kind_label"),
+            "old_session_id": payload.get("old_session_id"),
+            "new_session_id": payload.get("new_session_id"),
+            "lineage_summary": payload.get("lineage_summary"),
+            "restore_message_delta_current": int(payload.get("restore_message_delta_current") or 0),
+            "restore_summary_chars_delta_current": int(payload.get("restore_summary_chars_delta_current") or 0),
+            "restore_message_count_current": int(payload.get("restore_message_count_current") or 0),
+            "restore_summary_chars_current": int(payload.get("restore_summary_chars_current") or 0),
+            "targets_pre_compact_state": bool(payload.get("targets_pre_compact_state")),
+            "targets_post_resume_state": bool(payload.get("targets_post_resume_state")),
+            "restore_effect_summary": payload.get("restore_effect_summary"),
+            "workflow_surface_policy": dict(workflow_surface_policy) if isinstance(workflow_surface_policy, dict) else {},
+            "apply_action": payload.get("apply_action"),
+            "show_action": payload.get("show_action"),
+        }
 
     def _session_approval_status(self, params: dict[str, Any]) -> dict[str, Any]:
         session_id = self._require_session_id(params)
@@ -1640,6 +1779,24 @@ def _service_event_to_dict(event: RuntimeEvent) -> dict[str, Any]:
         "tool_name": event.tool_name,
         "tool_call_id": event.tool_call_id,
         "duration_ms": event.duration_ms,
+        "prompt_tokens": event.prompt_tokens,
+        "completion_tokens": event.completion_tokens,
+        "total_tokens": event.total_tokens,
+        "usage_source": event.usage_source,
+        "batch_size": event.batch_size,
+        "batch_parallel": event.batch_parallel,
+        "result_count": event.result_count,
+        "budget_state": event.budget_state,
+        "budget_reason": event.budget_reason,
+        "compaction_trigger": event.compaction_trigger,
+        "approval_risk_level": event.approval_risk_level,
+        "replacement_count": event.replacement_count,
+        "replaced_chars_total": event.replaced_chars_total,
+        "replacement_reason": event.replacement_reason,
+        "artifact_count": event.artifact_count,
+        "artifact_chars_saved": event.artifact_chars_saved,
+        "microcompact_count": event.microcompact_count,
+        "microcompact_chars_saved": event.microcompact_chars_saved,
         "is_error": event.is_error,
     }
     payload.update(permission_display_context_to_dict(context))

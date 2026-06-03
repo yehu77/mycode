@@ -31,7 +31,9 @@ The current Python implementation already covers the main local runtime shape:
 - MCP registration, discovery, tool exposure, stdio service, and TCP bridge
 - planning, advisor, task, workspace, symbol, and change-inspection surfaces
 - project-local external plugin loading via `.pyclaude/plugins/<name>/plugin.json`
+- shared local plugin workflow vocabulary across `/plugins`, `/plugin show`, `/project-context plugins`, `/config plugins`, `/status`, stdio/remote, and TUI
 - unified `/project-context` inspection for project memory, grouped skill state, plugin contributions, and session-local reload status
+- a completed local skills workflow with shared skill-registry vocabulary, explicit source/resolution diagnostics, reload-state reporting, prompt-composition inspection, structured stdio/remote payloads, and TUI skill-registry depth
 - focused file-context navigation across `Changes`, `Task Detail`, `Active Plan`, and `Status`
 - derived session-level `Working Set` summary with in-scope reasons and modified-vs-context-only classification
 - a dedicated `/context` REPL/headless surface for runtime-aligned context-usage inspection
@@ -66,7 +68,7 @@ Operationally, this is beyond skeleton status. It is already a usable local codi
 
 ## Current Repo Health
 
-- Full test suite currently passes: `575 passed`
+- Full test suite currently passes: `628 passed`
 - Test collection is stabilized with `pytest.ini`
 - Transient artifacts such as `pytest-cache-files-*`, `tests/_tmp*`, and test-local `.pyclaude` residue are excluded from collection
 - Current documentation reflects the local-tool-first scope instead of implying full product parity
@@ -78,7 +80,7 @@ Operationally, this is beyond skeleton status. It is already a usable local codi
    Keep full-suite green status as the baseline and prevent transient artifacts from polluting collection.
 
 2. Continue local coding-workflow depth where parity still matters.
-   Improve the remaining local ergonomics after the now-implemented TUI workflow, scoped `/clear`, manual `/compact`, explicit `/add-dir`, the deeper REPL `/changes`, `/workspaces`, `/history`, `/sessions`, `/config`, `/model`, `/status`, `/context`, `/project-context`, `/files`, and `/diff` surfaces, and the new background-session `ps/logs` inspection depth.
+   Improve the remaining local ergonomics after the now-implemented rewind/history UX, local background-agent workflow depth, and unified `/status` dashboard surface. Choose the next line from the remaining `Partial` rows in `PARITY_MATRIX.md` instead of reopening already-completed local-scope milestone plans.
 
 3. Refine parity tracking for upstream local-agent-relevant surfaces.
    Keep `PARITY_MATRIX.md` current so implementation work stays tied to the local coding-agent target rather than drifting toward product breadth.

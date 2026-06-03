@@ -65,6 +65,13 @@ class PendingChecklistEdit:
 
 
 @dataclass(slots=True)
+class PendingBackgroundFollowup:
+    bg_id: str
+    mode: str
+    prompt: str
+
+
+@dataclass(slots=True)
 class TuiState:
     messages: list[str] = field(default_factory=list)
     turns: list[ChatTurn] = field(default_factory=list)
@@ -73,6 +80,7 @@ class TuiState:
     pending_approval: PendingApproval | None = None
     pending_question: PendingQuestion | None = None
     pending_checklist_edit: PendingChecklistEdit | None = None
+    pending_background_followup: PendingBackgroundFollowup | None = None
     input_history: list[str] = field(default_factory=list)
     input_history_index: int | None = None
     selected_change_index: int = 0
@@ -105,6 +113,9 @@ class TuiState:
     symbol_focus_index: int | None = None
     task_advisor_text: str = ""
     task_drift_text: str = ""
+    selected_background_registry_index: int = 0
+    selected_background_registry_bg_id: str | None = None
+    selected_rewind_boundary_index: int = 0
     selected_plan_scout_index: int = 0
     selected_plan_execution_index: int = 0
     selected_plan_lineage_index: int = 0
@@ -239,6 +250,8 @@ class TuiState:
         if event.kind == "assistant_text":
             self.record_assistant_text(event.message)
             return
+        if event.kind == "assistant_usage":
+            return
         if event.kind == "assistant_tool_call":
             self.record_turn_activity(f"[assistant->tools] {event.message}")
             return
@@ -266,6 +279,15 @@ class TuiState:
         if event.kind == "provider_retry":
             self.append_event(f"[provider:retry] {event.message}")
             return
+        if event.kind == "tool_batch_started":
+            self.append_event(f"[tool:batch:start] {event.message}")
+            return
+        if event.kind == "tool_batch_finished":
+            self.append_event(f"[tool:batch:done] {event.message}")
+            return
+        if event.kind == "tool_waiting_for_approval":
+            self._record_tool_waiting(event)
+            return
         if event.kind == "tool_started":
             self._record_tool_started(event)
             return
@@ -274,6 +296,24 @@ class TuiState:
             return
         if event.kind == "tool_failed":
             self._record_tool_failed(event)
+            return
+        if event.kind == "tool_result_summarized":
+            self.record_turn_activity(f"[tool:summary] {event.message}")
+            return
+        if event.kind == "tool_result_replacement_applied":
+            self.append_event(f"[replacement] {event.message}")
+            return
+        if event.kind == "tool_result_replacement_reapplied":
+            self.append_event(f"[replacement] {event.message}")
+            return
+        if event.kind == "budget_pressure":
+            self.append_event(f"[budget] {event.message}")
+            return
+        if event.kind == "compact_recovery_started":
+            self.append_event(f"[recovery:start] {event.message}")
+            return
+        if event.kind == "compact_recovery_finished":
+            self.append_event(f"[recovery:done] {event.message}")
 
     def sync_after_change_applied(self) -> None:
         self.change_status = "Applied changes are now in Undo stack."
@@ -526,6 +566,19 @@ class TuiState:
     def move_plan_replay_selection(self, delta: int) -> None:
         self.selected_plan_replay_index = max(0, self.selected_plan_replay_index + delta)
 
+    def move_background_registry_selection(self, delta: int, *, total: int) -> None:
+        if total <= 0:
+            self.selected_background_registry_index = 0
+            self.selected_background_registry_bg_id = None
+            return
+        self.selected_background_registry_index = (self.selected_background_registry_index + delta) % total
+
+    def move_rewind_boundary_selection(self, delta: int, *, total: int) -> None:
+        if total <= 0:
+            self.selected_rewind_boundary_index = 0
+            return
+        self.selected_rewind_boundary_index = (self.selected_rewind_boundary_index + delta) % total
+
     def cycle_plan_timeline_filter(self) -> None:
         filters = ["all", "plan", "scout", "execution", "advisor", "drift"]
         try:
@@ -578,6 +631,18 @@ class TuiState:
         *,
         provider_text: str,
         config_text: str,
+        status_metadata: dict[str, object] | None = None,
+        memory_metadata: dict[str, object] | None = None,
+        rewind_preview_metadata: dict[str, object] | None = None,
+        background_metadata: dict[str, object] | None = None,
+        background_registry_metadata: dict[str, object] | None = None,
+        background_handoff_metadata: dict[str, object] | None = None,
+        plugin_surface_metadata: dict[str, object] | None = None,
+        skills_surface_metadata: dict[str, object] | None = None,
+        selected_rewind_boundary_index: int = 0,
+        selected_background_registry_index: int = 0,
+        workspace_surface_metadata: dict[str, object] | None = None,
+        file_context_surface_metadata: dict[str, object] | None = None,
         working_set_metadata: dict[str, object] | None = None,
         symbol_surface_metadata: dict[str, object] | None = None,
         symbol_focus_group: str | None = None,
@@ -589,29 +654,79 @@ class TuiState:
     ) -> str:
         config_items = self._parse_config_items(config_text)
 
-        status_lines = [
-            "Status",
-            f"busy: {'yes' if self.busy else 'no'}",
-            f"provider: {config_items.get('provider', '(unknown)')}",
-            f"model: {config_items.get('model', '(unknown)')}",
-            f"session_id: {config_items.get('session_id', '(unknown)')}",
-            f"constraints: {config_items.get('execution_constraints', 'normal')}",
-            f"advisor_blocks: {config_items.get('advisor_blocks', '0')}",
-            f"plan_executions: {config_items.get('plan_executions', '0')}",
-            f"plan_drifts: {config_items.get('plan_drifts', '0')}",
-            f"last_plan_drift: {config_items.get('last_plan_drift_summary', 'none')}",
-            f"active_plan_kind: {config_items.get('active_plan_kind', 'none')}",
-            f"active_plan_goal: {config_items.get('active_plan_goal', 'none')}",
-            f"skills: {config_items.get('enabled_skills', '0')}",
-            f"mcp_servers: {config_items.get('mcp_servers', '0')}",
-            f"mcp_failed: {config_items.get('mcp_failed_servers', '0')}",
-            f"undo: {config_items.get('recent_change_sets', '0')}",
-            f"redo: {config_items.get('redo_change_sets', '0')}",
-        ]
-        workspace_lines = self._workspace_status_lines(config_items)
-        if workspace_lines:
+        status_lines = ["Status"]
+        structured_lines = self._structured_status_dashboard_lines(
+            status_metadata,
+            config_items=config_items,
+            memory_metadata=memory_metadata,
+            rewind_preview_metadata=rewind_preview_metadata,
+            background_metadata=background_metadata,
+            background_registry_metadata=background_registry_metadata,
+            background_handoff_metadata=background_handoff_metadata,
+            plugin_surface_metadata=plugin_surface_metadata,
+            skills_surface_metadata=skills_surface_metadata,
+            selected_rewind_boundary_index=selected_rewind_boundary_index,
+            selected_background_registry_index=selected_background_registry_index,
+            workspace_surface_metadata=workspace_surface_metadata,
+            file_context_surface_metadata=file_context_surface_metadata,
+            working_set_metadata=working_set_metadata,
+            focused_file_context_metadata=focused_file_context_metadata,
+            focused_file_context_source=focused_file_context_source,
+            focused_file_context_index=focused_file_context_index,
+            focused_file_context_shortcut_label=focused_file_context_shortcut_label,
+        )
+        if structured_lines:
             status_lines.append("")
-            status_lines.extend(workspace_lines)
+            status_lines.extend(structured_lines)
+        else:
+            status_lines.extend(
+                [
+                    f"busy: {'yes' if self.busy else 'no'}",
+                    f"provider: {config_items.get('provider', '(unknown)')}",
+                    f"model: {config_items.get('model', '(unknown)')}",
+                    f"session_id: {config_items.get('session_id', '(unknown)')}",
+                    f"constraints: {config_items.get('execution_constraints', 'normal')}",
+                    f"advisor_blocks: {config_items.get('advisor_blocks', '0')}",
+                    f"plan_executions: {config_items.get('plan_executions', '0')}",
+                    f"plan_drifts: {config_items.get('plan_drifts', '0')}",
+                    f"last_plan_drift: {config_items.get('last_plan_drift_summary', 'none')}",
+                    f"active_plan_kind: {config_items.get('active_plan_kind', 'none')}",
+                    f"active_plan_goal: {config_items.get('active_plan_goal', 'none')}",
+                    f"skills: {config_items.get('enabled_skills', '0')}",
+                    f"mcp_servers: {config_items.get('mcp_servers', '0')}",
+                    f"mcp_failed: {config_items.get('mcp_failed_servers', '0')}",
+                    f"undo: {config_items.get('recent_change_sets', '0')}",
+                    f"redo: {config_items.get('redo_change_sets', '0')}",
+                ]
+            )
+            workspace_lines = self._workspace_status_lines(config_items)
+            if workspace_lines:
+                status_lines.append("")
+                status_lines.extend(workspace_lines)
+            memory_lines = self._memory_status_lines(
+                memory_metadata,
+                rewind_preview_metadata=rewind_preview_metadata,
+                selected_rewind_boundary_index=selected_rewind_boundary_index,
+            )
+            if memory_lines:
+                status_lines.append("")
+                status_lines.extend(memory_lines)
+            background_lines = self._background_status_lines(background_metadata)
+            if background_lines:
+                status_lines.append("")
+                status_lines.extend(background_lines)
+            background_registry_lines = self._background_registry_status_lines(
+                background_registry_metadata,
+                selected_index=selected_background_registry_index,
+                selected_bg_id=self.selected_background_registry_bg_id,
+            )
+            if background_registry_lines:
+                status_lines.append("")
+                status_lines.extend(background_registry_lines)
+            background_handoff_lines = self._background_handoff_status_lines(background_handoff_metadata)
+            if background_handoff_lines:
+                status_lines.append("")
+                status_lines.extend(background_handoff_lines)
         symbol_lines = self._symbol_status_lines(
             config_items,
             symbol_surface_metadata=symbol_surface_metadata,
@@ -621,23 +736,24 @@ class TuiState:
         if symbol_lines:
             status_lines.append("")
             status_lines.extend(symbol_lines)
-        file_context_lines = self._focused_file_context_status_lines(
-            focused_file_context_metadata,
-            source=focused_file_context_source,
-            selected_index=focused_file_context_index,
-            shortcut_label=focused_file_context_shortcut_label,
-        )
-        if file_context_lines:
-            status_lines.append("")
-            status_lines.extend(file_context_lines)
-        working_set_lines = self._working_set_status_lines(
-            working_set_metadata,
-            focused_file_context_metadata=focused_file_context_metadata,
-            focused_file_context_index=focused_file_context_index,
-        )
-        if working_set_lines:
-            status_lines.append("")
-            status_lines.extend(working_set_lines)
+        if not structured_lines:
+            file_context_lines = self._focused_file_context_status_lines(
+                focused_file_context_metadata,
+                source=focused_file_context_source,
+                selected_index=focused_file_context_index,
+                shortcut_label=focused_file_context_shortcut_label,
+            )
+            if file_context_lines:
+                status_lines.append("")
+                status_lines.extend(file_context_lines)
+            working_set_lines = self._working_set_status_lines(
+                working_set_metadata,
+                focused_file_context_metadata=focused_file_context_metadata,
+                focused_file_context_index=focused_file_context_index,
+            )
+            if working_set_lines:
+                status_lines.append("")
+                status_lines.extend(working_set_lines)
 
         provider_lines = [line.strip() for line in provider_text.splitlines() if line.strip()]
         if provider_lines:
@@ -649,6 +765,1156 @@ class TuiState:
             status_lines.append("MCP diagnosis")
             status_lines.extend(self._compact_block(self.mcp_diagnostic_text, max_lines=10))
         return "\n".join(status_lines)
+
+    def _structured_status_dashboard_lines(
+        self,
+        status_metadata: dict[str, object] | None,
+        *,
+        config_items: dict[str, str],
+        memory_metadata: dict[str, object] | None,
+        rewind_preview_metadata: dict[str, object] | None,
+        background_metadata: dict[str, object] | None,
+        background_registry_metadata: dict[str, object] | None,
+        background_handoff_metadata: dict[str, object] | None,
+        plugin_surface_metadata: dict[str, object] | None,
+        skills_surface_metadata: dict[str, object] | None,
+        selected_rewind_boundary_index: int,
+        selected_background_registry_index: int,
+        workspace_surface_metadata: dict[str, object] | None,
+        file_context_surface_metadata: dict[str, object] | None,
+        working_set_metadata: dict[str, object] | None,
+        focused_file_context_metadata: dict[str, object] | None,
+        focused_file_context_source: str | None,
+        focused_file_context_index: int,
+        focused_file_context_shortcut_label: str | None,
+    ) -> list[str]:
+        if not isinstance(status_metadata, dict) or not status_metadata:
+            return []
+
+        lines: list[str] = []
+
+        self._append_dashboard_section(
+            lines,
+            "Session Identity",
+            [
+                f"busy: {'yes' if self.busy else 'no'}",
+                f"session_id: {status_metadata.get('status_session_id') or config_items.get('session_id', '(unknown)')}",
+                f"workspace: {status_metadata.get('status_workspace_summary') or 'none'}",
+            ],
+        )
+        self._append_dashboard_section(
+            lines,
+            "Model and Provider",
+            [
+                f"provider: {status_metadata.get('status_provider') or config_items.get('provider', '(unknown)')}",
+                f"model: {status_metadata.get('status_model') or config_items.get('model', '(unknown)')}",
+                f"advisor_model: {status_metadata.get('status_advisor_model') or 'none'}",
+                f"advisor_mode: {status_metadata.get('status_advisor_mode') or 'none'}",
+                f"session_mode: {status_metadata.get('status_mode') or 'main'}",
+                f"context_usage: {status_metadata.get('status_context_usage') or 'unknown'}",
+            ],
+        )
+        memory_detail_lines = self._memory_status_lines(
+            memory_metadata,
+            rewind_preview_metadata=rewind_preview_metadata,
+            selected_rewind_boundary_index=selected_rewind_boundary_index,
+        )
+        if memory_detail_lines:
+            memory_lines = memory_detail_lines[1:]
+        else:
+            memory_lines = [
+                f"memory compaction: {status_metadata.get('status_memory_compaction') or 'none'}",
+                f"latest memory operation: {status_metadata.get('status_memory_last_operation') or 'none'}",
+                f"latest memory summary: {status_metadata.get('status_memory_summary') or 'none'}",
+            ]
+        self._append_dashboard_section(lines, "Memory Lifecycle", memory_lines)
+
+        notification_lines = [
+            f"background_notifications: {status_metadata.get('status_background_notification_count') or 0}",
+            f"latest_background_handoff: {status_metadata.get('status_background_latest_handoff') or 'none'}",
+            f"background_summary: {status_metadata.get('status_background_summary') or 'none'}",
+        ]
+        handoff_detail_lines = self._background_handoff_status_lines(background_handoff_metadata)
+        if handoff_detail_lines:
+            notification_lines.extend(handoff_detail_lines[1:])
+        self._append_dashboard_section(lines, "Background Notifications", notification_lines)
+
+        resolved_workspace_surface = (
+            workspace_surface_metadata if isinstance(workspace_surface_metadata, dict) else None
+        )
+        resolved_file_context_surface = (
+            file_context_surface_metadata if isinstance(file_context_surface_metadata, dict) else None
+        )
+        resolved_working_set_metadata = working_set_metadata
+        resolved_focused_file_context_metadata = focused_file_context_metadata
+        resolved_focused_file_context_source = focused_file_context_source
+        resolved_focused_file_context_index = focused_file_context_index
+        resolved_focused_file_context_shortcut_label = focused_file_context_shortcut_label
+        explicit_context_payload: dict[str, object] | None = None
+        file_action_groups: dict[str, object] | None = None
+        if resolved_file_context_surface is not None:
+            working_set_payload = resolved_file_context_surface.get("working_set")
+            if isinstance(working_set_payload, dict) and working_set_payload:
+                resolved_working_set_metadata = working_set_payload
+            focused_file_payload = resolved_file_context_surface.get("focused_file")
+            if isinstance(focused_file_payload, dict):
+                if isinstance(resolved_working_set_metadata, dict) and resolved_working_set_metadata:
+                    resolved_focused_file_context_metadata = resolved_working_set_metadata
+                source = str(focused_file_payload.get("source") or "").strip()
+                if source:
+                    resolved_focused_file_context_source = source
+                try:
+                    resolved_focused_file_context_index = max(
+                        0, int(focused_file_payload.get("index") or 0)
+                    )
+                except (TypeError, ValueError):
+                    resolved_focused_file_context_index = 0
+            explicit_context = resolved_file_context_surface.get("explicit_context")
+            if isinstance(explicit_context, dict):
+                explicit_context_payload = explicit_context
+            action_groups = resolved_file_context_surface.get("file_action_groups")
+            if isinstance(action_groups, dict):
+                file_action_groups = action_groups
+
+        workspace_lines = [
+            f"workspace_mode: {status_metadata.get('status_workspace_mode') or config_items.get('workspace_mode', 'main')}",
+            f"workspace_health: {status_metadata.get('status_workspace_health') or config_items.get('workspace_health', 'healthy')}",
+            f"workspace_anomaly: {status_metadata.get('status_workspace_anomaly') or 'none'}",
+            f"workspace_recovery: {status_metadata.get('status_workspace_recovery') or 'none'}",
+            f"working_set_summary: {status_metadata.get('status_working_set_summary') or 'none'}",
+            f"focused_file: {status_metadata.get('status_focused_file_summary') or 'none'}",
+            f"explicit_context_entries: {status_metadata.get('status_explicit_context_entry_count') or 0}",
+            f"unresolved_explicit_context_entries: {status_metadata.get('status_unresolved_explicit_context_entry_count') or 0}",
+        ]
+        if resolved_workspace_surface is not None:
+            workspace_lines.extend(
+                [
+                    f"workspace_label: {resolved_workspace_surface.get('workspace_label') or 'none'}",
+                    f"effective_cwd: {resolved_workspace_surface.get('workspace_effective_cwd') or '(unknown)'}",
+                    "workspace_effective_cwd_exists: "
+                    + ("yes" if resolved_workspace_surface.get("workspace_effective_cwd_exists") else "no"),
+                    f"workspace_cleanup_status: {resolved_workspace_surface.get('workspace_cleanup_status') or 'none'}",
+                    f"workspace_cleanup_error: {resolved_workspace_surface.get('workspace_cleanup_error') or 'none'}",
+                    f"workspace_fallback_cwd: {resolved_workspace_surface.get('workspace_fallback_cwd') or 'none'}",
+                ]
+            )
+        recommended_actions = (
+            resolved_workspace_surface.get("workspace_recommended_actions")
+            if resolved_workspace_surface is not None
+            else status_metadata.get("status_workspace_recommended_actions")
+        )
+        if isinstance(recommended_actions, (list, tuple)):
+            recommended_action_text = ", ".join(
+                str(item).strip() for item in recommended_actions if str(item).strip()
+            )
+            workspace_lines.extend(
+                [
+                    "Workspace Recovery",
+                    f"workspace_recommended_actions: {recommended_action_text or 'none'}",
+                ]
+            )
+        elif recommended_actions:
+            workspace_lines.extend(
+                [
+                    "Workspace Recovery",
+                    f"workspace_recommended_actions: {recommended_actions}",
+                ]
+            )
+        if resolved_workspace_surface is not None:
+            workspace_action_bundle = resolved_workspace_surface.get("workspace_action_bundle")
+            action_value_map = {
+                "status_workspace_primary_action": (
+                    workspace_action_bundle.get("primary_action")
+                    if isinstance(workspace_action_bundle, dict)
+                    else None
+                ),
+                "status_workspace_secondary_action": (
+                    workspace_action_bundle.get("secondary_action")
+                    if isinstance(workspace_action_bundle, dict)
+                    else None
+                ),
+                "status_workspace_tertiary_action": (
+                    workspace_action_bundle.get("tertiary_action")
+                    if isinstance(workspace_action_bundle, dict)
+                    else None
+                ),
+            }
+            workspace_group_lines = self._action_group_lines(
+                resolved_workspace_surface.get("workspace_action_groups")
+                if isinstance(resolved_workspace_surface.get("workspace_action_groups"), dict)
+                else None,
+                ordered_keys=[
+                    "inspect_current_workspace",
+                    "inspect_workspace_inventory",
+                    "workspace_recovery",
+                ],
+                labels={
+                    "inspect_current_workspace": "inspect current workspace",
+                    "inspect_workspace_inventory": "inspect workspace inventory",
+                    "workspace_recovery": "workspace recovery",
+                },
+            )
+        else:
+            action_value_map = {
+                "status_workspace_primary_action": status_metadata.get("status_workspace_primary_action"),
+                "status_workspace_secondary_action": status_metadata.get("status_workspace_secondary_action"),
+                "status_workspace_tertiary_action": status_metadata.get("status_workspace_tertiary_action"),
+            }
+            workspace_group_lines = []
+        for key in (
+            "status_workspace_primary_action",
+            "status_workspace_secondary_action",
+            "status_workspace_tertiary_action",
+        ):
+            value = str(action_value_map.get(key) or "").strip()
+            if value:
+                workspace_lines.append(f"{key}: {value}")
+        if workspace_group_lines:
+            workspace_lines.extend(workspace_group_lines)
+        workspace_detail_lines = self._workspace_status_lines(config_items)
+        if workspace_detail_lines and resolved_workspace_surface is None:
+            workspace_lines.extend(workspace_detail_lines[1:])
+        file_context_lines = self._focused_file_context_status_lines(
+            resolved_focused_file_context_metadata,
+            source=resolved_focused_file_context_source,
+            selected_index=resolved_focused_file_context_index,
+            shortcut_label=resolved_focused_file_context_shortcut_label,
+        )
+        if file_context_lines:
+            workspace_lines.extend(file_context_lines)
+        working_set_lines = self._working_set_status_lines(
+            resolved_working_set_metadata,
+            focused_file_context_metadata=resolved_focused_file_context_metadata,
+            focused_file_context_index=resolved_focused_file_context_index,
+        )
+        if working_set_lines:
+            workspace_lines.extend(working_set_lines)
+        if isinstance(explicit_context_payload, dict) and explicit_context_payload:
+            workspace_lines.extend(
+                [
+                    "Explicit Context",
+                    f"explicit_context_entries: {explicit_context_payload.get('entry_count') or 0}",
+                    "unresolved_explicit_context_entries: "
+                    + str(explicit_context_payload.get("unresolved_entry_count") or 0),
+                    f"explicit_only_files: {explicit_context_payload.get('explicit_only_file_count') or 0}",
+                    f"automatic_only_files: {explicit_context_payload.get('automatic_file_count') or 0}",
+                    f"overlapping_files: {explicit_context_payload.get('overlapping_file_count') or 0}",
+                ]
+            )
+            compare_lines = explicit_context_payload.get("compare_summary_lines")
+            if isinstance(compare_lines, list):
+                workspace_lines.extend(
+                    str(item).strip()
+                    for item in compare_lines
+                    if str(item).strip() and str(item).strip() != "explicit context compare:"
+                )
+        file_action_lines = self._action_group_lines(
+            file_action_groups,
+            ordered_keys=[
+                "inspect_focused_file",
+                "inspect_focused_diff",
+                "inspect_change",
+                "inspect_task",
+                "inspect_active_plan",
+                "inspect_explicit_context",
+                "stay_on_surface",
+            ],
+            labels={
+                "inspect_focused_file": "inspect focused file",
+                "inspect_focused_diff": "inspect focused diff",
+                "inspect_change": "inspect change",
+                "inspect_task": "inspect task",
+                "inspect_active_plan": "inspect active plan",
+                "inspect_explicit_context": "inspect explicit context",
+                "stay_on_surface": "stay on surface",
+            },
+        )
+        if file_action_lines:
+            workspace_lines.extend(["File Actions", *file_action_lines])
+        self._append_dashboard_section(lines, "Workspace State", workspace_lines)
+
+        active_workflow_lines = [
+            f"active plan: {status_metadata.get('status_plan_summary') or 'none'}",
+            f"active task: {status_metadata.get('status_active_task_count') or 0}",
+            f"task surfaces: {status_metadata.get('status_task_surface_summary') or 'none'}",
+            f"runtime progress: {status_metadata.get('status_runtime_progress_summary') or 'none'}",
+            "active tool: "
+            + (
+                (
+                    f"{status_metadata.get('status_runtime_active_tool_status')} "
+                    f"{status_metadata.get('status_runtime_active_tool_name') or ''}"
+                ).strip()
+                if str(status_metadata.get("status_runtime_active_tool_status") or "none") != "none"
+                else "none"
+            ),
+            f"active tool input: {status_metadata.get('status_runtime_active_tool_input') or 'none'}",
+            "last tool outcome: "
+            + (
+                " | ".join(
+                    part
+                    for part in (
+                        str(status_metadata.get("status_runtime_last_tool_name") or "").strip(),
+                        (
+                            str(status_metadata.get("status_runtime_last_tool_status") or "").strip()
+                            if str(status_metadata.get("status_runtime_last_tool_status") or "none") != "none"
+                            else ""
+                        ),
+                        str(status_metadata.get("status_runtime_last_tool_summary") or "").strip(),
+                    )
+                    if part
+                )
+                or "none"
+            ),
+            "parallel batch: "
+            + (
+                f"active size={int(status_metadata.get('status_runtime_parallel_batch_size') or 0)}"
+                if bool(status_metadata.get("status_runtime_parallel_batch_active"))
+                else "none"
+            ),
+            f"last tool-result summary: {status_metadata.get('status_runtime_last_result_summary') or 'none'}",
+            "tool-result replacement: "
+            + str(
+                status_metadata.get("status_runtime_tool_result_replacement_summary") or "none"
+            ),
+            "tool-result artifact: "
+            + str(
+                status_metadata.get("status_runtime_tool_result_artifact_summary") or "none"
+            ),
+            "tool-result microcompact: "
+            + str(
+                status_metadata.get("status_runtime_tool_result_microcompact_summary") or "none"
+            ),
+            "budget pressure: "
+            + (
+                str(status_metadata.get("status_budget_reason") or "none")
+                if str(status_metadata.get("status_budget_pressure") or "ok") != "ok"
+                else "none"
+            ),
+            f"compact recovery: {status_metadata.get('status_runtime_compact_recovery_summary') or 'none'}",
+            f"advisor blocks: {config_items.get('advisor_blocks', '0')}",
+            f"plan executions: {config_items.get('plan_executions', '0')}",
+            f"plan drifts: {config_items.get('plan_drifts', '0')}",
+            f"last plan drift: {config_items.get('last_plan_drift_summary', 'none')}",
+        ]
+        background_state_lines = self._background_status_lines(background_metadata)
+        if background_state_lines:
+            active_workflow_lines.extend(["background_state:"])
+            active_workflow_lines.extend(background_state_lines[1:])
+        background_registry_lines = self._background_registry_status_lines(
+            background_registry_metadata,
+            selected_index=selected_background_registry_index,
+            selected_bg_id=self.selected_background_registry_bg_id,
+        )
+        if background_registry_lines:
+            active_workflow_lines.extend(["background_sessions:"])
+            active_workflow_lines.extend(background_registry_lines[1:])
+        self._append_dashboard_section(lines, "Active Workflow", active_workflow_lines)
+
+        self._append_dashboard_section(
+            lines,
+            "Project-Context Health",
+            [
+                f"project_context: {status_metadata.get('status_project_context_summary') or 'none'}",
+                f"project_context_reload_health: {status_metadata.get('status_project_context_reload_health') or 'latest reload: none'}",
+                f"project_context_issue: {status_metadata.get('status_project_context_issue') or 'none'}",
+                f"skill_registry: {status_metadata.get('status_skill_registry_summary') or 'none'}",
+                f"skill_prompt_composition: {status_metadata.get('status_skill_prompt_summary') or 'none'}",
+                f"skill_reload_state: {status_metadata.get('status_skill_reload_state') or 'latest reload: none'}",
+                f"manual_skill_overrides: {status_metadata.get('status_skill_manual_overrides') or 'enabled=0 disabled=0'}",
+                f"skill_diagnostics: {status_metadata.get('status_skill_diagnostics') or 0}",
+                f"plugins_health: {status_metadata.get('status_plugins_health') or 'none'}",
+                f"plugin_registry: {status_metadata.get('status_plugin_registry_summary') or 'none'}",
+                f"plugin_reload_state: {status_metadata.get('status_plugin_reload_state') or 'latest reload: none'}",
+                f"manual_plugin_overrides: {status_metadata.get('status_plugin_manual_overrides') or 'enabled=0 disabled=0'}",
+                f"mcp_health: {status_metadata.get('status_mcp_health') or 'none'}",
+                f"mcp_issue: {status_metadata.get('status_mcp_issue') or 'none'}",
+                f"permission_mode: {status_metadata.get('status_permission_mode') or config_items.get('permission_mode', 'default')}",
+                f"permission_summary: {status_metadata.get('status_permission_summary') or 'none'}",
+                f"workspace_anomaly: {status_metadata.get('status_workspace_anomaly') or 'none'}",
+                f"runtime_health_alert: {status_metadata.get('status_runtime_health_alert') or 'none'}",
+            ],
+        )
+        if isinstance(skills_surface_metadata, dict) and skills_surface_metadata:
+            skill_lines = [
+                f"skill_registry: {skills_surface_metadata.get('skill_registry_summary') or 'none'}",
+                f"skill_prompt_composition: {skills_surface_metadata.get('skill_prompt_composition_summary') or 'none'}",
+                "manual_skill_overrides: "
+                + (
+                    f"enabled={skills_surface_metadata.get('skill_manual_enabled_count') or 0} "
+                    f"disabled={skills_surface_metadata.get('skill_manual_disabled_count') or 0}"
+                ),
+                "skill_sources: "
+                + (
+                    f"builtin={skills_surface_metadata.get('skill_builtin_count') or 0} "
+                    f"project_local={skills_surface_metadata.get('skill_project_local_count') or 0} "
+                    f"plugin_contributed={skills_surface_metadata.get('skill_plugin_contributed_count') or 0}"
+                ),
+                "skill_status: "
+                + (
+                    f"enabled={skills_surface_metadata.get('skill_enabled_count') or 0} "
+                    f"disabled={skills_surface_metadata.get('skill_disabled_count') or 0} "
+                    f"inactive={skills_surface_metadata.get('skill_inactive_count') or 0}"
+                ),
+                "skill_reload_state: "
+                + str(
+                    (
+                        skills_surface_metadata.get("skill_reload_state")
+                        if isinstance(skills_surface_metadata.get("skill_reload_state"), dict)
+                        else {}
+                    ).get("summary")
+                    or "latest reload: none"
+                ),
+                f"skill_diagnostics: {skills_surface_metadata.get('skill_diagnostic_count') or 0}",
+                f"selected_skill: {skills_surface_metadata.get('skill_selected_summary') or 'none'}",
+            ]
+            skill_action_lines = self._action_group_lines(
+                skills_surface_metadata.get("skill_action_groups")
+                if isinstance(skills_surface_metadata.get("skill_action_groups"), dict)
+                else None,
+                ordered_keys=[
+                    "inspect_skill_registry",
+                    "inspect_project_context_skills",
+                    "inspect_skill_reload_state",
+                    "inspect_selected_skill",
+                    "toggle_selected_skill",
+                ],
+                labels={
+                    "inspect_skill_registry": "inspect skill registry",
+                    "inspect_project_context_skills": "inspect project-context skills",
+                    "inspect_skill_reload_state": "inspect skill reload state",
+                    "inspect_selected_skill": "inspect selected skill",
+                    "toggle_selected_skill": "toggle selected skill",
+                },
+            )
+            if skill_action_lines:
+                skill_lines.extend(["Skill Actions", *skill_action_lines])
+            self._append_dashboard_section(lines, "Skill Registry", skill_lines)
+        if isinstance(plugin_surface_metadata, dict) and plugin_surface_metadata:
+            plugin_lines = [
+                f"plugin_registry: {plugin_surface_metadata.get('plugin_registry_summary') or 'none'}",
+                f"plugin_diagnostics: {plugin_surface_metadata.get('plugin_diagnostic_count') or 0}",
+                "manual_plugin_overrides: "
+                + (
+                    f"enabled={plugin_surface_metadata.get('plugin_manual_enabled_count') or 0} "
+                    f"disabled={plugin_surface_metadata.get('plugin_manual_disabled_count') or 0}"
+                ),
+                "plugin_reload_state: "
+                + str(
+                    (
+                        plugin_surface_metadata.get("plugin_reload_state")
+                        if isinstance(plugin_surface_metadata.get("plugin_reload_state"), dict)
+                        else {}
+                    ).get("summary")
+                    or "latest reload: none"
+                ),
+                f"selected_plugin: {plugin_surface_metadata.get('plugin_selected_summary') or 'none'}",
+            ]
+            plugin_action_lines = self._action_group_lines(
+                plugin_surface_metadata.get("plugin_action_groups")
+                if isinstance(plugin_surface_metadata.get("plugin_action_groups"), dict)
+                else None,
+                ordered_keys=[
+                    "inspect_plugin_registry",
+                    "inspect_project_context_plugins",
+                    "inspect_plugin_reload_state",
+                    "inspect_selected_plugin",
+                    "toggle_selected_plugin",
+                ],
+                labels={
+                    "inspect_plugin_registry": "inspect plugin registry",
+                    "inspect_project_context_plugins": "inspect project-context plugins",
+                    "inspect_plugin_reload_state": "inspect plugin reload state",
+                    "inspect_selected_plugin": "inspect selected plugin",
+                    "toggle_selected_plugin": "toggle selected plugin",
+                },
+            )
+            if plugin_action_lines:
+                plugin_lines.extend(["Plugin Actions", *plugin_action_lines])
+            self._append_dashboard_section(lines, "Plugin Registry", plugin_lines)
+        next_action_lines = self._status_action_lines(
+            status_metadata.get("status_action_groups"),
+            resume=False,
+        )
+        if not next_action_lines:
+            next_actions = status_metadata.get("status_next_actions")
+            next_action_lines = [
+                f"- {item}"
+                for item in next_actions
+                if isinstance(item, str) and item.strip()
+            ]
+        self._append_dashboard_section(lines, "Next Actions", next_action_lines)
+        return lines
+
+    def _status_action_label(self, key: str) -> str:
+        labels = {
+            "go_to_focused_file": "inspect focused file",
+            "inspect_changes": "inspect changes",
+            "inspect_task": "inspect tasks",
+            "inspect_active_plan": "inspect active plan",
+            "inspect_history_rewind": "inspect history/rewind",
+            "inspect_background_handoff": "inspect background handoff",
+            "inspect_project_context_health": "inspect project-context health",
+            "inspect_runtime_health": "inspect runtime health",
+            "inspect_sessions": "inspect sessions",
+            "resume_repl": "resume repl",
+            "resume_tui": "resume tui",
+        }
+        return labels.get(key, key)
+
+    def _status_action_lines(
+        self,
+        action_groups: dict[str, object] | None,
+        *,
+        resume: bool = False,
+    ) -> list[str]:
+        if not isinstance(action_groups, dict) or not action_groups:
+            return []
+        ordered_keys = [
+            "go_to_focused_file",
+            "inspect_changes",
+            "inspect_task",
+            "inspect_active_plan",
+            "inspect_history_rewind",
+            "inspect_background_handoff",
+            "inspect_project_context_health",
+            "inspect_runtime_health",
+        ]
+        if resume:
+            ordered_keys.extend(["inspect_sessions", "resume_repl", "resume_tui"])
+        lines: list[str] = []
+        for key in ordered_keys:
+            raw = action_groups.get(key)
+            if not isinstance(raw, list):
+                continue
+            commands = [str(item).strip() for item in raw if str(item).strip()]
+            if not commands:
+                continue
+            lines.append(f"- {self._status_action_label(key)}: {' | '.join(commands)}")
+        return lines
+
+    def _action_group_lines(
+        self,
+        action_groups: dict[str, object] | None,
+        *,
+        ordered_keys: list[str],
+        labels: dict[str, str],
+    ) -> list[str]:
+        if not isinstance(action_groups, dict) or not action_groups:
+            return []
+        lines: list[str] = []
+        for key in ordered_keys:
+            raw = action_groups.get(key)
+            if not isinstance(raw, list):
+                continue
+            commands = [str(item).strip() for item in raw if str(item).strip()]
+            if not commands:
+                continue
+            lines.append(f"- {labels.get(key, key)}: {' | '.join(commands)}")
+        return lines
+
+    def _append_dashboard_section(
+        self,
+        target: list[str],
+        title: str,
+        items: list[str],
+    ) -> None:
+        filtered = [item for item in items if str(item).strip()]
+        if target:
+            target.append("")
+        target.append(title)
+        target.extend(filtered or ["none"])
+
+    def _memory_status_lines(
+        self,
+        memory_metadata: dict[str, object] | None,
+        *,
+        rewind_preview_metadata: dict[str, object] | None = None,
+        selected_rewind_boundary_index: int = 0,
+    ) -> list[str]:
+        if not isinstance(memory_metadata, dict):
+            return []
+        history_boundary_count = int(
+            memory_metadata.get("memory_boundary_count", memory_metadata.get("history_boundary_count") or 0)
+            or 0
+        )
+        rewindable_count = int(
+            memory_metadata.get(
+                "memory_rewindable_boundary_count",
+                memory_metadata.get("rewindable_history_boundary_count") or 0,
+            )
+            or 0
+        )
+        context_summary_chars = int(
+            memory_metadata.get(
+                "memory_context_summary_chars",
+                memory_metadata.get("context_summary_chars") or 0,
+            )
+            or 0
+        )
+        last_boundary_kind = str(
+            memory_metadata.get(
+                "memory_last_boundary_kind",
+                memory_metadata.get("last_history_boundary_kind") or "",
+            )
+            or ""
+        ).strip()
+        latest_rewindable_kind = str(
+            memory_metadata.get(
+                "memory_latest_rewindable_boundary_kind",
+                memory_metadata.get("latest_rewindable_boundary_kind") or "",
+            )
+            or ""
+        ).strip()
+        default_rewind_selector = str(
+            memory_metadata.get(
+                "memory_default_rewind_selector",
+                memory_metadata.get("default_rewind_selector") or "",
+            )
+            or ""
+        ).strip()
+        rewind_show_action = str(
+            memory_metadata.get(
+                "memory_rewind_show_action",
+                memory_metadata.get("rewind_show_action") or "",
+            )
+            or ""
+        ).strip()
+        rewind_apply_action = str(
+            memory_metadata.get(
+                "memory_rewind_apply_action",
+                memory_metadata.get("rewind_apply_action") or "",
+            )
+            or ""
+        ).strip()
+        compaction_state = str(
+            memory_metadata.get(
+                "memory_compaction_state",
+                memory_metadata.get("compaction_state") or "",
+            )
+            or ""
+        ).strip()
+        compaction_reason = str(
+            memory_metadata.get(
+                "memory_compaction_reason",
+                memory_metadata.get("compaction_reason") or "",
+            )
+            or ""
+        ).strip()
+        budget_state = str(memory_metadata.get("memory_budget_state") or "").strip()
+        budget_reason = str(memory_metadata.get("memory_budget_reason") or "").strip()
+        last_turn_token_count = memory_metadata.get("memory_last_turn_token_count")
+        last_turn_token_source = str(memory_metadata.get("memory_last_turn_token_source") or "").strip()
+        provider_usage_seen = bool(memory_metadata.get("memory_provider_usage_seen"))
+        budget_pressure = str(memory_metadata.get("memory_budget_pressure") or "").strip()
+        compact_lifecycle = str(memory_metadata.get("memory_compact_lifecycle") or "").strip()
+        latest_compact_trigger = str(memory_metadata.get("memory_latest_compact_trigger") or "").strip()
+        latest_compact_reason = str(memory_metadata.get("memory_latest_compact_reason") or "").strip()
+        last_operation = str(memory_metadata.get("memory_last_operation") or "").strip()
+        last_operation_messages = str(
+            memory_metadata.get("memory_last_operation_messages") or ""
+        ).strip()
+        last_operation_session_identity = str(
+            memory_metadata.get("memory_last_operation_session_identity") or ""
+        ).strip()
+        last_operation_focus = str(
+            memory_metadata.get("memory_last_operation_task_plan_file_focus") or ""
+        ).strip()
+        if not any(
+            (
+                history_boundary_count,
+                rewindable_count,
+                context_summary_chars,
+                last_boundary_kind,
+                latest_rewindable_kind,
+                default_rewind_selector,
+                compaction_state,
+                last_operation,
+            )
+        ):
+            return []
+        lines = ["Memory Lifecycle"]
+        lines.append(f"history_boundaries: {history_boundary_count}")
+        lines.append(f"rewindable_boundaries: {rewindable_count}")
+        lines.append(f"context_summary_chars: {context_summary_chars}")
+        if compaction_state:
+            lines.append(f"memory compaction: {compaction_state}")
+        if compaction_reason:
+            lines.append(f"compact reason: {compaction_reason}")
+        else:
+            lines.append("compact reason: none")
+        if budget_state:
+            lines.append(f"runtime budget state: {budget_state}")
+        if budget_reason:
+            lines.append(f"runtime budget reason: {budget_reason}")
+        else:
+            lines.append("runtime budget reason: none")
+        lines.append(
+            "last turn token count: "
+            + (str(last_turn_token_count) if last_turn_token_count is not None else "none")
+        )
+        lines.append(f"last turn token source: {last_turn_token_source or 'none'}")
+        lines.append(f"provider usage seen: {'yes' if provider_usage_seen else 'no'}")
+        lines.append(f"budget pressure: {budget_pressure or 'ok'}")
+        lines.append(f"compact lifecycle: {compact_lifecycle or 'none'}")
+        lines.append(f"latest compact trigger: {latest_compact_trigger or 'none'}")
+        lines.append(f"latest compact reason: {latest_compact_reason or 'none'}")
+        if last_operation:
+            lines.append(f"latest memory operation: {last_operation}")
+        if last_operation_messages:
+            lines.append(f"memory_messages: {last_operation_messages}")
+        if last_operation_session_identity:
+            lines.append(f"memory_session_identity: {last_operation_session_identity}")
+        if last_operation_focus:
+            lines.append(f"memory_focus_policy: {last_operation_focus}")
+        lines.append(f"last boundary: {last_boundary_kind or 'none'}")
+        lines.append(f"latest rewindable: {latest_rewindable_kind or 'none'}")
+        if default_rewind_selector:
+            lines.append(f"default rewind selector: {default_rewind_selector}")
+        if rewind_show_action:
+            lines.append(f"rewind show: {rewind_show_action}")
+        if rewind_apply_action:
+            lines.append(f"rewind apply: {rewind_apply_action}")
+        if isinstance(rewind_preview_metadata, dict) and rewindable_count > 0:
+            selector_index = int(rewind_preview_metadata.get("selector_index") or 0)
+            boundary_id = str(rewind_preview_metadata.get("boundary_id") or "").strip()
+            boundary_kind = str(rewind_preview_metadata.get("boundary_kind_label") or "").strip()
+            boundary_summary = str(rewind_preview_metadata.get("summary") or "").strip()
+            restore_effect = str(rewind_preview_metadata.get("restore_effect_summary") or "").strip()
+            restore_messages = int(rewind_preview_metadata.get("snapshot_message_count") or 0)
+            restore_summary_chars = int(rewind_preview_metadata.get("snapshot_summary_chars") or 0)
+            preview_show = str(rewind_preview_metadata.get("show_action") or "").strip()
+            preview_apply = str(rewind_preview_metadata.get("apply_action") or "").strip()
+            trigger = str(rewind_preview_metadata.get("trigger") or "").strip()
+            lines.append(
+                "selected_rewind_boundary: "
+                f"{selector_index}/{max(rewindable_count, selected_rewind_boundary_index + 1)}"
+            )
+            if boundary_id:
+                lines.append(f"selected_rewind_boundary_id: {boundary_id}")
+            if boundary_kind:
+                lines.append(f"selected_rewind_boundary_kind: {boundary_kind}")
+            if trigger:
+                lines.append(f"selected_rewind_boundary_trigger: {trigger}")
+            if boundary_summary:
+                lines.append(f"selected_rewind_boundary_summary: {boundary_summary}")
+            lines.append(f"selected_rewind_restore_messages: {restore_messages}")
+            lines.append(f"selected_rewind_restore_context_summary_chars: {restore_summary_chars}")
+            if restore_effect:
+                lines.append(f"selected_rewind_restore_effect: {restore_effect}")
+            if preview_show:
+                lines.append(f"selected_rewind_show: {preview_show}")
+            if preview_apply:
+                lines.append(f"selected_rewind_apply: {preview_apply}")
+            lines.append(
+                "shortcuts: Ctrl+Alt+Left/Right select rewind boundary, Ctrl+Alt+P preview, Ctrl+Alt+R apply"
+            )
+        return lines
+
+    def _background_status_lines(self, background_metadata: dict[str, object] | None) -> list[str]:
+        if not isinstance(background_metadata, dict):
+            return []
+        background_session_id = str(background_metadata.get("background_session_id") or "").strip()
+        if not background_session_id:
+            return []
+        lines = ["Background State"]
+        lines.append(f"background_session_id: {background_session_id}")
+        continuation = str(background_metadata.get("background_continuation_category") or "").strip()
+        if continuation:
+            lines.append(f"background_continuation: {continuation}")
+        workflow_summary = str(background_metadata.get("background_current_workflow_summary") or "").strip()
+        if workflow_summary:
+            lines.append(f"background_workflow: {workflow_summary}")
+        task_surface_summary = str(background_metadata.get("background_task_surface_summary") or "").strip()
+        if task_surface_summary:
+            lines.append(f"background_task_surfaces: {task_surface_summary}")
+        primary_task = background_metadata.get("background_primary_task")
+        if isinstance(primary_task, dict):
+            task_id = str(primary_task.get("task_id") or "").strip()
+            task_surface = str(primary_task.get("surface_kind") or "").strip()
+            task_status = str(primary_task.get("status") or "").strip()
+            task_description = str(primary_task.get("description") or "").strip()
+            summary_bits = [bit for bit in (task_id, task_surface, task_status) if bit]
+            if task_description:
+                summary_bits.append(task_description)
+            if summary_bits:
+                lines.append(f"background_primary_task: {' | '.join(summary_bits)}")
+        active_plan = str(background_metadata.get("background_active_plan_summary") or "").strip()
+        if active_plan:
+            lines.append(f"background_active_plan: {active_plan}")
+        focused_file = str(background_metadata.get("background_focused_file") or "").strip()
+        if focused_file:
+            lines.append(f"background_focused_file: {focused_file}")
+        recent_activity = str(background_metadata.get("background_recent_activity") or "").strip()
+        if recent_activity:
+            lines.append(f"background_recent_activity: {recent_activity}")
+        token_count = background_metadata.get("background_token_count")
+        token_source = str(background_metadata.get("background_token_count_source") or "").strip()
+        if token_count not in {None, ""}:
+            suffix = f" ({token_source})" if token_source else ""
+            lines.append(f"background_token_count: {token_count}{suffix}")
+        last_tool_input = str(background_metadata.get("background_last_tool_input") or "").strip()
+        if last_tool_input:
+            lines.append(f"background_last_tool_input: {last_tool_input}")
+        last_tool_summary = str(background_metadata.get("background_last_tool_summary") or "").strip()
+        if last_tool_summary:
+            lines.append(f"background_last_tool_summary: {last_tool_summary}")
+        progress_summary = str(background_metadata.get("background_progress_summary") or "").strip()
+        if progress_summary:
+            lines.append(f"background_progress: {progress_summary}")
+        completion_state = str(background_metadata.get("background_completion_state") or "").strip()
+        if completion_state:
+            lines.append(f"background_completion: {completion_state}")
+        completion_summary = str(background_metadata.get("background_completion_summary") or "").strip()
+        if completion_summary:
+            lines.append(f"background_completion_summary: {completion_summary}")
+        pending_followup_count = int(background_metadata.get("background_pending_followup_count", 0) or 0)
+        if pending_followup_count > 0:
+            lines.append(f"background_pending_followups: {pending_followup_count}")
+        pending_followup_summary = str(
+            background_metadata.get("background_pending_followup_summary") or ""
+        ).strip()
+        if pending_followup_summary:
+            lines.append(f"background_pending_followup: {pending_followup_summary}")
+        send_followup = str(background_metadata.get("background_send_followup_action") or "").strip()
+        if send_followup:
+            lines.append(f"background_send_followup: {send_followup}")
+        attach_action = str(background_metadata.get("background_attach_action") or "").strip()
+        if attach_action:
+            lines.append(f"background_attach: {attach_action}")
+        logs_action = str(background_metadata.get("background_logs_action") or "").strip()
+        if logs_action:
+            lines.append(f"background_logs: {logs_action}")
+        return lines
+
+    def _background_handoff_status_lines(
+        self,
+        background_handoff_metadata: dict[str, object] | None,
+    ) -> list[str]:
+        if not isinstance(background_handoff_metadata, dict):
+            return []
+        count = int(background_handoff_metadata.get("background_handoff_count", 0) or 0)
+        if count <= 0:
+            return []
+        lines = ["Background Notifications"]
+        lines.append(f"background_notifications: {count}")
+        selected_bg_id = str(background_handoff_metadata.get("background_handoff_selected_bg_id") or "").strip()
+        if selected_bg_id:
+            lines.append(f"latest_background_handoff: {selected_bg_id}")
+        selected_state = str(
+            background_handoff_metadata.get("background_handoff_selected_completion_state") or ""
+        ).strip()
+        if selected_state:
+            lines.append(f"latest_background_state: {selected_state}")
+        selected_summary = str(
+            background_handoff_metadata.get("background_handoff_selected_completion_summary") or ""
+        ).strip()
+        if selected_summary:
+            lines.append(f"latest_background_summary: {selected_summary}")
+        failure_reason = str(
+            background_handoff_metadata.get("background_handoff_selected_failure_reason") or ""
+        ).strip()
+        if failure_reason:
+            lines.append(f"latest_background_failure: {failure_reason}")
+        transcript_action = str(
+            background_handoff_metadata.get("background_handoff_transcript_action") or ""
+        ).strip()
+        if transcript_action:
+            lines.append(f"background_handoff_transcript_action: {transcript_action}")
+        task_action = str(background_handoff_metadata.get("background_handoff_task_action") or "").strip()
+        if task_action:
+            lines.append(f"background_handoff_task_action: {task_action}")
+        changes_action = str(
+            background_handoff_metadata.get("background_handoff_changes_action") or ""
+        ).strip()
+        if changes_action:
+            lines.append(f"background_handoff_changes_action: {changes_action}")
+        resume_action = str(
+            background_handoff_metadata.get("background_handoff_resume_action") or ""
+        ).strip()
+        if resume_action:
+            lines.append(f"background_handoff_resume_action: {resume_action}")
+        return lines
+
+    def _selected_background_registry_entry(
+        self,
+        background_registry_metadata: dict[str, object],
+        *,
+        selected_index: int,
+        selected_bg_id: str | None,
+    ) -> tuple[int, dict[str, object] | None]:
+        entries = background_registry_metadata.get("background_registry_entries")
+        if not isinstance(entries, list) or not entries:
+            return 0, None
+        for index, item in enumerate(entries):
+            if not isinstance(item, dict):
+                continue
+            if selected_bg_id and str(item.get("background_session_id") or "").strip() == selected_bg_id:
+                return index, item
+        if 0 <= selected_index < len(entries):
+            item = entries[selected_index]
+            return selected_index, item if isinstance(item, dict) else None
+        preferred_bg_id = str(
+            background_registry_metadata.get("background_registry_selected_bg_id") or ""
+        ).strip()
+        for index, item in enumerate(entries):
+            if not isinstance(item, dict):
+                continue
+            if preferred_bg_id and str(item.get("background_session_id") or "").strip() == preferred_bg_id:
+                return index, item
+        first = entries[0]
+        return 0, first if isinstance(first, dict) else None
+
+    def _background_registry_status_lines(
+        self,
+        background_registry_metadata: dict[str, object] | None,
+        *,
+        selected_index: int = 0,
+        selected_bg_id: str | None = None,
+    ) -> list[str]:
+        if not isinstance(background_registry_metadata, dict):
+            return []
+        registry_count = int(background_registry_metadata.get("background_registry_count", 0) or 0)
+        entries = background_registry_metadata.get("background_registry_entries")
+        if registry_count <= 0 and not isinstance(entries, list):
+            return []
+        resolved_index, selected_entry = self._selected_background_registry_entry(
+            background_registry_metadata,
+            selected_index=selected_index,
+            selected_bg_id=selected_bg_id,
+        )
+        lines = ["Background Sessions"]
+        lines.append(f"background_sessions: {registry_count}")
+        selected_bg_id_text = (
+            str(selected_entry.get("background_session_id") or "").strip()
+            if isinstance(selected_entry, dict)
+            else str(background_registry_metadata.get("background_registry_selected_bg_id") or "").strip()
+        )
+        if selected_bg_id_text:
+            lines.append(f"selected_background_session: {selected_bg_id_text}")
+        selected_status = (
+            str(selected_entry.get("status") or "").strip()
+            if isinstance(selected_entry, dict)
+            else str(background_registry_metadata.get("background_registry_selected_status") or "").strip()
+        )
+        if selected_status:
+            lines.append(f"selected_background_status: {selected_status}")
+        selected_continuation = (
+            str(selected_entry.get("background_continuation_category") or "").strip()
+            if isinstance(selected_entry, dict)
+            else str(
+                background_registry_metadata.get("background_registry_selected_continuation_category") or ""
+            ).strip()
+        )
+        if selected_continuation:
+            lines.append(f"selected_background_continuation: {selected_continuation}")
+        selected_workflow = (
+            str(selected_entry.get("background_current_workflow_summary") or "").strip()
+            if isinstance(selected_entry, dict)
+            else ""
+        )
+        if not selected_workflow:
+            selected_workflow = str(
+                background_registry_metadata.get("background_registry_selected_workflow_summary") or ""
+            ).strip()
+        if selected_workflow:
+            lines.append(f"selected_background_workflow: {selected_workflow}")
+        selected_task = (
+            selected_entry.get("background_primary_task")
+            if isinstance(selected_entry, dict)
+            else background_registry_metadata.get("background_registry_selected_primary_task")
+        )
+        if not isinstance(selected_task, dict):
+            fallback_task = background_registry_metadata.get("background_registry_selected_primary_task")
+            selected_task = fallback_task if isinstance(fallback_task, dict) else selected_task
+        if isinstance(selected_task, dict):
+            task_id = str(selected_task.get("task_id") or "").strip()
+            task_status = str(selected_task.get("status") or "").strip()
+            task_description = str(selected_task.get("description") or "").strip()
+            task_bits = [bit for bit in (task_id, task_status, task_description) if bit]
+            if task_bits:
+                lines.append(f"selected_background_primary_task: {' | '.join(task_bits)}")
+        selected_plan = (
+            str(selected_entry.get("background_active_plan_summary") or "").strip()
+            if isinstance(selected_entry, dict)
+            else ""
+        )
+        if not selected_plan:
+            selected_plan = str(
+                background_registry_metadata.get("background_registry_selected_active_plan_summary") or ""
+            ).strip()
+        if selected_plan:
+            lines.append(f"selected_background_active_plan: {selected_plan}")
+        selected_file = (
+            str(selected_entry.get("background_focused_file") or "").strip()
+            if isinstance(selected_entry, dict)
+            else ""
+        )
+        if not selected_file:
+            selected_file = str(
+                background_registry_metadata.get("background_registry_selected_focused_file") or ""
+            ).strip()
+        if selected_file:
+            lines.append(f"selected_background_focused_file: {selected_file}")
+        selected_recent_activity = (
+            str(selected_entry.get("background_recent_activity") or "").strip()
+            if isinstance(selected_entry, dict)
+            else ""
+        )
+        if not selected_recent_activity:
+            selected_recent_activity = str(
+                background_registry_metadata.get("background_registry_selected_recent_activity") or ""
+            ).strip()
+        if selected_recent_activity:
+            lines.append(f"selected_background_recent_activity: {selected_recent_activity}")
+        selected_token_count = (
+            selected_entry.get("background_token_count")
+            if isinstance(selected_entry, dict)
+            else background_registry_metadata.get("background_registry_selected_token_count")
+        )
+        selected_token_source = (
+            str(selected_entry.get("background_token_count_source") or "").strip()
+            if isinstance(selected_entry, dict)
+            else str(
+                background_registry_metadata.get("background_registry_selected_token_count_source") or ""
+            ).strip()
+        )
+        if selected_token_count not in {None, ""}:
+            suffix = f" ({selected_token_source})" if selected_token_source else ""
+            lines.append(f"selected_background_token_count: {selected_token_count}{suffix}")
+        selected_last_tool_input = (
+            str(selected_entry.get("background_last_tool_input") or "").strip()
+            if isinstance(selected_entry, dict)
+            else ""
+        )
+        if not selected_last_tool_input:
+            selected_last_tool_input = str(
+                background_registry_metadata.get("background_registry_selected_last_tool_input") or ""
+            ).strip()
+        if selected_last_tool_input:
+            lines.append(f"selected_background_last_tool_input: {selected_last_tool_input}")
+        selected_last_tool_summary = (
+            str(selected_entry.get("background_last_tool_summary") or "").strip()
+            if isinstance(selected_entry, dict)
+            else ""
+        )
+        if not selected_last_tool_summary:
+            selected_last_tool_summary = str(
+                background_registry_metadata.get("background_registry_selected_last_tool_summary") or ""
+            ).strip()
+        if selected_last_tool_summary:
+            lines.append(f"selected_background_last_tool_summary: {selected_last_tool_summary}")
+        selected_progress = (
+            str(selected_entry.get("background_progress_summary") or "").strip()
+            if isinstance(selected_entry, dict)
+            else ""
+        )
+        if not selected_progress:
+            selected_progress = str(
+                background_registry_metadata.get("background_registry_selected_progress_summary") or ""
+            ).strip()
+        if selected_progress:
+            lines.append(f"selected_background_progress: {selected_progress}")
+        selected_completion_state = (
+            str(selected_entry.get("background_completion_state") or "").strip()
+            if isinstance(selected_entry, dict)
+            else ""
+        )
+        if not selected_completion_state:
+            selected_completion_state = str(
+                background_registry_metadata.get("background_registry_selected_completion_state") or ""
+            ).strip()
+        if selected_completion_state:
+            lines.append(f"selected_background_completion: {selected_completion_state}")
+        selected_completion_summary = (
+            str(selected_entry.get("background_completion_summary") or "").strip()
+            if isinstance(selected_entry, dict)
+            else ""
+        )
+        if not selected_completion_summary:
+            selected_completion_summary = str(
+                background_registry_metadata.get("background_registry_selected_completion_summary") or ""
+            ).strip()
+        if selected_completion_summary:
+            lines.append(f"selected_background_completion_summary: {selected_completion_summary}")
+        pending_followup_count = (
+            int(selected_entry.get("background_pending_followup_count") or 0)
+            if isinstance(selected_entry, dict)
+            else int(
+                background_registry_metadata.get("background_registry_selected_pending_followup_count", 0)
+                or 0
+            )
+        )
+        if pending_followup_count > 0:
+            lines.append(f"selected_background_pending_followups: {pending_followup_count}")
+        pending_followup_summary = (
+            str(selected_entry.get("background_pending_followup_summary") or "").strip()
+            if isinstance(selected_entry, dict)
+            else ""
+        )
+        if not pending_followup_summary:
+            pending_followup_summary = str(
+                background_registry_metadata.get("background_registry_selected_pending_followup_summary") or ""
+            ).strip()
+        if pending_followup_summary:
+            lines.append(f"selected_background_pending_followup: {pending_followup_summary}")
+        primary_action = (
+            str(selected_entry.get("background_primary_action") or "").strip()
+            if isinstance(selected_entry, dict)
+            else str(background_registry_metadata.get("background_registry_primary_action") or "").strip()
+        )
+        if primary_action:
+            lines.append(f"background_registry_primary_action: {primary_action}")
+        secondary_action = (
+            str(selected_entry.get("background_secondary_action") or "").strip()
+            if isinstance(selected_entry, dict)
+            else str(background_registry_metadata.get("background_registry_secondary_action") or "").strip()
+        )
+        if secondary_action:
+            lines.append(f"background_registry_secondary_action: {secondary_action}")
+        logs_action = (
+            str(selected_entry.get("background_logs_action") or "").strip()
+            if isinstance(selected_entry, dict)
+            else str(background_registry_metadata.get("background_registry_logs_action") or "").strip()
+        )
+        if logs_action:
+            lines.append(f"background_registry_logs_action: {logs_action}")
+        send_followup_action = (
+            str(selected_entry.get("background_send_followup_action") or "").strip()
+            if isinstance(selected_entry, dict)
+            else str(background_registry_metadata.get("background_registry_send_followup_action") or "").strip()
+        )
+        if send_followup_action:
+            lines.append(f"background_registry_send_followup_action: {send_followup_action}")
+        queue_action = (
+            str(selected_entry.get("background_queue_message_action") or "").strip()
+            if isinstance(selected_entry, dict)
+            else str(background_registry_metadata.get("background_registry_queue_message_action") or "").strip()
+        )
+        if queue_action:
+            lines.append(f"background_registry_queue_message_action: {queue_action}")
+        cancel_action = (
+            str(selected_entry.get("background_cancel_pending_followup_action") or "").strip()
+            if isinstance(selected_entry, dict)
+            else str(
+                background_registry_metadata.get("background_registry_cancel_pending_followup_action") or ""
+            ).strip()
+        )
+        if cancel_action:
+            lines.append(f"background_registry_cancel_pending_followup_action: {cancel_action}")
+        if isinstance(entries, list) and entries:
+            lines.append("background_registry_entries:")
+            for index, item in enumerate(entries[:3], start=1):
+                if not isinstance(item, dict):
+                    continue
+                bg_id = str(item.get("background_session_id") or "").strip() or f"item-{index}"
+                status = str(item.get("status") or "").strip() or "unknown"
+                continuation = str(item.get("background_continuation_category") or "").strip() or "none"
+                primary_action = str(item.get("background_primary_action") or "").strip() or "none"
+                marker = ">" if index - 1 == resolved_index else "-"
+                lines.append(
+                    f"{marker} {index}. {bg_id} status={status} continuation={continuation} action={primary_action}"
+                )
+        return lines
 
     def render_changes_panel(
         self,
@@ -797,7 +2063,7 @@ class TuiState:
         if not any((workspace_health, workspace_mode, effective_cwd)):
             return []
         lines = [
-            "Workspace",
+            "Workspace State",
             f"workspace_mode: {workspace_mode or 'main'}",
             f"workspace_health: {workspace_health or 'healthy'}",
             f"workspace_label: {config_items.get('workspace_label', 'none')}",
@@ -1605,6 +2871,7 @@ class TuiState:
         if path:
             lines.append(f"focused_file_path: {path}")
         scope_reasons = self._file_context_scope_reasons(focused_item)
+        lines.append(f"context_origin: {self._file_context_origin_label(focused_item)}")
         if scope_reasons:
             lines.append("in scope because: " + ", ".join(scope_reasons))
         related_change = str(focused_item.get("change_id") or "").strip()
@@ -1661,6 +2928,7 @@ class TuiState:
             marker = ">" if focused_path and path == focused_path else " "
             lines.append(f"{marker} {index}. {path}")
             reasons = self._file_context_scope_reasons(item)
+            lines.append("  context_origin: " + self._file_context_origin_label(item))
             if reasons:
                 lines.append("  in scope because: " + ", ".join(reasons))
             related_change = str(item.get("change_id") or "").strip()
@@ -1705,6 +2973,20 @@ class TuiState:
             for reason in (item.get("scope_reasons") or [])
             if str(reason).strip()
         ]
+
+    def _file_context_origin_label(self, item: dict[str, object]) -> str:
+        explicit = False
+        automatic = False
+        for reason in self._file_context_scope_reasons(item):
+            if reason == "explicit context path":
+                explicit = True
+            else:
+                automatic = True
+        if explicit and automatic:
+            return "explicit+automatic"
+        if explicit:
+            return "explicit-only"
+        return "automatic-only"
 
     def _file_context_is_context_only(self, item: dict[str, object]) -> bool:
         if "is_context_only" in item:
@@ -2322,7 +3604,7 @@ class TuiState:
                 metadata[key] = value
         if not metadata and not planned_paths and not applied_paths:
             return []
-        lines = ["Workspace"]
+        lines = ["Workspace State"]
         for key in (
             "workspace_action",
             "workspace_target",
@@ -2446,15 +3728,37 @@ class TuiState:
             )
         return "\n".join(lines)
 
-    def _record_tool_started(self, event: RuntimeEvent) -> None:
+    def _record_tool_waiting(self, event: RuntimeEvent) -> None:
         self.tool_logs.append(
             ToolLogEntry(
                 tool_call_id=event.tool_call_id or "",
                 tool_name=event.tool_name or "unknown",
-                status="RUNNING",
+                status="WAITING",
                 input_summary=event.message,
+                detail=(
+                    f"approval: {event.approval_risk_level}"
+                    if event.approval_risk_level
+                    else ""
+                ),
             )
         )
+
+    def _record_tool_started(self, event: RuntimeEvent) -> None:
+        entry = self._find_tool_entry(event.tool_call_id)
+        if entry is None:
+            self.tool_logs.append(
+                ToolLogEntry(
+                    tool_call_id=event.tool_call_id or "",
+                    tool_name=event.tool_name or "unknown",
+                    status="RUNNING",
+                    input_summary=event.message,
+                )
+            )
+        else:
+            entry.status = "RUNNING"
+            if event.message:
+                entry.input_summary = event.message
+            entry.detail = ""
         if self._is_change_tool(event.tool_name):
             self.change_status = f"Applying {event.tool_name}..."
             self.last_change_preview_label = "Approved change set"

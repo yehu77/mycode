@@ -13,14 +13,19 @@ Hosted product flows are intentionally out of scope unless they are required to 
 ## Current Status
 
 - The core local coding-agent runtime is implemented and usable.
-- The full Python test suite currently passes: `575 passed`.
+- The full Python test suite currently passes: `628 passed`.
 - Project-local external plugin loading, session/resume continuity, and session-level working-set/file-context navigation are implemented and validated.
+- local plugin workflow depth now includes shared `/plugins` and `/plugin show` vocabulary, explicit contribution and diagnostics inspection, reload-state reporting, structured stdio/remote plugin metadata, and TUI plugin dashboard integration
 - `/context` now provides a dedicated REPL/headless context-usage surface aligned with the runtime prompt/tool chain.
 - `/project-context` now provides a dedicated REPL/headless project memory / skills / plugins / reload-status inspection surface above the local context workflow.
 - `/files` and `/diff` now provide explicit REPL/headless entry surfaces for working-set files, focused file context, and diff-backed local work.
 - `/compact` now provides a manual conversation-compaction surface above the existing `context_summary` and auto-compaction path.
 - `/add-dir` now provides explicit local context curation on top of the shared working-set/file-context model.
 - REPL/headless inspection depth now covers `/history`, `/sessions`, `/config`, `/model`, and `/status` slice views in addition to the deeper `/changes` and `/workspaces` surfaces.
+- rewind/history UX now includes structured boundary browsing, preview-before-apply, TUI rewind selection, and aligned stdio/remote rewind metadata.
+- background-agent local scope now includes follow-up steering, main-session handoff notifications, runtime-grade progress metadata, and project-local agent definition inspection through `/agents`.
+- `/status` now acts as a shared session dashboard across REPL, TUI, stdio, and remote surfaces, including memory lifecycle, background notifications, runtime health, and stable action routing.
+- the local skills workflow now includes shared registry/reload/prompt-composition inspection across REPL, TUI, stdio, and remote, plus a dedicated TUI `Skill Registry` block.
 - Recent test hygiene work added `pytest.ini` collection guards and excludes transient cache/temp artifacts such as `pytest-cache-files-*`, `tests/_tmp*`, and test-local `.pyclaude` residue.
 
 ## Current Capabilities
@@ -79,11 +84,14 @@ Hosted product flows are intentionally out of scope unless they are required to 
 - `/sessions` now supports saved-session detail, compact summary, and workspace-focused inspection paths
 - `/config` and `/model` now support narrower runtime/workspace/permissions/plugins/MCP/advisor inspection slices instead of only one large dump
 - `/status` now provides a compact current-session overview plus `workspace`, `workflow`, and `resume` slices
+- `/status` now also exposes a stronger unified dashboard vocabulary, structured `status_*` metadata for stdio/remote, TUI dashboard depth, runtime-health summaries, and shared status action families
 - `/context` now provides estimated context-usage summary for system prompt sections, messages, and tool definitions
 - `/add-dir` now provides explicit context-path curation, while `/files explicit|auto` exposes explicit-vs-automatic working-set scope directly
 - `/clear` now supports scoped local reset for history, changes, symbol surface, active plan, or lightweight session workflow state
 - `/project-context` now provides project memory, grouped skill-state, plugin-contribution, and latest reload-status inspection without leaving the REPL
 - `/files` now provides a compact file/workingset context surface, while `/diff` provides a compact diff-backed work surface
+- `/rewind` and `/history` now provide boundary preview, lineage, compare summaries, and aligned TUI/stdio/remote rewind selection metadata
+- `/agents` now provides builtin plus project-local definition inspection with source grouping, same-name shadowing, diagnostics, and effective-resolution summaries
 
 ### Remote Attach and Headless Surfaces
 

@@ -16,6 +16,7 @@ from claudecode_py.permissions import ApprovalRequest, ApprovalResult, Permissio
 from claudecode_py.runtime.events import RuntimeEvent
 from claudecode_py.state import AdvisorReviewSummary, PlanningArtifact, SessionState, WorkspaceFileChange
 from claudecode_py.service import JsonRpcStdioService, ServiceDispatcher
+from claudecode_py.storage.background_sessions import create_background_session, update_background_session
 from claudecode_py.storage.transcript import save_transcript
 
 
@@ -113,6 +114,10 @@ class StdioServiceTests(unittest.TestCase):
             self.assertEqual(described["result"]["working_set_scope"], "session")
             self.assertEqual(described["result"]["working_set_sources"], [])
             self.assertEqual(described["result"]["working_set_files"], [])
+            self.assertEqual(described["result"]["workspace_surface"]["workspace_health"], "healthy")
+            self.assertEqual(described["result"]["workspace_surface"]["workspace_action_groups"]["inspect_current_workspace"], ["/workspaces current"])
+            self.assertEqual(described["result"]["file_context_surface"]["working_set"]["file_context_file_count"], 0)
+            self.assertEqual(described["result"]["file_context_surface"]["focused_file"]["summary"], "none")
             self.assertEqual(described["result"]["focused_file_context_source"], "working_set")
             self.assertIsNone(described["result"]["focused_file_context_path"])
             self.assertEqual(described["result"]["focused_file_context_scope_reasons"], [])
@@ -232,6 +237,15 @@ class StdioServiceTests(unittest.TestCase):
             self.assertEqual(described["result"]["working_set_primary_target"]["path"], "demo.py")
             self.assertEqual(described["result"]["working_set_primary_diff_targets"]["path"], "demo.py")
             self.assertEqual(described["result"]["working_set_files"][0]["diff_target_count"], 1)
+            self.assertEqual(described["result"]["file_context_surface"]["working_set"]["file_context_primary_path"], "demo.py")
+            self.assertEqual(
+                described["result"]["file_context_surface"]["focused_file"]["context_origin"],
+                "automatic-only",
+            )
+            self.assertEqual(
+                described["result"]["file_context_surface"]["file_action_groups"]["inspect_focused_diff"],
+                ["/diff focused"],
+            )
             self.assertEqual(described["result"]["focused_file_context_source"], "working_set")
             self.assertEqual(described["result"]["focused_file_context_path"], "demo.py")
             self.assertEqual(described["result"]["focused_file_context_primary_target"]["action"], "open_file")
@@ -486,7 +500,7 @@ class StdioServiceTests(unittest.TestCase):
             self.assertIn("compare_lens:", timeline_result["result"]["text"])
             self.assertIn("selected_timeline_compare: 3/", timeline_result["result"]["text"])
             self.assertIn("selected_timeline_compare_primary_action:", timeline_result["result"]["text"])
-            self.assertIn("[Execution Loop]", timeline_result["result"]["text"])
+            self.assertIn("Execution Loop", timeline_result["result"]["text"])
             self.assertIn("[execution]", timeline_result["result"]["text"])
             self.assertIn("selected_timeline_primary_action:", timeline_result["result"]["text"])
             replay_view_result = dispatcher.handle(
@@ -871,6 +885,646 @@ class StdioServiceTests(unittest.TestCase):
                 }
             )
             self.assertEqual(missing["error"]["data"]["session_id"], session_id)
+        finally:
+            dispatcher.close()
+            if cwd.exists():
+                shutil.rmtree(cwd, ignore_errors=True)
+
+    def test_session_action_supports_rewind_and_exposes_memory_metadata(self) -> None:
+        cwd = Path(__file__).resolve().parent / "_tmp_stdio_service_rewind_action"
+        if cwd.exists():
+            shutil.rmtree(cwd)
+        cwd.mkdir(parents=True)
+
+        dispatcher = ServiceDispatcher(
+            SessionConfig(
+                cwd=cwd,
+                interactive=False,
+                max_history_messages=4,
+                history_keep_last_messages=2,
+            )
+        )
+        try:
+            created = dispatcher.handle(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "session.create",
+                    "params": {},
+                }
+            )
+            session_id = created["result"]["session_id"]
+            session = dispatcher._sessions[session_id].session
+            session.state.context_summary = "Earlier summary"
+            session.state.messages = [
+                {"role": "user", "content": [{"type": "text", "text": "one"}]},
+                {"role": "assistant", "content": [{"type": "text", "text": "two"}]},
+                {"role": "user", "content": [{"type": "text", "text": "three"}]},
+                {"role": "assistant", "content": [{"type": "text", "text": "four"}]},
+            ]
+            session.compact_history_into_context_summary("keep only decisions")
+
+            described_before = dispatcher.handle(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "method": "session.describe",
+                    "params": {"session_id": session_id},
+                }
+            )
+            rewind_list = dispatcher.handle(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 3,
+                    "method": "session.action",
+                    "params": {"session_id": session_id, "action": "describe_rewind"},
+                }
+            )
+            rewind_show = dispatcher.handle(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 40,
+                    "method": "session.action",
+                    "params": {"session_id": session_id, "action": "describe_rewind", "args": "show 1"},
+                }
+            )
+            rewind_apply = dispatcher.handle(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 4,
+                    "method": "session.action",
+                    "params": {"session_id": session_id, "action": "rewind_to_boundary", "args": "1"},
+                }
+            )
+            described_after = dispatcher.handle(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 5,
+                    "method": "session.describe",
+                    "params": {"session_id": session_id},
+                }
+            )
+
+            self.assertIn("Compact instruction: keep only decisions", described_before["result"]["context_summary"])
+            self.assertEqual(described_before["result"]["history_boundary_count"], 1)
+            self.assertEqual(described_before["result"]["rewindable_history_boundary_count"], 1)
+            self.assertEqual(described_before["result"]["compact_boundary_count"], 1)
+            self.assertEqual(described_before["result"]["last_history_boundary_kind"], "compact")
+            self.assertEqual(described_before["result"]["latest_rewindable_boundary_kind"], "compact")
+            self.assertEqual(described_before["result"]["default_rewind_selector"], "1")
+            self.assertEqual(described_before["result"]["rewind_show_action"], "/rewind show 1")
+            self.assertEqual(described_before["result"]["rewind_apply_action"], "/rewind apply 1")
+            self.assertEqual(described_before["result"]["compaction_state"], "ok")
+            self.assertIsNone(described_before["result"]["compact_apply_action"])
+            self.assertIn("rewind boundaries:", rewind_list["result"]["text"])
+            self.assertEqual(rewind_list["result"]["rewind_mode"], "list")
+            self.assertEqual(rewind_list["result"]["rewindable_boundary_count"], 1)
+            self.assertEqual(rewind_list["result"]["default_rewind_selector"], "1")
+            self.assertEqual(rewind_show["result"]["rewind_mode"], "show")
+            self.assertEqual(rewind_show["result"]["selector"], 1)
+            self.assertEqual(rewind_show["result"]["boundary_kind"], "compact")
+            self.assertEqual(rewind_show["result"]["boundary_kind_label"], "compact boundary")
+            self.assertEqual(rewind_show["result"]["trigger"], "manual")
+            self.assertEqual(rewind_show["result"]["snapshot_message_count"], 4)
+            self.assertEqual(rewind_show["result"]["lineage_summary"], "pre-compact restore point")
+            self.assertTrue(rewind_show["result"]["targets_pre_compact_state"])
+            self.assertEqual(rewind_show["result"]["restore_message_delta_current"], 2)
+            self.assertEqual(rewind_show["result"]["apply_action"], "/rewind apply 1")
+            self.assertEqual(
+                rewind_show["result"]["workflow_surface_policy"]["task_plan_file_focus"],
+                "cleared",
+            )
+            self.assertIn("conversation rewound:", rewind_apply["result"]["text"])
+            self.assertEqual(described_after["result"]["context_summary"], "Earlier summary")
+            self.assertEqual(described_after["result"]["message_count"], 4)
+            self.assertEqual(described_after["result"]["history_boundary_count"], 2)
+            self.assertEqual(described_after["result"]["last_history_boundary_kind"], "rewind")
+        finally:
+            dispatcher.close()
+            if cwd.exists():
+                shutil.rmtree(cwd, ignore_errors=True)
+
+    def test_session_action_supports_background_followup_actions(self) -> None:
+        cwd = Path(__file__).resolve().parent / "_tmp_stdio_service_background_followup"
+        if cwd.exists():
+            shutil.rmtree(cwd)
+        cwd.mkdir(parents=True)
+
+        dispatcher = ServiceDispatcher(SessionConfig(cwd=cwd, interactive=False))
+        try:
+            created = dispatcher.handle(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "session.create",
+                    "params": {},
+                }
+            )
+            session_id = created["result"]["session_id"]
+            session = dispatcher._sessions[session_id].session
+            captured: list[tuple[str, str, str]] = []
+            session.send_background_followup = (  # type: ignore[method-assign]
+                lambda bg_id, prompt="": captured.append(("send", bg_id, prompt))
+                or f"sent {bg_id}: {prompt}"
+            )
+            session.queue_background_message = (  # type: ignore[method-assign]
+                lambda bg_id, prompt: captured.append(("queue", bg_id, prompt))
+                or f"queued {bg_id}: {prompt}"
+            )
+            session.cancel_pending_background_followup = (  # type: ignore[method-assign]
+                lambda bg_id: captured.append(("cancel", bg_id, ""))
+                or f"canceled {bg_id}"
+            )
+
+            sent = dispatcher.handle(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "method": "session.action",
+                    "params": {
+                        "session_id": session_id,
+                        "action": "background_send_followup",
+                        "bg_id": "bg-123",
+                        "prompt": "please continue",
+                    },
+                }
+            )
+            queued = dispatcher.handle(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 3,
+                    "method": "session.action",
+                    "params": {
+                        "session_id": session_id,
+                        "action": "background_queue_message",
+                        "bg_id": "bg-123",
+                        "prompt": "queue this",
+                    },
+                }
+            )
+            canceled = dispatcher.handle(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 4,
+                    "method": "session.action",
+                    "params": {
+                        "session_id": session_id,
+                        "action": "background_cancel_pending_followup",
+                        "bg_id": "bg-123",
+                    },
+                }
+            )
+
+            self.assertEqual(sent["result"]["text"], "sent bg-123: please continue")
+            self.assertEqual(queued["result"]["text"], "queued bg-123: queue this")
+            self.assertEqual(canceled["result"]["text"], "canceled bg-123")
+            self.assertEqual(
+                captured,
+                [
+                    ("send", "bg-123", "please continue"),
+                    ("queue", "bg-123", "queue this"),
+                    ("cancel", "bg-123", ""),
+                ],
+            )
+        finally:
+            dispatcher.close()
+            if cwd.exists():
+                shutil.rmtree(cwd, ignore_errors=True)
+
+    def test_session_describe_and_list_open_expose_background_metadata(self) -> None:
+        cwd = Path(__file__).resolve().parent / "_tmp_stdio_service_background_metadata"
+        if cwd.exists():
+            shutil.rmtree(cwd)
+        cwd.mkdir(parents=True)
+
+        dispatcher = ServiceDispatcher(SessionConfig(cwd=cwd, interactive=False))
+        try:
+            created = dispatcher.handle(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "session.create",
+                    "params": {},
+                }
+            )
+            session_id = created["result"]["session_id"]
+            session = dispatcher._sessions[session_id].session
+            session.set_background_session_link("bg-123")
+            task = session.task_manager.create(
+                "agent",
+                "Finish background workflow summary",
+                task_role="background",
+                background_session_id="bg-123",
+                background_reverse_hint="pyclaude ps bg-123 | pyclaude logs bg-123 summary",
+            )
+            session.task_manager.set_progress(task.id, "Waiting for attach")
+
+            described = dispatcher.handle(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "method": "session.describe",
+                    "params": {"session_id": session_id},
+                }
+            )
+            listed = dispatcher.handle(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 3,
+                    "method": "session.list_open",
+                    "params": {},
+                }
+            )
+
+            self.assertEqual(described["result"]["background_session_id"], "bg-123")
+            self.assertEqual(
+                described["result"]["background_continuation_category"],
+                "live attachable",
+            )
+            self.assertEqual(
+                described["result"]["background_current_workflow_summary"],
+                "attachable live background session",
+            )
+            self.assertEqual(
+                described["result"]["background_primary_action"],
+                "pyclaude attach bg-123",
+            )
+            self.assertEqual(
+                described["result"]["background_logs_action"],
+                "pyclaude logs bg-123 summary",
+            )
+            self.assertEqual(
+                described["result"]["background_task_surface_summary"],
+                "background_execution:1",
+            )
+            self.assertEqual(
+                described["result"]["background_primary_task"]["task_id"],
+                task.id,
+            )
+            self.assertEqual(
+                listed["result"]["sessions"][0]["background_session_id"],
+                "bg-123",
+            )
+            self.assertEqual(
+                listed["result"]["sessions"][0]["background_primary_action"],
+                "pyclaude attach bg-123",
+            )
+        finally:
+            dispatcher.close()
+            if cwd.exists():
+                shutil.rmtree(cwd, ignore_errors=True)
+
+    def test_session_describe_exposes_background_registry_metadata(self) -> None:
+        cwd = Path(__file__).resolve().parent / "_tmp_stdio_service_background_registry"
+        if cwd.exists():
+            shutil.rmtree(cwd)
+        cwd.mkdir(parents=True)
+
+        dispatcher = ServiceDispatcher(SessionConfig(cwd=cwd, interactive=False))
+        try:
+            created = dispatcher.handle(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "session.create",
+                    "params": {},
+                }
+            )
+            session_id = created["result"]["session_id"]
+            live = create_background_session(
+                cwd,
+                prompt="Live background task",
+                provider="openai-compatible",
+                model="gpt-test",
+                status="running",
+            )
+            update_background_session(
+                cwd,
+                live.bg_id,
+                session_id="session-live",
+                bridge_host="127.0.0.1",
+                bridge_port=9001,
+            )
+            saved = create_background_session(
+                cwd,
+                prompt="Saved background task",
+                provider="openai-compatible",
+                model="gpt-test",
+                status="completed",
+            )
+            update_background_session(
+                cwd,
+                saved.bg_id,
+                session_id="session-saved",
+            )
+            save_transcript(
+                SessionConfig(cwd=cwd, interactive=False),
+                SessionState(
+                    session_id="session-saved",
+                    messages=[{"role": "user", "content": [{"type": "text", "text": "saved"}]}],
+                ),
+            )
+
+            described = dispatcher.handle(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "method": "session.describe",
+                    "params": {"session_id": session_id},
+                }
+            )
+
+            self.assertEqual(described["result"]["background_registry_count"], 2)
+            self.assertEqual(
+                described["result"]["background_registry_selected_bg_id"],
+                live.bg_id,
+            )
+            self.assertEqual(
+                described["result"]["background_registry_selected_continuation_category"],
+                "live attachable",
+            )
+            self.assertEqual(
+                described["result"]["background_registry_primary_action"],
+                f"pyclaude attach {live.bg_id}",
+            )
+            self.assertEqual(
+                described["result"]["background_registry_logs_action"],
+                f"pyclaude logs {live.bg_id} summary",
+            )
+            self.assertIn(
+                live.bg_id,
+                [
+                    item["background_session_id"]
+                    for item in described["result"]["background_registry_entries"]
+                ],
+            )
+            self.assertEqual(described["result"]["background_handoff_count"], 1)
+            self.assertEqual(
+                described["result"]["background_handoff_selected_bg_id"],
+                saved.bg_id,
+            )
+            self.assertEqual(
+                described["result"]["background_handoff_selected_completion_state"],
+                "completed",
+            )
+            self.assertEqual(
+                described["result"]["background_handoff_resume_action"],
+                "pyclaude --resume-session session-saved repl",
+            )
+        finally:
+            dispatcher.close()
+            if cwd.exists():
+                shutil.rmtree(cwd, ignore_errors=True)
+
+    def test_session_describe_and_list_open_expose_structured_status_metadata(self) -> None:
+        cwd = Path(__file__).resolve().parent / "_tmp_stdio_service_status_metadata"
+        if cwd.exists():
+            shutil.rmtree(cwd)
+        cwd.mkdir(parents=True)
+
+        dispatcher = ServiceDispatcher(SessionConfig(cwd=cwd, interactive=False, provider="openai-compatible", model="gpt-test"))
+        try:
+            created = dispatcher.handle(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "session.create",
+                    "params": {},
+                }
+            )
+            session_id = created["result"]["session_id"]
+            session = dispatcher._sessions[session_id].session
+            session.record_workspace_change(
+                tool_name="apply_patch",
+                summary="Update runtime flow",
+                file_changes=[
+                    WorkspaceFileChange(
+                        path="runtime/session.py",
+                        existed_before=True,
+                        before_content="old\n",
+                        after_content="new\n",
+                        action_kind="update",
+                    )
+                ],
+            )
+            session.task_manager.create("agent", "Inspect runtime flow")
+
+            described = dispatcher.handle(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "method": "session.describe",
+                    "params": {"session_id": session_id},
+                }
+            )
+            listed = dispatcher.handle(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 3,
+                    "method": "session.list_open",
+                    "params": {},
+                }
+            )
+
+            self.assertEqual(described["result"]["status_session_id"], session_id)
+            self.assertEqual(described["result"]["status_provider"], "openai-compatible")
+            self.assertEqual(described["result"]["status_model"], "gpt-test")
+            self.assertIn("/", described["result"]["status_context_usage"])
+            self.assertEqual(described["result"]["status_budget_state"], "ok")
+            self.assertEqual(described["result"]["status_budget_reason"], "none")
+            self.assertEqual(described["result"]["status_context_token_source"], "none")
+            self.assertIsNone(described["result"]["status_last_turn_token_count"])
+            self.assertEqual(described["result"]["status_last_turn_token_source"], "none")
+            self.assertFalse(described["result"]["status_provider_usage_seen"])
+            self.assertEqual(described["result"]["status_budget_pressure"], "ok")
+            self.assertEqual(described["result"]["status_compact_lifecycle"], "none")
+            self.assertEqual(described["result"]["status_runtime_progress_summary"], "none")
+            self.assertEqual(described["result"]["status_runtime_progress_kind"], "none")
+            self.assertIsNone(described["result"]["status_runtime_active_tool_name"])
+            self.assertEqual(described["result"]["status_runtime_active_tool_status"], "none")
+            self.assertIsNone(described["result"]["status_runtime_active_tool_input"])
+            self.assertIsNone(described["result"]["status_runtime_last_tool_name"])
+            self.assertEqual(described["result"]["status_runtime_last_tool_status"], "none")
+            self.assertIsNone(described["result"]["status_runtime_last_tool_summary"])
+            self.assertFalse(described["result"]["status_runtime_parallel_batch_active"])
+            self.assertEqual(described["result"]["status_runtime_parallel_batch_size"], 0)
+            self.assertIsNone(described["result"]["status_runtime_last_result_summary"])
+            self.assertIsNone(described["result"]["status_runtime_compact_recovery_summary"])
+            self.assertEqual(described["result"]["status_working_set_file_count"], 1)
+            self.assertEqual(described["result"]["status_focused_file_path"], "runtime/session.py")
+            self.assertEqual(described["result"]["memory_budget_state"], "ok")
+            self.assertIsNone(described["result"]["memory_budget_reason"])
+            self.assertEqual(described["result"]["memory_context_token_source"], "none")
+            self.assertIsNone(described["result"]["memory_last_turn_token_count"])
+            self.assertIsNone(described["result"]["memory_last_turn_token_source"])
+            self.assertFalse(described["result"]["memory_provider_usage_seen"])
+            self.assertEqual(described["result"]["memory_budget_pressure"], "ok")
+            self.assertEqual(described["result"]["memory_compact_lifecycle"], "none")
+            self.assertFalse(described["result"]["memory_should_stop"])
+            self.assertEqual(described["result"]["workspace_surface"]["workspace_mode"], "main")
+            self.assertEqual(described["result"]["workspace_surface"]["workspace_action_groups"]["inspect_current_workspace"], ["/workspaces current"])
+            self.assertEqual(described["result"]["file_context_surface"]["working_set"]["file_context_primary_path"], "runtime/session.py")
+            self.assertEqual(described["result"]["file_context_surface"]["focused_file"]["path"], "runtime/session.py")
+            self.assertEqual(described["result"]["status_plan_summary"], "none")
+            self.assertIn("/files focused", described["result"]["status_next_actions"])
+            self.assertIn("status_action_groups", described["result"])
+            self.assertIn("go_to_focused_file", described["result"]["status_action_groups"])
+            self.assertIn("status_project_context_issue", described["result"])
+            self.assertIn("status_skill_registry_summary", described["result"])
+            self.assertIn("status_skill_prompt_summary", described["result"])
+            self.assertIn("status_skill_reload_state", described["result"])
+            self.assertIn("status_skill_manual_overrides", described["result"])
+            self.assertIn("status_plugin_registry_summary", described["result"])
+            self.assertIn("status_plugin_reload_state", described["result"])
+            self.assertIn("status_plugin_manual_overrides", described["result"])
+            self.assertIn("status_mcp_health", described["result"])
+            self.assertIn("status_permission_summary", described["result"])
+            self.assertIn("status_workspace_anomaly", described["result"])
+            self.assertIn("status_runtime_health_alert", described["result"])
+            self.assertIn("skills_surface", described["result"])
+            self.assertIn("skill_registry_summary", described["result"]["skills_surface"])
+            self.assertIn("plugin_surface", described["result"])
+            self.assertIn("plugin_registry_summary", described["result"]["plugin_surface"])
+            self.assertEqual(listed["result"]["sessions"][0]["status_session_id"], session_id)
+            self.assertEqual(listed["result"]["sessions"][0]["status_provider"], "openai-compatible")
+            self.assertEqual(listed["result"]["sessions"][0]["status_budget_state"], "ok")
+            self.assertEqual(listed["result"]["sessions"][0]["status_context_token_source"], "none")
+            self.assertEqual(listed["result"]["sessions"][0]["status_last_turn_token_source"], "none")
+            self.assertFalse(listed["result"]["sessions"][0]["status_provider_usage_seen"])
+            self.assertEqual(listed["result"]["sessions"][0]["status_budget_pressure"], "ok")
+            self.assertEqual(listed["result"]["sessions"][0]["status_compact_lifecycle"], "none")
+            self.assertEqual(listed["result"]["sessions"][0]["status_runtime_progress_summary"], "none")
+            self.assertEqual(listed["result"]["sessions"][0]["status_runtime_progress_kind"], "none")
+            self.assertEqual(listed["result"]["sessions"][0]["status_runtime_active_tool_status"], "none")
+            self.assertEqual(listed["result"]["sessions"][0]["status_runtime_last_tool_status"], "none")
+            self.assertFalse(listed["result"]["sessions"][0]["status_runtime_parallel_batch_active"])
+            self.assertEqual(listed["result"]["sessions"][0]["status_runtime_parallel_batch_size"], 0)
+            self.assertEqual(listed["result"]["sessions"][0]["status_working_set_file_count"], 1)
+            self.assertEqual(listed["result"]["sessions"][0]["workspace_surface"]["workspace_health"], "healthy")
+            self.assertEqual(listed["result"]["sessions"][0]["file_context_surface"]["focused_file"]["path"], "runtime/session.py")
+            self.assertIn("skills_surface", listed["result"]["sessions"][0])
+            self.assertIn("plugin_surface", listed["result"]["sessions"][0])
+        finally:
+            dispatcher.close()
+            if cwd.exists():
+                shutil.rmtree(cwd, ignore_errors=True)
+
+    def test_session_view_agents_returns_lightweight_definitions(self) -> None:
+        cwd = Path(__file__).resolve().parent / "_tmp_stdio_service_agents_view"
+        if cwd.exists():
+            shutil.rmtree(cwd)
+        cwd.mkdir(parents=True)
+
+        dispatcher = ServiceDispatcher(SessionConfig(cwd=cwd, interactive=False))
+        try:
+            created = dispatcher.handle(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "session.create",
+                    "params": {},
+                }
+            )
+            session_id = created["result"]["session_id"]
+            viewed = dispatcher.handle(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "method": "session.view",
+                    "params": {"session_id": session_id, "view": "agents"},
+                }
+            )
+            text = viewed["result"]["text"]
+            self.assertIn("agent definitions:", text)
+            self.assertIn("source summary:", text)
+            self.assertIn("- builtin: definitions=4 effective=4 shadowed=0 root=builtin", text)
+            self.assertIn("- default: source=builtin effective=yes override_state=base based_on=none", text)
+            self.assertIn("- background: source=builtin effective=yes override_state=base based_on=none", text)
+            self.assertIn("- read_only_planning: source=builtin effective=yes override_state=base based_on=none", text)
+            self.assertIn("- model_resolution: definitions inherit the active session model unless explicitly overridden", text)
+        finally:
+            dispatcher.close()
+            if cwd.exists():
+                shutil.rmtree(cwd, ignore_errors=True)
+
+    def test_session_events_serialize_extended_runtime_event_fields(self) -> None:
+        cwd = Path(__file__).resolve().parent / "_tmp_stdio_service_runtime_events"
+        if cwd.exists():
+            shutil.rmtree(cwd)
+        cwd.mkdir(parents=True)
+
+        dispatcher = ServiceDispatcher(SessionConfig(cwd=cwd, interactive=False))
+        try:
+            created = dispatcher.handle(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "session.create",
+                    "params": {},
+                }
+            )
+            session_id = created["result"]["session_id"]
+            record = dispatcher._sessions[session_id]
+            record.append_event(
+                RuntimeEvent(
+                    kind="tool_waiting_for_approval",
+                    message='{"path":"demo.py"}',
+                    tool_name="read_file",
+                    tool_call_id="tool-1",
+                    approval_risk_level="read",
+                )
+            )
+            record.append_event(
+                RuntimeEvent(
+                    kind="tool_batch_finished",
+                    message="completed 2 parallel read-only tool call(s)",
+                    batch_size=2,
+                    batch_parallel=True,
+                    result_count=2,
+                )
+            )
+            record.append_event(
+                RuntimeEvent(
+                    kind="budget_pressure",
+                    message="message count 6 >= warning threshold 6",
+                    budget_state="warning",
+                    budget_reason="message count 6 >= warning threshold 6",
+                )
+            )
+            record.append_event(
+                RuntimeEvent(
+                    kind="compact_recovery_finished",
+                    message="compact recovery restored budget headroom; retrying turn",
+                    compaction_trigger="recovery",
+                    budget_state="ok",
+                    budget_reason="within limits",
+                )
+            )
+
+            events = dispatcher.handle(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "method": "session.events",
+                    "params": {"session_id": session_id, "after_seq": 0},
+                }
+            )
+            payloads = events["result"]["events"]
+
+            self.assertEqual(payloads[0]["kind"], "tool_waiting_for_approval")
+            self.assertEqual(payloads[0]["approval_risk_level"], "read")
+            self.assertEqual(payloads[1]["kind"], "tool_batch_finished")
+            self.assertEqual(payloads[1]["batch_size"], 2)
+            self.assertTrue(payloads[1]["batch_parallel"])
+            self.assertEqual(payloads[1]["result_count"], 2)
+            self.assertEqual(payloads[2]["kind"], "budget_pressure")
+            self.assertEqual(payloads[2]["budget_state"], "warning")
+            self.assertEqual(
+                payloads[2]["budget_reason"],
+                "message count 6 >= warning threshold 6",
+            )
+            self.assertEqual(payloads[3]["kind"], "compact_recovery_finished")
+            self.assertEqual(payloads[3]["compaction_trigger"], "recovery")
         finally:
             dispatcher.close()
             if cwd.exists():
@@ -1936,6 +2590,15 @@ class StdioServiceTests(unittest.TestCase):
             self.assertEqual(result["task_surface_counts"]["checklist"], 1)
             self.assertEqual(result["task_surface_counts"]["background_execution"], 1)
             self.assertEqual(result["task_surface_total_count"], 2)
+            self.assertEqual(result["memory_last_operation"], "resume")
+            self.assertEqual(
+                result["memory_last_operation_task_plan_file_focus"],
+                "cleared",
+            )
+            self.assertEqual(
+                result["memory_last_operation_advisor_review_state"],
+                "restored",
+            )
 
             resumed_session = dispatcher._sessions[session_id].session
             restored_task = resumed_session.task_manager.get(background_task.id)

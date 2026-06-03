@@ -173,6 +173,10 @@ def _runtime_event_to_dict(event: RuntimeEvent) -> dict:
         "tool_name": event.tool_name,
         "tool_call_id": event.tool_call_id,
         "duration_ms": event.duration_ms,
+        "prompt_tokens": event.prompt_tokens,
+        "completion_tokens": event.completion_tokens,
+        "total_tokens": event.total_tokens,
+        "usage_source": event.usage_source,
         "is_error": event.is_error,
     }
 

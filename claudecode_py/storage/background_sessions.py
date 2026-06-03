@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from uuid import uuid4
@@ -45,6 +45,10 @@ class BackgroundSessionRecord:
     bridge_port: int | None = None
     error: str | None = None
     exit_code: int | None = None
+    pending_followups: list[str] = field(default_factory=list)
+    latest_followup_message: str | None = None
+    latest_followup_at: str | None = None
+    latest_followup_mode: str | None = None
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -283,4 +287,24 @@ def _load_background_record(payload: dict) -> BackgroundSessionRecord:
         bridge_port=int(payload["bridge_port"]) if payload.get("bridge_port") is not None else None,
         error=str(payload.get("error")) if payload.get("error") is not None else None,
         exit_code=int(payload["exit_code"]) if payload.get("exit_code") is not None else None,
+        pending_followups=[
+            str(item)
+            for item in payload.get("pending_followups", [])
+            if str(item).strip()
+        ],
+        latest_followup_message=(
+            str(payload.get("latest_followup_message"))
+            if payload.get("latest_followup_message") is not None
+            else None
+        ),
+        latest_followup_at=(
+            str(payload.get("latest_followup_at"))
+            if payload.get("latest_followup_at") is not None
+            else None
+        ),
+        latest_followup_mode=(
+            str(payload.get("latest_followup_mode"))
+            if payload.get("latest_followup_mode") is not None
+            else None
+        ),
     )

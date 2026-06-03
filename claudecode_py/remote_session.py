@@ -20,6 +20,7 @@ def _runtime_event_from_payload(event_payload: dict[str, Any]) -> RuntimeEvent |
     kind = event_payload.get("kind")
     if kind not in {
         "assistant_text",
+        "assistant_usage",
         "assistant_tool_call",
         "assistant_tool_result_ready",
         "plan_execution",
@@ -31,10 +32,22 @@ def _runtime_event_from_payload(event_payload: dict[str, Any]) -> RuntimeEvent |
         "advisor_error",
         "context_compacted",
         "provider_retry",
+        "tool_batch_started",
+        "tool_batch_finished",
+        "tool_waiting_for_approval",
         "tool_started",
         "tool_finished",
         "tool_failed",
         "tool_result",
+        "tool_result_summarized",
+        "tool_result_replacement_applied",
+        "tool_result_replacement_reapplied",
+        "tool_result_artifact_created",
+        "tool_result_artifact_reused",
+        "tool_result_microcompacted",
+        "budget_pressure",
+        "compact_recovery_started",
+        "compact_recovery_finished",
     }:
         return None
     return RuntimeEvent(
@@ -44,6 +57,48 @@ def _runtime_event_from_payload(event_payload: dict[str, Any]) -> RuntimeEvent |
         tool_name=event_payload.get("tool_name"),
         tool_call_id=event_payload.get("tool_call_id"),
         duration_ms=event_payload.get("duration_ms"),
+        prompt_tokens=event_payload.get("prompt_tokens"),
+        completion_tokens=event_payload.get("completion_tokens"),
+        total_tokens=event_payload.get("total_tokens"),
+        usage_source=(
+            str(event_payload.get("usage_source"))
+            if event_payload.get("usage_source") is not None
+            else None
+        ),
+        batch_size=event_payload.get("batch_size"),
+        batch_parallel=event_payload.get("batch_parallel"),
+        result_count=event_payload.get("result_count"),
+        budget_state=(
+            str(event_payload.get("budget_state"))
+            if event_payload.get("budget_state") is not None
+            else None
+        ),
+        budget_reason=(
+            str(event_payload.get("budget_reason"))
+            if event_payload.get("budget_reason") is not None
+            else None
+        ),
+        compaction_trigger=(
+            str(event_payload.get("compaction_trigger"))
+            if event_payload.get("compaction_trigger") is not None
+            else None
+        ),
+        approval_risk_level=(
+            str(event_payload.get("approval_risk_level"))
+            if event_payload.get("approval_risk_level") is not None
+            else None
+        ),
+        replacement_count=event_payload.get("replacement_count"),
+        replaced_chars_total=event_payload.get("replaced_chars_total"),
+        replacement_reason=(
+            str(event_payload.get("replacement_reason"))
+            if event_payload.get("replacement_reason") is not None
+            else None
+        ),
+        artifact_count=event_payload.get("artifact_count"),
+        artifact_chars_saved=event_payload.get("artifact_chars_saved"),
+        microcompact_count=event_payload.get("microcompact_count"),
+        microcompact_chars_saved=event_payload.get("microcompact_chars_saved"),
         is_error=bool(event_payload.get("is_error")),
     )
 
@@ -157,12 +212,32 @@ class RemoteSessionProxy:
         self._checklist_duplicate_guard: dict[str, Any] | None = None
         self._task_surface_counts: dict[str, int] = {}
         self._working_set_metadata: dict[str, Any] = {}
+        self._file_context_surface_metadata: dict[str, Any] = {}
+        self._memory_metadata: dict[str, Any] = {}
+        self._rewind_preview_metadata: dict[str, Any] = {}
+        self._rewind_preview_selector: str | None = None
+        self._background_metadata: dict[str, Any] = {}
+        self._background_registry_metadata: dict[str, Any] = {}
+        self._background_handoff_metadata: dict[str, Any] = {}
+        self._skills_surface_metadata: dict[str, Any] = {}
+        self._plugin_surface_metadata: dict[str, Any] = {}
+        self._status_metadata: dict[str, Any] = {}
+        self._workspace_surface_metadata: dict[str, Any] = {}
         self._task_detail_cache: dict[str, dict[str, Any]] = {}
         self._sync_workspace_metadata(described)
         self._sync_execution_contract_metadata(described)
         self._sync_task_surface_counts(described)
         self._sync_symbol_surface_metadata(described)
         self._sync_working_set_metadata(described)
+        self._sync_file_context_surface_metadata(described)
+        self._sync_memory_metadata(described)
+        self._sync_background_metadata(described)
+        self._sync_background_registry_metadata(described)
+        self._sync_background_handoff_metadata(described)
+        self._sync_skills_surface_metadata(described)
+        self._sync_plugin_surface_metadata(described)
+        self._sync_status_metadata(described)
+        self._sync_workspace_surface_metadata(described)
         self.permission_manager = _RemotePermissionManager()
         self._default_live_sink = None
         self._transient_live_sink = None
@@ -386,6 +461,12 @@ class RemoteSessionProxy:
     def working_set_payload(self, limit: int = 5) -> dict[str, Any]:
         del limit
         return self._extract_file_context_payload(self._working_set_metadata)
+
+    def file_context_surface_payload(self) -> dict[str, Any]:
+        return dict(self._file_context_surface_metadata)
+
+    def workspace_surface_payload(self) -> dict[str, Any]:
+        return dict(self._workspace_surface_metadata)
 
     def execution_contract_payload(self) -> dict[str, Any]:
         return {
@@ -917,10 +998,107 @@ class RemoteSessionProxy:
     def describe_config(self) -> str:
         return self._view_text("config")
 
-    def clear_history(self) -> None:
-        self.client.request("session.action", {"session_id": self.session_id, "action": "clear_history"})
-        self.state.messages = []
-        self.state.context_summary = None
+    def describe_agents(self) -> str:
+        return self._view_text("agents")
+
+    def memory_surface_payload(self) -> dict[str, Any]:
+        return dict(self._memory_metadata)
+
+    def background_surface_payload(self) -> dict[str, Any]:
+        return dict(getattr(self, "_background_metadata", {}))
+
+    def background_registry_payload(self) -> dict[str, Any]:
+        return dict(getattr(self, "_background_registry_metadata", {}))
+
+    def background_handoff_payload(self) -> dict[str, Any]:
+        return dict(getattr(self, "_background_handoff_metadata", {}))
+
+    def skills_surface_payload(self) -> dict[str, Any]:
+        return dict(getattr(self, "_skills_surface_metadata", {}))
+
+    def plugin_surface_payload(self) -> dict[str, Any]:
+        return dict(getattr(self, "_plugin_surface_metadata", {}))
+
+    def status_surface_payload(self) -> dict[str, Any]:
+        return dict(getattr(self, "_status_metadata", {}))
+
+    def send_background_followup(self, bg_id: str, prompt: str = "") -> str:
+        return self._action_text(
+            "background_send_followup",
+            bg_id=bg_id,
+            prompt=prompt,
+        )
+
+    def queue_background_message(self, bg_id: str, prompt: str) -> str:
+        return self._action_text(
+            "background_queue_message",
+            bg_id=bg_id,
+            prompt=prompt,
+        )
+
+    def cancel_pending_background_followup(self, bg_id: str) -> str:
+        return self._action_text(
+            "background_cancel_pending_followup",
+            bg_id=bg_id,
+        )
+
+    def clear_history(self) -> str:
+        return self._action_text("clear_history")
+
+    def describe_rewind(self, selector: str = "") -> str:
+        result = self._action_result("describe_rewind", args=selector)
+        return str(result.get("text", ""))
+
+    def describe_rewind_payload(self, selector: str = "") -> dict[str, Any]:
+        return dict(self._action_result("describe_rewind", args=selector))
+
+    def rewind_boundary_preview_payload(self, selector: str = "1") -> dict[str, Any] | None:
+        normalized = str(selector or "").strip() or "1"
+        if self._rewind_preview_selector == normalized and self._rewind_preview_metadata:
+            return dict(self._rewind_preview_metadata)
+        result = self.describe_rewind_payload(f"show {normalized}")
+        preview = {
+            "selector_index": result.get("selector"),
+            "boundary_id": result.get("boundary_id"),
+            "boundary_kind": result.get("boundary_kind"),
+            "boundary_kind_label": result.get("boundary_kind_label"),
+            "created_at": result.get("created_at"),
+            "trigger": result.get("trigger"),
+            "trigger_reason": result.get("trigger_reason"),
+            "summary": result.get("summary"),
+            "rewindable": result.get("rewindable"),
+            "message_count_before": result.get("message_count_before"),
+            "message_count_after": result.get("message_count_after"),
+            "context_summary_chars_before": result.get("context_summary_chars_before"),
+            "context_summary_chars_after": result.get("context_summary_chars_after"),
+            "snapshot_available": result.get("snapshot_available"),
+            "snapshot_message_count": result.get("snapshot_message_count"),
+            "snapshot_summary_chars": result.get("snapshot_summary_chars"),
+            "target_boundary_id": result.get("target_boundary_id"),
+            "target_boundary_kind": result.get("target_boundary_kind"),
+            "target_boundary_kind_label": result.get("target_boundary_kind_label"),
+            "old_session_id": result.get("old_session_id"),
+            "new_session_id": result.get("new_session_id"),
+            "lineage_summary": result.get("lineage_summary"),
+            "restore_message_delta_current": result.get("restore_message_delta_current"),
+            "restore_summary_chars_delta_current": result.get("restore_summary_chars_delta_current"),
+            "restore_message_count_current": result.get("restore_message_count_current"),
+            "restore_summary_chars_current": result.get("restore_summary_chars_current"),
+            "targets_pre_compact_state": result.get("targets_pre_compact_state"),
+            "targets_post_resume_state": result.get("targets_post_resume_state"),
+            "restore_effect_summary": result.get("restore_effect_summary"),
+            "workflow_surface_policy": result.get("workflow_surface_policy"),
+            "show_action": result.get("show_action"),
+            "apply_action": result.get("apply_action"),
+        }
+        if not preview.get("boundary_id"):
+            return None
+        self._rewind_preview_selector = normalized
+        self._rewind_preview_metadata = dict(preview)
+        return dict(preview)
+
+    def rewind_to_boundary(self, selector: str) -> str:
+        return self._action_text("rewind_to_boundary", args=selector)
 
     def clear_session_reset(self) -> str:
         result = self.client.request(
@@ -1090,13 +1268,61 @@ class RemoteSessionProxy:
         return str(result.get("text", ""))
 
     def _action_text(self, action: str, **params) -> str:
+        result = self._action_result(action, **params)
+        return str(result.get("text", ""))
+
+    def _action_result(self, action: str, **params) -> dict[str, Any]:
         result = self.client.request(
             "session.action",
             {"session_id": self.session_id, "action": action, **params},
         )
+        if action == "describe_rewind":
+            args = str(params.get("args") or "").strip()
+            if str(result.get("rewind_mode") or "").strip() == "show" and result.get("boundary_id"):
+                selector = ""
+                if args.lower().startswith("show "):
+                    selector = args.split(" ", 1)[1].strip()
+                self._rewind_preview_selector = selector or str(result.get("selector") or "").strip() or None
+                self._rewind_preview_metadata = {
+                    "selector_index": result.get("selector"),
+                    "boundary_id": result.get("boundary_id"),
+                    "boundary_kind": result.get("boundary_kind"),
+                    "boundary_kind_label": result.get("boundary_kind_label"),
+                    "created_at": result.get("created_at"),
+                    "trigger": result.get("trigger"),
+                    "trigger_reason": result.get("trigger_reason"),
+                    "summary": result.get("summary"),
+                    "rewindable": result.get("rewindable"),
+                    "message_count_before": result.get("message_count_before"),
+                    "message_count_after": result.get("message_count_after"),
+                    "context_summary_chars_before": result.get("context_summary_chars_before"),
+                    "context_summary_chars_after": result.get("context_summary_chars_after"),
+                    "snapshot_available": result.get("snapshot_available"),
+                    "snapshot_message_count": result.get("snapshot_message_count"),
+                    "snapshot_summary_chars": result.get("snapshot_summary_chars"),
+                    "target_boundary_id": result.get("target_boundary_id"),
+                    "target_boundary_kind": result.get("target_boundary_kind"),
+                    "target_boundary_kind_label": result.get("target_boundary_kind_label"),
+                    "old_session_id": result.get("old_session_id"),
+                    "new_session_id": result.get("new_session_id"),
+                    "lineage_summary": result.get("lineage_summary"),
+                    "restore_message_delta_current": result.get("restore_message_delta_current"),
+                    "restore_summary_chars_delta_current": result.get("restore_summary_chars_delta_current"),
+                    "restore_message_count_current": result.get("restore_message_count_current"),
+                    "restore_summary_chars_current": result.get("restore_summary_chars_current"),
+                    "targets_pre_compact_state": result.get("targets_pre_compact_state"),
+                    "targets_post_resume_state": result.get("targets_post_resume_state"),
+                    "restore_effect_summary": result.get("restore_effect_summary"),
+                    "workflow_surface_policy": result.get("workflow_surface_policy"),
+                    "show_action": result.get("show_action"),
+                    "apply_action": result.get("apply_action"),
+                }
         self._sync_from_describe()
         self._task_detail_cache.clear()
-        return str(result.get("text", ""))
+        if action == "rewind_to_boundary":
+            self._rewind_preview_selector = None
+            self._rewind_preview_metadata = {}
+        return dict(result)
 
     def _task_detail_view_result(self, task_id: str, *, force: bool = False) -> dict[str, Any]:
         if not force:
@@ -1117,6 +1343,9 @@ class RemoteSessionProxy:
         context_summary = result.get("context_summary")
         self.state.context_summary = str(context_summary) if context_summary else None
         self._sync_working_set_metadata(result)
+        self._sync_memory_metadata(result)
+        self._sync_skills_surface_metadata(result)
+        self._sync_plugin_surface_metadata(result)
 
     def _sync_from_describe(self) -> None:
         described = self.client.request("session.describe", {"session_id": self.session_id})
@@ -1124,12 +1353,559 @@ class RemoteSessionProxy:
             self.session_id = str(described["session_id"])
             self.state.session_id = self.session_id
         self.state.messages = [{} for _ in range(int(described.get("message_count", 0)))]
+        context_summary = described.get("context_summary")
+        self.state.context_summary = str(context_summary) if context_summary else None
         self._sync_workspace_metadata(described)
         self._sync_execution_contract_metadata(described)
         self._sync_task_surface_counts(described)
         self._sync_checklist_duplicate_guard_metadata(described)
         self._sync_symbol_surface_metadata(described)
         self._sync_working_set_metadata(described)
+        self._sync_file_context_surface_metadata(described)
+        self._sync_memory_metadata(described)
+        self._sync_background_metadata(described)
+        self._sync_background_registry_metadata(described)
+        self._sync_background_handoff_metadata(described)
+        self._sync_skills_surface_metadata(described)
+        self._sync_plugin_surface_metadata(described)
+        self._sync_status_metadata(described)
+        self._sync_workspace_surface_metadata(described)
+
+    def _sync_memory_metadata(self, payload: dict[str, Any]) -> None:
+        self._memory_metadata = {
+            "context_summary_present": bool(
+                payload.get("memory_context_summary_present", payload.get("context_summary_present", False))
+            ),
+            "context_summary_chars": int(
+                payload.get("memory_context_summary_chars", payload.get("context_summary_chars", 0))
+                or 0
+            ),
+            "history_boundary_count": int(
+                payload.get("memory_boundary_count", payload.get("history_boundary_count", 0)) or 0
+            ),
+            "rewindable_history_boundary_count": int(
+                payload.get(
+                    "memory_rewindable_boundary_count",
+                    payload.get("rewindable_history_boundary_count", 0),
+                )
+                or 0
+            ),
+            "compact_boundary_count": int(
+                payload.get("memory_compact_boundary_count", payload.get("compact_boundary_count", 0))
+                or 0
+            ),
+            "last_history_boundary_kind": payload.get(
+                "memory_last_boundary_kind",
+                payload.get("last_history_boundary_kind"),
+            ),
+            "last_history_boundary_created_at": payload.get(
+                "memory_last_boundary_created_at",
+                payload.get("last_history_boundary_created_at"),
+            ),
+            "last_history_boundary_summary": payload.get(
+                "memory_last_boundary_summary",
+                payload.get("last_history_boundary_summary"),
+            ),
+            "latest_rewindable_boundary_id": payload.get(
+                "memory_latest_rewindable_boundary_id",
+                payload.get("latest_rewindable_boundary_id"),
+            ),
+            "latest_rewindable_boundary_kind": payload.get(
+                "memory_latest_rewindable_boundary_kind",
+                payload.get("latest_rewindable_boundary_kind"),
+            ),
+            "latest_rewindable_boundary_created_at": payload.get(
+                "memory_latest_rewindable_boundary_created_at",
+                payload.get("latest_rewindable_boundary_created_at"),
+            ),
+            "latest_rewindable_boundary_summary": payload.get(
+                "memory_latest_rewindable_boundary_summary",
+                payload.get("latest_rewindable_boundary_summary"),
+            ),
+            "default_rewind_selector": payload.get(
+                "memory_default_rewind_selector",
+                payload.get("default_rewind_selector"),
+            ),
+            "rewind_show_action": payload.get(
+                "memory_rewind_show_action",
+                payload.get("rewind_show_action"),
+            ),
+            "rewind_apply_action": payload.get(
+                "memory_rewind_apply_action",
+                payload.get("rewind_apply_action"),
+            ),
+            "compaction_state": payload.get(
+                "memory_compaction_state",
+                payload.get("compaction_state"),
+            ),
+            "would_compact": bool(
+                payload.get("memory_would_compact", payload.get("would_compact", False))
+            ),
+            "should_warn": bool(
+                payload.get("memory_should_warn", payload.get("should_warn", False))
+            ),
+            "should_auto_compact": bool(
+                payload.get("memory_should_auto_compact", payload.get("should_auto_compact", False))
+            ),
+            "compaction_reason": payload.get(
+                "memory_compaction_reason",
+                payload.get("compaction_reason"),
+            ),
+            "message_count": int(
+                payload.get("memory_message_count", payload.get("message_count", 0)) or 0
+            ),
+            "message_limit": int(
+                payload.get("memory_message_limit", payload.get("message_limit", 0)) or 0
+            ),
+            "warning_message_threshold": int(
+                payload.get(
+                    "memory_warning_message_threshold",
+                    payload.get("warning_message_threshold", 0),
+                )
+                or 0
+            ),
+            "context_summary_limit": int(
+                payload.get(
+                    "memory_context_summary_limit",
+                    payload.get("context_summary_limit", 0),
+                )
+                or 0
+            ),
+            "warning_summary_threshold": int(
+                payload.get(
+                    "memory_warning_summary_threshold",
+                    payload.get("warning_summary_threshold", 0),
+                )
+                or 0
+            ),
+            "auto_summary_threshold": int(
+                payload.get(
+                    "memory_auto_summary_threshold",
+                    payload.get("auto_summary_threshold", 0),
+                )
+                or 0
+            ),
+            "compact_preview_action": payload.get(
+                "memory_compact_preview_action",
+                payload.get("compact_preview_action"),
+            ),
+            "compact_apply_action": payload.get(
+                "memory_compact_apply_action",
+                payload.get("compact_apply_action"),
+            ),
+            "memory_budget_state": payload.get("memory_budget_state"),
+            "memory_budget_reason": payload.get("memory_budget_reason"),
+            "memory_context_tokens_estimated": payload.get("memory_context_tokens_estimated"),
+            "memory_context_percentage": payload.get("memory_context_percentage"),
+            "memory_context_token_source": payload.get("memory_context_token_source"),
+            "memory_last_turn_token_count": payload.get("memory_last_turn_token_count"),
+            "memory_last_turn_token_source": payload.get("memory_last_turn_token_source"),
+            "memory_provider_usage_seen": payload.get("memory_provider_usage_seen"),
+            "memory_budget_pressure": payload.get("memory_budget_pressure"),
+            "memory_compact_lifecycle": payload.get("memory_compact_lifecycle"),
+            "memory_latest_compact_trigger": payload.get("memory_latest_compact_trigger"),
+            "memory_latest_compact_reason": payload.get("memory_latest_compact_reason"),
+            "memory_latest_compact_summary": payload.get("memory_latest_compact_summary"),
+            "memory_tool_result_replacements": payload.get("memory_tool_result_replacements"),
+            "memory_tool_result_artifacts": payload.get("memory_tool_result_artifacts"),
+            "memory_replacement_aware_compaction": payload.get("memory_replacement_aware_compaction"),
+            "memory_should_stop": payload.get("memory_should_stop"),
+            "memory_last_operation": payload.get("memory_last_operation"),
+            "memory_last_operation_summary": payload.get("memory_last_operation_summary"),
+            "memory_last_operation_messages": payload.get("memory_last_operation_messages"),
+            "memory_last_operation_context_summary": payload.get(
+                "memory_last_operation_context_summary"
+            ),
+            "memory_last_operation_session_identity": payload.get(
+                "memory_last_operation_session_identity"
+            ),
+            "memory_last_operation_history_boundaries": payload.get(
+                "memory_last_operation_history_boundaries"
+            ),
+            "memory_last_operation_task_plan_file_focus": payload.get(
+                "memory_last_operation_task_plan_file_focus"
+            ),
+            "memory_last_operation_advisor_review_state": payload.get(
+                "memory_last_operation_advisor_review_state"
+            ),
+            "memory_last_operation_symbol_surface": payload.get(
+                "memory_last_operation_symbol_surface"
+            ),
+            "memory_last_operation_advisor_configuration": payload.get(
+                "memory_last_operation_advisor_configuration"
+            ),
+            "memory_last_operation_boundary_kind": payload.get(
+                "memory_last_operation_boundary_kind"
+            ),
+            "memory_last_operation_boundary_id": payload.get(
+                "memory_last_operation_boundary_id"
+            ),
+            "memory_last_operation_trigger": payload.get("memory_last_operation_trigger"),
+            "memory_last_operation_trigger_reason": payload.get(
+                "memory_last_operation_trigger_reason"
+            ),
+            "memory_context_summary_present": bool(
+                payload.get("memory_context_summary_present", payload.get("context_summary_present", False))
+            ),
+            "memory_context_summary_chars": int(
+                payload.get("memory_context_summary_chars", payload.get("context_summary_chars", 0))
+                or 0
+            ),
+            "memory_boundary_count": int(
+                payload.get("memory_boundary_count", payload.get("history_boundary_count", 0)) or 0
+            ),
+            "memory_rewindable_boundary_count": int(
+                payload.get(
+                    "memory_rewindable_boundary_count",
+                    payload.get("rewindable_history_boundary_count", 0),
+                )
+                or 0
+            ),
+            "memory_compaction_state": payload.get(
+                "memory_compaction_state",
+                payload.get("compaction_state"),
+            ),
+            "memory_compaction_reason": payload.get(
+                "memory_compaction_reason",
+                payload.get("compaction_reason"),
+            ),
+            "memory_default_rewind_selector": payload.get(
+                "memory_default_rewind_selector",
+                payload.get("default_rewind_selector"),
+            ),
+            "memory_rewind_show_action": payload.get(
+                "memory_rewind_show_action",
+                payload.get("rewind_show_action"),
+            ),
+            "memory_rewind_apply_action": payload.get(
+                "memory_rewind_apply_action",
+                payload.get("rewind_apply_action"),
+            ),
+        }
+
+    def _sync_background_metadata(self, payload: dict[str, Any]) -> None:
+        background_session_id = str(payload.get("background_session_id") or "").strip()
+        if not background_session_id:
+            self._background_metadata = {}
+            return
+        self._background_metadata = {
+            "background_session_id": background_session_id,
+            "background_session_source": payload.get("background_session_source"),
+            "background_continuation_category": payload.get("background_continuation_category"),
+            "background_live_attachable": bool(payload.get("background_live_attachable", False)),
+            "background_saved_resumable": bool(payload.get("background_saved_resumable", False)),
+            "background_inactive_only": bool(payload.get("background_inactive_only", False)),
+            "background_primary_action": payload.get("background_primary_action"),
+            "background_secondary_action": payload.get("background_secondary_action"),
+            "background_attach_action": payload.get(
+                "background_attach_action",
+                payload.get("background_go_to_live_attach"),
+            ),
+            "background_resume_action": payload.get(
+                "background_resume_action",
+                payload.get("background_go_to_saved_resume"),
+            ),
+            "background_logs_action": payload.get("background_logs_action"),
+            "background_history_action": payload.get("background_history_action"),
+            "background_sessions_action": payload.get("background_sessions_action"),
+            "background_pending_followup_count": int(
+                payload.get("background_pending_followup_count", 0) or 0
+            ),
+            "background_pending_followup_summary": payload.get("background_pending_followup_summary"),
+            "background_latest_followup_message": payload.get("background_latest_followup_message"),
+            "background_latest_followup_mode": payload.get("background_latest_followup_mode"),
+            "background_latest_followup_at": payload.get("background_latest_followup_at"),
+            "background_send_followup_action": payload.get("background_send_followup_action"),
+            "background_queue_message_action": payload.get("background_queue_message_action"),
+            "background_cancel_pending_followup_action": payload.get(
+                "background_cancel_pending_followup_action"
+            ),
+            "background_current_workflow_summary": payload.get("background_current_workflow_summary"),
+            "background_task_surface_counts": dict(payload.get("background_task_surface_counts") or {}),
+            "background_task_surface_summary": payload.get("background_task_surface_summary"),
+            "background_background_execution_count": int(
+                payload.get("background_background_execution_count", 0) or 0
+            ),
+            "background_active_plan_execution_count": int(
+                payload.get("background_active_plan_execution_count", 0) or 0
+            ),
+            "background_primary_task": payload.get("background_primary_task"),
+            "background_primary_task_action": payload.get("background_primary_task_action"),
+            "background_recent_change_count": int(payload.get("background_recent_change_count", 0) or 0),
+            "background_recent_activity": payload.get("background_recent_activity"),
+            "background_recent_activity_kind": payload.get("background_recent_activity_kind"),
+            "background_last_tool": payload.get("background_last_tool"),
+            "background_last_tool_input": payload.get("background_last_tool_input"),
+            "background_last_tool_summary": payload.get("background_last_tool_summary"),
+            "background_token_count": payload.get("background_token_count"),
+            "background_token_count_source": payload.get("background_token_count_source"),
+            "background_tool_use_count": int(payload.get("background_tool_use_count", 0) or 0),
+            "background_message_count": payload.get("background_message_count"),
+            "background_progress_summary": payload.get("background_progress_summary"),
+            "background_progress_updated_at": payload.get("background_progress_updated_at"),
+            "background_completion_state": payload.get("background_completion_state"),
+            "background_completion_summary": payload.get("background_completion_summary"),
+            "background_failure_reason": payload.get("background_failure_reason"),
+            "background_result_pointer": payload.get("background_result_pointer"),
+            "background_transcript_pointer": payload.get("background_transcript_pointer"),
+            "background_working_set_file_count": int(
+                payload.get("background_working_set_file_count", 0) or 0
+            ),
+            "background_focused_file": payload.get("background_focused_file"),
+            "background_focused_file_source": payload.get("background_focused_file_source"),
+            "background_has_active_plan": bool(payload.get("background_has_active_plan", False)),
+            "background_active_plan_id": payload.get("background_active_plan_id"),
+            "background_active_plan_summary": payload.get("background_active_plan_summary"),
+            "background_action_groups": payload.get("background_action_groups"),
+            "background_action_order": payload.get("background_action_order"),
+        }
+
+    def _sync_background_registry_metadata(self, payload: dict[str, Any]) -> None:
+        count = int(payload.get("background_registry_count", 0) or 0)
+        entries_payload = payload.get("background_registry_entries")
+        entries = (
+            [dict(item) for item in entries_payload if isinstance(item, dict)]
+            if isinstance(entries_payload, list)
+            else []
+        )
+        if count <= 0 and not entries:
+            self._background_registry_metadata = {}
+            return
+        self._background_registry_metadata = {
+            "background_registry_count": count,
+            "background_registry_entries": entries,
+            "background_registry_selected_bg_id": payload.get("background_registry_selected_bg_id"),
+            "background_registry_selected_status": payload.get("background_registry_selected_status"),
+            "background_registry_selected_continuation_category": payload.get(
+                "background_registry_selected_continuation_category"
+            ),
+            "background_registry_selected_workflow_summary": payload.get(
+                "background_registry_selected_workflow_summary"
+            ),
+            "background_registry_selected_primary_task": payload.get(
+                "background_registry_selected_primary_task"
+            ),
+            "background_registry_selected_active_plan_summary": payload.get(
+                "background_registry_selected_active_plan_summary"
+            ),
+            "background_registry_selected_focused_file": payload.get(
+                "background_registry_selected_focused_file"
+            ),
+            "background_registry_selected_recent_activity": payload.get(
+                "background_registry_selected_recent_activity"
+            ),
+            "background_registry_selected_recent_activity_kind": payload.get(
+                "background_registry_selected_recent_activity_kind"
+            ),
+            "background_registry_selected_progress_summary": payload.get(
+                "background_registry_selected_progress_summary"
+            ),
+            "background_registry_selected_last_tool_input": payload.get(
+                "background_registry_selected_last_tool_input"
+            ),
+            "background_registry_selected_last_tool_summary": payload.get(
+                "background_registry_selected_last_tool_summary"
+            ),
+            "background_registry_selected_token_count": payload.get(
+                "background_registry_selected_token_count"
+            ),
+            "background_registry_selected_token_count_source": payload.get(
+                "background_registry_selected_token_count_source"
+            ),
+            "background_registry_selected_completion_state": payload.get(
+                "background_registry_selected_completion_state"
+            ),
+            "background_registry_selected_completion_summary": payload.get(
+                "background_registry_selected_completion_summary"
+            ),
+            "background_registry_selected_pending_followup_count": int(
+                payload.get("background_registry_selected_pending_followup_count", 0) or 0
+            ),
+            "background_registry_selected_pending_followup_summary": payload.get(
+                "background_registry_selected_pending_followup_summary"
+            ),
+            "background_registry_selected_latest_followup_message": payload.get(
+                "background_registry_selected_latest_followup_message"
+            ),
+            "background_registry_selected_latest_followup_mode": payload.get(
+                "background_registry_selected_latest_followup_mode"
+            ),
+            "background_registry_primary_action": payload.get("background_registry_primary_action"),
+            "background_registry_secondary_action": payload.get(
+                "background_registry_secondary_action"
+            ),
+            "background_registry_attach_action": payload.get("background_registry_attach_action"),
+            "background_registry_resume_action": payload.get("background_registry_resume_action"),
+            "background_registry_logs_action": payload.get("background_registry_logs_action"),
+            "background_registry_send_followup_action": payload.get(
+                "background_registry_send_followup_action"
+            ),
+            "background_registry_queue_message_action": payload.get(
+                "background_registry_queue_message_action"
+            ),
+            "background_registry_cancel_pending_followup_action": payload.get(
+                "background_registry_cancel_pending_followup_action"
+            ),
+            "background_registry_selection_strategy": payload.get(
+                "background_registry_selection_strategy"
+            ),
+        }
+
+    def _sync_background_handoff_metadata(self, payload: dict[str, Any]) -> None:
+        count = int(payload.get("background_handoff_count", 0) or 0)
+        entries_payload = payload.get("background_handoff_entries")
+        entries = (
+            [dict(item) for item in entries_payload if isinstance(item, dict)]
+            if isinstance(entries_payload, list)
+            else []
+        )
+        if count <= 0 and not entries:
+            self._background_handoff_metadata = {}
+            return
+        self._background_handoff_metadata = {
+            "background_handoff_count": count,
+            "background_handoff_entries": entries,
+            "background_handoff_selected_bg_id": payload.get("background_handoff_selected_bg_id"),
+            "background_handoff_selected_completion_state": payload.get(
+                "background_handoff_selected_completion_state"
+            ),
+            "background_handoff_selected_completion_summary": payload.get(
+                "background_handoff_selected_completion_summary"
+            ),
+            "background_handoff_selected_failure_reason": payload.get(
+                "background_handoff_selected_failure_reason"
+            ),
+            "background_handoff_selected_primary_task": payload.get(
+                "background_handoff_selected_primary_task"
+            ),
+            "background_handoff_transcript_action": payload.get(
+                "background_handoff_transcript_action"
+            ),
+            "background_handoff_task_action": payload.get("background_handoff_task_action"),
+            "background_handoff_changes_action": payload.get(
+                "background_handoff_changes_action"
+            ),
+            "background_handoff_resume_action": payload.get("background_handoff_resume_action"),
+            "background_handoff_selection_strategy": payload.get(
+                "background_handoff_selection_strategy"
+            ),
+        }
+
+    def _sync_plugin_surface_metadata(self, payload: dict[str, Any]) -> None:
+        surface = payload.get("plugin_surface")
+        if isinstance(surface, dict) and surface:
+            self._plugin_surface_metadata = dict(surface)
+            return
+        self._plugin_surface_metadata = {}
+
+    def _sync_skills_surface_metadata(self, payload: dict[str, Any]) -> None:
+        surface = payload.get("skills_surface")
+        if isinstance(surface, dict) and surface:
+            self._skills_surface_metadata = dict(surface)
+            return
+        self._skills_surface_metadata = {}
+
+    def _sync_status_metadata(self, payload: dict[str, Any]) -> None:
+        self._sync_skills_surface_metadata(payload)
+        self._sync_plugin_surface_metadata(payload)
+        self._status_metadata = {
+            "status_session_id": payload.get("status_session_id"),
+            "status_provider": payload.get("status_provider"),
+            "status_model": payload.get("status_model"),
+            "status_advisor_model": payload.get("status_advisor_model"),
+            "status_advisor_mode": payload.get("status_advisor_mode"),
+            "status_mode": payload.get("status_mode"),
+            "status_context_usage": payload.get("status_context_usage"),
+            "status_context_usage_tokens": payload.get("status_context_usage_tokens"),
+            "status_context_usage_max_tokens": payload.get("status_context_usage_max_tokens"),
+            "status_context_usage_percentage": payload.get("status_context_usage_percentage"),
+            "status_memory_summary": payload.get("status_memory_summary"),
+            "status_memory_compaction": payload.get("status_memory_compaction"),
+            "status_memory_last_operation": payload.get("status_memory_last_operation"),
+            "status_memory_boundary_count": payload.get("status_memory_boundary_count"),
+            "status_budget_state": payload.get("status_budget_state"),
+            "status_budget_reason": payload.get("status_budget_reason"),
+            "status_context_token_source": payload.get("status_context_token_source"),
+            "status_last_turn_token_count": payload.get("status_last_turn_token_count"),
+            "status_last_turn_token_source": payload.get("status_last_turn_token_source"),
+            "status_provider_usage_seen": payload.get("status_provider_usage_seen"),
+            "status_budget_pressure": payload.get("status_budget_pressure"),
+            "status_compact_lifecycle": payload.get("status_compact_lifecycle"),
+            "status_runtime_progress_summary": payload.get("status_runtime_progress_summary"),
+            "status_runtime_progress_kind": payload.get("status_runtime_progress_kind"),
+            "status_runtime_active_tool_name": payload.get("status_runtime_active_tool_name"),
+            "status_runtime_active_tool_status": payload.get("status_runtime_active_tool_status"),
+            "status_runtime_active_tool_input": payload.get("status_runtime_active_tool_input"),
+            "status_runtime_last_tool_name": payload.get("status_runtime_last_tool_name"),
+            "status_runtime_last_tool_status": payload.get("status_runtime_last_tool_status"),
+            "status_runtime_last_tool_summary": payload.get("status_runtime_last_tool_summary"),
+            "status_runtime_parallel_batch_active": payload.get("status_runtime_parallel_batch_active"),
+            "status_runtime_parallel_batch_size": payload.get("status_runtime_parallel_batch_size"),
+            "status_runtime_last_result_summary": payload.get("status_runtime_last_result_summary"),
+            "status_runtime_compact_recovery_summary": payload.get(
+                "status_runtime_compact_recovery_summary"
+            ),
+            "status_runtime_tool_result_replacement_summary": payload.get(
+                "status_runtime_tool_result_replacement_summary"
+            ),
+            "status_runtime_tool_result_artifact_summary": payload.get(
+                "status_runtime_tool_result_artifact_summary"
+            ),
+            "status_runtime_tool_result_microcompact_summary": payload.get(
+                "status_runtime_tool_result_microcompact_summary"
+            ),
+            "status_background_summary": payload.get("status_background_summary"),
+            "status_background_notification_count": payload.get("status_background_notification_count"),
+            "status_background_latest_handoff": payload.get("status_background_latest_handoff"),
+            "status_working_set_summary": payload.get("status_working_set_summary"),
+            "status_working_set_file_count": payload.get("status_working_set_file_count"),
+            "status_focused_file_summary": payload.get("status_focused_file_summary"),
+            "status_focused_file_path": payload.get("status_focused_file_path"),
+            "status_focused_file_source": payload.get("status_focused_file_source"),
+            "status_plan_summary": payload.get("status_plan_summary"),
+            "status_plan_goal": payload.get("status_plan_goal"),
+            "status_task_summary": payload.get("status_task_summary"),
+            "status_active_task_count": payload.get("status_active_task_count"),
+            "status_task_surface_summary": payload.get("status_task_surface_summary"),
+            "status_project_context_summary": payload.get("status_project_context_summary"),
+            "status_project_context_reload_health": payload.get("status_project_context_reload_health"),
+            "status_project_context_issue": payload.get("status_project_context_issue"),
+            "status_skills_health": payload.get("status_skills_health"),
+            "status_skill_registry_summary": payload.get("status_skill_registry_summary"),
+            "status_skill_prompt_summary": payload.get("status_skill_prompt_summary"),
+            "status_skill_reload_state": payload.get("status_skill_reload_state"),
+            "status_skill_manual_overrides": payload.get("status_skill_manual_overrides"),
+            "status_skill_diagnostics": payload.get("status_skill_diagnostics"),
+            "status_plugins_health": payload.get("status_plugins_health"),
+            "status_plugin_registry_summary": payload.get("status_plugin_registry_summary"),
+            "status_plugin_reload_state": payload.get("status_plugin_reload_state"),
+            "status_plugin_manual_overrides": payload.get("status_plugin_manual_overrides"),
+            "status_mcp_health": payload.get("status_mcp_health"),
+            "status_mcp_issue": payload.get("status_mcp_issue"),
+            "status_permission_mode": payload.get("status_permission_mode"),
+            "status_permission_summary": payload.get("status_permission_summary"),
+            "status_permission_issue": payload.get("status_permission_issue"),
+            "status_workspace_summary": payload.get("status_workspace_summary"),
+            "status_workspace_mode": payload.get("status_workspace_mode"),
+            "status_workspace_health": payload.get("status_workspace_health"),
+            "status_workspace_anomaly": payload.get("status_workspace_anomaly"),
+            "status_workspace_cleanup_status": payload.get("status_workspace_cleanup_status"),
+            "status_workspace_unavailable": payload.get("status_workspace_unavailable"),
+            "status_runtime_health_alert": payload.get("status_runtime_health_alert"),
+            "status_runtime_health_source": payload.get("status_runtime_health_source"),
+            "status_action_groups": dict(payload.get("status_action_groups") or {}),
+            "status_explicit_context_entry_count": payload.get("status_explicit_context_entry_count"),
+            "status_unresolved_explicit_context_entry_count": payload.get(
+                "status_unresolved_explicit_context_entry_count"
+            ),
+            "status_tool_result_replacement_summary": payload.get(
+                "status_tool_result_replacement_summary"
+            ),
+            "status_tool_result_artifact_summary": payload.get(
+                "status_tool_result_artifact_summary"
+            ),
+            "status_next_actions": list(payload.get("status_next_actions") or []),
+        }
 
     def _sync_workspace_metadata(self, payload: dict[str, Any]) -> None:
         self.state.original_cwd = (
@@ -1180,6 +1956,52 @@ class RemoteSessionProxy:
             "workspace_health": self.state.workspace_health,
         }
 
+    def _sync_workspace_surface_metadata(self, payload: dict[str, Any]) -> None:
+        surface = payload.get("workspace_surface")
+        if isinstance(surface, dict) and surface:
+            self._workspace_surface_metadata = dict(surface)
+            return
+        recommended_actions = [
+            str(item).strip()
+            for item in (payload.get("workspace_recommended_actions") or [])
+            if str(item).strip()
+        ]
+        if not recommended_actions:
+            for key in ("workspace_primary_action", "workspace_secondary_action", "workspace_tertiary_action"):
+                action = str(payload.get(key) or "").strip()
+                if action and action != "none" and action not in recommended_actions:
+                    recommended_actions.append(action)
+        self._workspace_surface_metadata = {
+            "workspace_summary": payload.get("workspace_summary"),
+            "workspace_mode": payload.get("workspace_mode"),
+            "workspace_label": payload.get("workspace_label"),
+            "workspace_health": payload.get("workspace_health"),
+            "workspace_created_at": payload.get("workspace_created_at"),
+            "workspace_original_cwd": payload.get("original_cwd"),
+            "workspace_effective_cwd": payload.get("effective_cwd"),
+            "workspace_effective_cwd_exists": payload.get("workspace_effective_cwd_exists"),
+            "workspace_cleanup_status": payload.get("workspace_cleanup_status"),
+            "workspace_cleanup_error": payload.get("workspace_cleanup_error"),
+            "workspace_unavailable": payload.get("workspace_unavailable"),
+            "workspace_unavailable_reason": payload.get("workspace_unavailable_reason"),
+            "workspace_fallback_cwd": payload.get("workspace_fallback_cwd"),
+            "workspace_anomaly_summary": payload.get("status_workspace_anomaly"),
+            "workspace_recovery_summary": recommended_actions[0] if recommended_actions else None,
+            "workspace_recommended_actions": recommended_actions,
+            "workspace_action_bundle": {
+                "primary_action": payload.get("workspace_primary_action"),
+                "secondary_action": payload.get("workspace_secondary_action"),
+                "tertiary_action": payload.get("workspace_tertiary_action"),
+                "target": payload.get("workspace_action_target"),
+                "workspace_health": payload.get("workspace_health"),
+            },
+            "workspace_action_groups": {
+                "inspect_current_workspace": ["/workspaces current"],
+                "inspect_workspace_inventory": ["/workspaces list"],
+                "workspace_recovery": recommended_actions,
+            },
+        }
+
     def _sync_symbol_surface_metadata(self, payload: dict[str, Any]) -> None:
         surface_kind = payload.get("symbol_surface_kind")
         if surface_kind in {None, "", "none"}:
@@ -1224,6 +2046,34 @@ class RemoteSessionProxy:
 
     def _sync_working_set_metadata(self, payload: dict[str, Any]) -> None:
         self._working_set_metadata = self._extract_file_context_payload(payload)
+
+    def _sync_file_context_surface_metadata(self, payload: dict[str, Any]) -> None:
+        surface = payload.get("file_context_surface")
+        if isinstance(surface, dict) and surface:
+            self._file_context_surface_metadata = dict(surface)
+            return
+        working_set = self._extract_file_context_payload(payload)
+        self._file_context_surface_metadata = {
+            "working_set": dict(working_set),
+            "working_set_summary": None,
+            "focused_file": {
+                "source": payload.get("focused_file_context_source"),
+                "scope": payload.get("focused_file_context_scope"),
+                "index": payload.get("focused_file_context_index"),
+                "file_count": payload.get("focused_file_context_file_count"),
+                "path": payload.get("focused_file_context_path"),
+                "scope_reasons": list(payload.get("focused_file_context_scope_reasons") or []),
+                "context_origin": None,
+                "has_related_change": bool(payload.get("focused_file_context_has_related_change", False)),
+                "has_diff_hunks": bool(payload.get("focused_file_context_has_diff_hunks", False)),
+                "is_context_only": bool(payload.get("focused_file_context_is_context_only", False)),
+                "primary_target": payload.get("focused_file_context_primary_target"),
+                "secondary_target": payload.get("focused_file_context_secondary_target"),
+                "summary": payload.get("focused_file_context_summary"),
+            },
+            "explicit_context": {},
+            "file_action_groups": {},
+        }
 
     def _extract_file_context_payload(self, payload: dict[str, Any]) -> dict[str, Any]:
         return {

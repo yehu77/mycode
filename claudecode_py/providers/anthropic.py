@@ -4,13 +4,15 @@ from collections.abc import Iterator
 from typing import Any
 import os
 
-from ..models import AssistantResponse, ProviderStreamEvent, ToolCall
+from ..models import AssistantResponse, ProviderStreamEvent, TokenUsage, ToolCall
 from .capabilities import ProviderCapabilities
 from .errors import (
     ProviderCapabilityError,
     ProviderConfigurationError,
+    ProviderContextLimitError,
     ProviderNetworkError,
     ProviderTimeoutError,
+    classify_context_limit_error,
     classify_status_error,
 )
 
@@ -97,6 +99,9 @@ class AnthropicProvider:
     def _wrap_error(self, exc: Exception):
         status_code = getattr(exc, "status_code", None)
         message = str(exc)
+        context_limit_error = classify_context_limit_error(status_code, message)
+        if context_limit_error is not None:
+            return context_limit_error
         if status_code is not None:
             return classify_status_error(status_code, message)
 
@@ -107,6 +112,8 @@ class AnthropicProvider:
             return ProviderNetworkError(f"Provider network error: {message}")
         if "tool" in message.lower() and "support" in message.lower():
             return ProviderCapabilityError(f"Provider capability mismatch: {message}")
+        if classify_context_limit_error(None, message) is not None:
+            return ProviderContextLimitError(f"Anthropic provider call failed: {message}")
         return ProviderNetworkError(f"Anthropic provider call failed: {message}")
 
     def _build_response_from_message(self, response: Any) -> AssistantResponse:
@@ -143,4 +150,22 @@ class AnthropicProvider:
             text="".join(text_parts).strip(),
             tool_calls=tool_calls,
             stop_reason=getattr(response, "stop_reason", None),
+            usage=self._extract_usage(response),
+        )
+
+    def _extract_usage(self, response: Any) -> TokenUsage | None:
+        usage = getattr(response, "usage", None)
+        if usage is None:
+            return None
+        prompt_tokens = getattr(usage, "input_tokens", None)
+        completion_tokens = getattr(usage, "output_tokens", None)
+        total_tokens = None
+        if prompt_tokens is not None or completion_tokens is not None:
+            total_tokens = int(prompt_tokens or 0) + int(completion_tokens or 0)
+        if prompt_tokens is None and completion_tokens is None and total_tokens is None:
+            return None
+        return TokenUsage(
+            prompt_tokens=int(prompt_tokens) if prompt_tokens is not None else None,
+            completion_tokens=int(completion_tokens) if completion_tokens is not None else None,
+            total_tokens=total_tokens,
         )

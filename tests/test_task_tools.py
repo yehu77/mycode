@@ -14,7 +14,7 @@ from claudecode_py.session import Session
 from claudecode_py.tasks import TaskManager
 from claudecode_py.tools.base import ToolContext
 from claudecode_py.tools.agent import AgentTool
-from claudecode_py.tools.task_tools import TaskGetTool, TaskStopTool, TaskWaitTool
+from claudecode_py.tools.task_tools import TaskGetTool, TaskListTool, TaskStopTool, TaskWaitTool
 
 
 class TaskToolsTests(unittest.TestCase):
@@ -59,6 +59,60 @@ class TaskToolsTests(unittest.TestCase):
 
         self.assertIn("status: completed", wait_result)
         self.assertIn("output_tail:\ndone", wait_result)
+
+    def test_task_tools_render_background_reverse_hint(self) -> None:
+        cwd = Path(__file__).resolve().parent
+        session = Session(SessionConfig(cwd=cwd, interactive=False))
+        task_manager = TaskManager()
+        task = task_manager.create(
+            "agent",
+            "background work",
+            parent_session_id="session-bg",
+            task_role="background",
+        )
+        ctx = ToolContext(
+            cwd=cwd,
+            permission_manager=PermissionManager(interactive=False),
+            task_manager=task_manager,
+            session=session,
+        )
+
+        listed = ctx.task_manager.list()
+        self.assertEqual(len(listed), 1)
+        task_list_output = TaskListTool().execute({}, ctx)
+        task_get_output = TaskGetTool().execute({"task_id": task.id}, ctx)
+
+        self.assertIn("background_session_id=session-bg", task_list_output)
+        self.assertIn("background_reverse_hint=owning_session=session-bg; actions=/tasks active | /status workflow", task_list_output)
+        self.assertIn("background_session_id: session-bg", task_get_output)
+        self.assertIn("background_reverse_hint: owning_session=session-bg; actions=/tasks active | /status workflow", task_get_output)
+
+    def test_task_tools_prefer_explicit_background_session_link(self) -> None:
+        cwd = Path(__file__).resolve().parent
+        session = Session(SessionConfig(cwd=cwd, interactive=False))
+        task_manager = TaskManager()
+        task = task_manager.create(
+            "agent",
+            "background work",
+            parent_session_id="session-bg",
+            task_role="background",
+            background_session_id="bg-123",
+            background_reverse_hint="pyclaude ps bg-123 | pyclaude logs bg-123 summary",
+        )
+        ctx = ToolContext(
+            cwd=cwd,
+            permission_manager=PermissionManager(interactive=False),
+            task_manager=task_manager,
+            session=session,
+        )
+
+        task_list_output = TaskListTool().execute({}, ctx)
+        task_get_output = TaskGetTool().execute({"task_id": task.id}, ctx)
+
+        self.assertIn("background_session_id=bg-123", task_list_output)
+        self.assertIn("background_reverse_hint=pyclaude ps bg-123 | pyclaude logs bg-123 summary", task_list_output)
+        self.assertIn("background_session_id: bg-123", task_get_output)
+        self.assertIn("background_reverse_hint: pyclaude ps bg-123 | pyclaude logs bg-123 summary", task_get_output)
 
     def test_agent_tool_passes_isolated_workspace_flag(self) -> None:
         cwd = Path(__file__).resolve().parent

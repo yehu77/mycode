@@ -12,10 +12,23 @@ if str(ROOT) not in sys.path:
 
 from claudecode_py.config import SessionConfig
 from claudecode_py.mcp import McpClient, McpRegistry, McpServerConfig
+from claudecode_py.models import AssistantResponse
 from claudecode_py.permissions import ApprovalResult, PermissionDeniedError
+from claudecode_py.providers.capabilities import ProviderCapabilities
+from claudecode_py.providers.errors import ProviderContextLimitError
+from claudecode_py.runtime.query_loop import run_query_loop
 from claudecode_py.session import Session
 from claudecode_py.session_factory import SessionFactory
-from claudecode_py.state import AdvisorReviewSummary, PlanningArtifact, SessionState, WorkspaceChangeSet, WorkspaceFileChange
+from claudecode_py.state import (
+    AdvisorReviewSummary,
+    HistoryBoundary,
+    PlanningArtifact,
+    SessionState,
+    ToolResultArtifactRecord,
+    ToolResultReplacementRecord,
+    WorkspaceChangeSet,
+    WorkspaceFileChange,
+)
 from claudecode_py.storage.transcript import load_transcript, load_transcript_by_session_id, save_transcript
 from claudecode_py.tools.base import ToolContext
 from claudecode_py.permissions import PermissionManager
@@ -577,15 +590,17 @@ class SessionViewsTests(unittest.TestCase):
         rendered_plugins = session.describe_config(section="plugins")
         rendered_mcp = session.describe_config(section="mcp")
 
-        self.assertIn("current session:", rendered_workspace)
+        self.assertIn("workspace state:", rendered_workspace)
         self.assertIn("workspace_mode: main", rendered_workspace)
         self.assertIn("primary action:", rendered_workspace)
         self.assertIn("provider: openai-compatible", rendered_runtime)
         self.assertIn("model: gpt-test", rendered_runtime)
         self.assertIn("permission_mode:", rendered_permissions)
-        self.assertIn("project_plugins:", rendered_plugins)
+        self.assertIn("plugin registry:", rendered_plugins)
+        self.assertIn("plugin diagnostics:", rendered_plugins)
+        self.assertIn("plugin reload state:", rendered_plugins)
         self.assertIn("mcp_config_path:", rendered_mcp)
-        self.assertNotIn("project_plugins:", rendered_mcp)
+        self.assertNotIn("plugin registry:", rendered_mcp)
 
     def test_describe_provider_supports_advisor_slice(self) -> None:
         session = Session(
@@ -643,24 +658,97 @@ class SessionViewsTests(unittest.TestCase):
                     used_read_only_subagents=True,
                 )
             )
+            session._record_runtime_progress_event(
+                RuntimeEvent(
+                    kind="tool_waiting_for_approval",
+                    message='{"path":"runtime/session.py"}',
+                    tool_name="read_file",
+                    tool_call_id="call-1",
+                    approval_risk_level="read",
+                )
+            )
+            session._record_runtime_progress_event(
+                RuntimeEvent(
+                    kind="tool_result_summarized",
+                    message="ok results=1",
+                    result_count=1,
+                )
+            )
+            session._record_runtime_progress_event(
+                RuntimeEvent(
+                    kind="compact_recovery_finished",
+                    message="retry succeeded after recovery compact",
+                    compaction_trigger="recovery",
+                    budget_state="warning",
+                    budget_reason="prompt too long",
+                )
+            )
 
             summary = session.describe_status()
             workflow = session.describe_status(section="workflow")
             resume = session.describe_status(section="resume")
 
-            self.assertIn("current session:", summary)
+            self.assertIn("session identity:", summary)
+            self.assertIn("model and provider:", summary)
+            self.assertIn("memory lifecycle:", summary)
+            self.assertIn("background notifications:", summary)
+            self.assertIn("workspace state:", summary)
+            self.assertIn("active workflow:", summary)
+            self.assertIn("project-context health:", summary)
+            self.assertIn("project context:", summary)
+            self.assertIn("mcp health:", summary)
+            self.assertIn("permission summary:", summary)
+            self.assertIn("workspace anomaly:", summary)
+            self.assertIn("workspace recovery:", summary)
+            self.assertIn("workspace_recommended_actions:", summary)
+            self.assertIn("runtime health alert:", summary)
             self.assertIn("provider: openai-compatible", summary)
-            self.assertIn("working set files:", summary)
+            self.assertIn("working set: 1 file(s)", summary)
             self.assertIn("mix: diff_backed=", summary)
             self.assertIn("focused file source:", summary)
+            self.assertIn("memory compaction:", summary)
+            self.assertIn("runtime progress: retry succeeded after recovery compact", summary)
+            self.assertIn("active tool: waiting_for_approval read_file", summary)
+            self.assertIn("history lifecycle:", summary)
+            self.assertIn("- latest boundary: none", summary)
+            self.assertIn("- latest rewindable boundary: none", summary)
             self.assertIn("next actions:", summary)
-            self.assertIn("/files focused", summary)
-            self.assertIn("workflow status:", workflow)
+            self.assertIn("inspect focused file: /files focused", summary)
+            self.assertIn("session identity:", workflow)
+            self.assertIn("model and provider:", workflow)
+            self.assertIn("memory lifecycle:", workflow)
+            self.assertIn("background notifications:", workflow)
+            self.assertIn("workspace state:", workflow)
+            self.assertIn("active workflow:", workflow)
+            self.assertIn("project-context health:", workflow)
+            self.assertIn("project context:", workflow)
+            self.assertIn("mcp health:", workflow)
+            self.assertIn("permission summary:", workflow)
             self.assertIn("task surfaces:", workflow)
+            self.assertIn("workspace recovery:", workflow)
+            self.assertIn("memory compaction:", workflow)
+            self.assertIn("latest memory operation:", workflow)
+            self.assertIn("runtime progress: retry succeeded after recovery compact", workflow)
+            self.assertIn("active tool: waiting_for_approval read_file", workflow)
+            self.assertIn("last tool outcome: read_file | waiting_for_approval | waiting for approval (read)", workflow)
+            self.assertIn("last tool-result summary: ok results=1", workflow)
+            self.assertIn("compact recovery: retry succeeded after recovery compact", workflow)
+            self.assertIn("history lifecycle:", workflow)
             self.assertIn("mix: diff_backed=", workflow)
             self.assertIn("Working set", workflow)
             self.assertIn("/diff focused", workflow)
-            self.assertIn("resume status:", resume)
+            self.assertIn("session identity:", resume)
+            self.assertIn("model and provider:", resume)
+            self.assertIn("memory lifecycle:", resume)
+            self.assertIn("workspace state:", resume)
+            self.assertIn("active workflow:", resume)
+            self.assertIn("runtime progress: retry succeeded after recovery compact", resume)
+            self.assertIn("active tool: waiting_for_approval read_file", resume)
+            self.assertIn("project-context health:", resume)
+            self.assertIn("runtime health alert:", resume)
+            self.assertIn("history lifecycle:", resume)
+            self.assertIn("memory preservation semantics:", resume)
+            self.assertIn("- operation: resume", resume)
             self.assertIn("saved session:", resume)
         finally:
             session.close()
@@ -1588,7 +1676,8 @@ class SessionViewsTests(unittest.TestCase):
         self.assertIn(current_execution.id, rendered)
         self.assertIn(f"actions=/task show {current_execution.id} | /task advisor {current_execution.id}", rendered)
         self.assertIn("- phase_entry_delta:Scout Research: added=0 removed=1", rendered)
-        self.assertIn("- phase_entry_delta:Execution Loop: added=1 removed=0", rendered)
+        self.assertIn("- phase_entry_delta:Execution Loop:", rendered)
+        self.assertIn("removed=0", rendered)
 
     def test_active_plan_replay_supports_previous_artifact_slice(self) -> None:
         session = Session(SessionConfig(cwd=Path(__file__).resolve().parent, interactive=False))
@@ -2385,6 +2474,11 @@ class SessionViewsTests(unittest.TestCase):
     def test_describe_and_apply_manual_history_compaction(self) -> None:
         state = SessionState(
             context_summary="Earlier summary",
+            advisor_last_result=AdvisorReviewSummary(
+                checkpoint="final",
+                status="approve",
+                reason="ok",
+            ),
             messages=[
                 {"role": "user", "content": [{"type": "text", "text": "one"}]},
                 {"role": "assistant", "content": [{"type": "text", "text": "two"}]},
@@ -2401,6 +2495,9 @@ class SessionViewsTests(unittest.TestCase):
             ),
             state=state,
         )
+        session._current_change_focus_payload = {"selected_index": 0}
+        session._current_task_focus_payload = {"selected_index": 1}
+        session._current_plan_focus_payload = {"selected_index": 2}
 
         status = session.describe_compact()
         preview = session.describe_compact(section="preview", instructions="keep only decisions")
@@ -2412,21 +2509,44 @@ class SessionViewsTests(unittest.TestCase):
         self.assertIn("compacted context summary: yes", status)
         self.assertIn("would compact: yes", status)
         self.assertIn("messages to compact: 2", status)
+        self.assertIn("compact trigger: manual", status)
+        self.assertIn("boundary kind: compact", status)
+        self.assertIn("- task/plan/file focus: preserved", status)
         self.assertIn("history compaction preview:", preview)
         self.assertIn("compact instruction: keep only decisions", preview)
         self.assertIn("compacted summary preview: Earlier summary", preview)
         self.assertIn("compacted message preview:", preview)
         self.assertIn("- 1. user: one", preview)
+        self.assertIn("compact trigger: manual", preview)
         self.assertIn("history compacted:", applied)
         self.assertIn("compact instruction: keep only decisions", applied)
         self.assertIn("compacted context summary: yes", applied)
+        self.assertIn("boundary kind: compact", applied)
         self.assertEqual(len(session.state.messages), 2)
         self.assertIsNotNone(session.state.context_summary)
+        self.assertEqual(len(session.state.history_boundaries), 1)
+        self.assertEqual(session.state.history_boundaries[0].kind, "compact")
+        self.assertIsNotNone(session._current_change_focus_payload)
+        self.assertIsNotNone(session._current_task_focus_payload)
+        self.assertIsNotNone(session._current_plan_focus_payload)
+        self.assertIsNotNone(session.state.advisor_last_result)
         assert session.state.context_summary is not None
         self.assertIn("Earlier summary", session.state.context_summary)
         self.assertIn("Compact instruction: keep only decisions", session.state.context_summary)
         self.assertIn("Earlier conversation summary:", session.state.context_summary)
         self.assertIn("- 1. user: one", session.state.context_summary)
+        history = session.describe_history(section="messages")
+        self.assertIn("history boundaries:", history)
+        self.assertIn("compact boundary | trigger=manual", history)
+        self.assertIn("lineage=pre-compact restore point", history)
+        self.assertIn("rewind_selector=1", history)
+        self.assertIn("browse: preview restore point before applying rewind.", history)
+        self.assertIn("rewind guidance:", history)
+        self.assertIn("rewind selectors count rewindable boundaries only, newest first.", history)
+        self.assertIn("recommended flow:", history)
+        self.assertIn("- preview a boundary before applying it", history)
+        self.assertIn("/rewind show 1", history)
+        self.assertIn("/rewind apply 1", history)
 
     def test_clear_session_reset_rotates_session_id_and_preserves_old_transcript(self) -> None:
         cwd = Path(__file__).resolve().parent / f"_tmp_session_clear_reset_{uuid4().hex}"
@@ -2473,6 +2593,13 @@ class SessionViewsTests(unittest.TestCase):
             self.assertEqual(session.state.planning_artifact_history, [])
             self.assertEqual(session.state.enabled_skill_names, ["repo-skill"])
             self.assertEqual(session.state.session_permission_rules[0]["value"], "bash")
+            self.assertIsNone(session.state.advisor_last_result)
+            self.assertEqual(session.state.advisor_review_history, [])
+            self.assertIn("memory preservation semantics:", result["text"])
+            self.assertIn("- operation: clear_session", result["text"])
+            self.assertIn("- task/plan/file focus: cleared", result["text"])
+            self.assertIn("- advisor review state: cleared", result["text"])
+            self.assertEqual(session.memory_surface_payload()["memory_last_operation"], "clear_session")
 
             old_state, _old_path = load_transcript_by_session_id(cwd, old_session_id)
             new_state, _new_path = load_transcript_by_session_id(cwd, new_session_id)
@@ -2482,10 +2609,113 @@ class SessionViewsTests(unittest.TestCase):
             self.assertEqual(len(old_state.messages), 1)
             self.assertIsNone(new_state.context_summary)
             self.assertEqual(new_state.messages, [])
+            self.assertEqual(len(new_state.history_boundaries), 1)
+            self.assertEqual(new_state.history_boundaries[0].kind, "fresh_session_reset")
+            self.assertEqual(new_state.history_boundaries[0].old_session_id, old_session_id)
+            self.assertEqual(new_state.history_boundaries[0].new_session_id, new_session_id)
         finally:
             session.close()
             if cwd.exists():
                 shutil.rmtree(cwd)
+
+    def test_rewind_can_restore_compacted_conversation_boundary(self) -> None:
+        state = SessionState(
+            context_summary="Earlier summary",
+            advisor_last_result=AdvisorReviewSummary(
+                checkpoint="plan_drift",
+                status="block",
+                reason="stay narrow",
+            ),
+            messages=[
+                {"role": "user", "content": [{"type": "text", "text": "one"}]},
+                {"role": "assistant", "content": [{"type": "text", "text": "two"}]},
+                {"role": "user", "content": [{"type": "text", "text": "three"}]},
+                {"role": "assistant", "content": [{"type": "text", "text": "four"}]},
+            ],
+        )
+        session = Session(
+            SessionConfig(
+                cwd=Path(__file__).resolve().parent,
+                interactive=False,
+                max_history_messages=4,
+                history_keep_last_messages=2,
+            ),
+            state=state,
+        )
+        session._current_change_focus_payload = {"selected_index": 0}
+        session._current_task_focus_payload = {"selected_index": 1}
+        session._current_plan_focus_payload = {"selected_index": 2}
+        try:
+            session.compact_history_into_context_summary("keep only decisions")
+
+            rewind_list = session.describe_rewind()
+            rewind_show = session.describe_rewind("show 1")
+            rewind_apply = session.rewind_to_boundary("1")
+
+            self.assertIn("rewind boundaries:", rewind_list)
+            self.assertIn("snapshot_messages=4", rewind_list)
+            self.assertIn("rewind boundary:", rewind_show)
+            self.assertIn("kind: compact", rewind_show)
+            self.assertIn("boundary kind: compact boundary", rewind_show)
+            self.assertIn("message_count_before: 4", rewind_show)
+            self.assertIn("message_count_after: 2", rewind_show)
+            self.assertIn("context_summary_chars_before: 15", rewind_show)
+            self.assertIn("snapshot_available: yes", rewind_show)
+            self.assertIn("timeline compare:", rewind_show)
+            self.assertIn("- lineage: pre-compact restore point", rewind_show)
+            self.assertIn("- compare lens: this boundary targets pre-compact conversation state", rewind_show)
+            self.assertIn("restore effect:", rewind_show)
+            self.assertIn("- restored messages: 4", rewind_show)
+            self.assertIn("- task/plan/file focus: cleared", rewind_show)
+            self.assertIn("/rewind apply 1", rewind_show)
+            self.assertIn("conversation rewound:", rewind_apply)
+            self.assertIn("target boundary kind: compact", rewind_apply)
+            self.assertIn("memory preservation semantics:", rewind_apply)
+            self.assertIn("- operation: rewind", rewind_apply)
+            self.assertIn("- task/plan/file focus: cleared", rewind_apply)
+            self.assertIn("- advisor review state: preserved", rewind_apply)
+            self.assertEqual(session.memory_surface_payload()["memory_last_operation"], "rewind")
+            self.assertEqual(len(session.state.messages), 4)
+            self.assertEqual(session.state.messages[0]["role"], "user")
+            self.assertEqual(session.state.context_summary, "Earlier summary")
+            self.assertEqual(session.state.history_boundaries[-1].kind, "rewind")
+            self.assertEqual(session.state.history_boundaries[-1].target_boundary_id, session.state.history_boundaries[0].boundary_id)
+            self.assertIsNone(session._current_change_focus_payload)
+            self.assertIsNone(session._current_task_focus_payload)
+            self.assertIsNone(session._current_plan_focus_payload)
+            self.assertIsNotNone(session.state.advisor_last_result)
+        finally:
+            session.close()
+
+    def test_clear_history_preserves_focus_and_advisor_state(self) -> None:
+        session = Session(SessionConfig(cwd=Path(__file__).resolve().parent, interactive=False))
+        try:
+            session.state.context_summary = "Earlier summary"
+            session.state.messages = [{"role": "user", "content": [{"type": "text", "text": "hello"}]}]
+            session.state.advisor_last_result = AdvisorReviewSummary(
+                checkpoint="final",
+                status="approve",
+                reason="ok",
+            )
+            session._current_change_focus_payload = {"selected_index": 0}
+            session._current_task_focus_payload = {"selected_index": 1}
+            session._current_plan_focus_payload = {"selected_index": 2}
+
+            rendered = session.clear_history()
+
+            self.assertIn("Cleared conversation history only for this session.", rendered)
+            self.assertIn("memory preservation semantics:", rendered)
+            self.assertIn("- operation: clear_history", rendered)
+            self.assertIn("- task/plan/file focus: preserved", rendered)
+            self.assertEqual(session.memory_surface_payload()["memory_last_operation"], "clear_history")
+            self.assertEqual(session.state.messages, [])
+            self.assertIsNone(session.state.context_summary)
+            self.assertIsNotNone(session._current_change_focus_payload)
+            self.assertIsNotNone(session._current_task_focus_payload)
+            self.assertIsNotNone(session._current_plan_focus_payload)
+            self.assertIsNotNone(session.state.advisor_last_result)
+        finally:
+            session.close()
 
     def test_describe_mcp_views(self) -> None:
         registry = McpRegistry()
@@ -2667,18 +2897,22 @@ class SessionViewsTests(unittest.TestCase):
             self.assertIn("project memory:", memory)
             self.assertIn("Project memory text", memory)
             self.assertIn("next_actions:", memory)
-            self.assertIn("loaded skills:", skills)
-            self.assertIn("active auto-enabled skills:", skills)
+            self.assertIn("skill registry:", skills)
+            self.assertIn("registered skills:", skills)
+            self.assertIn("skill prompt composition: auto_enabled=1 manual_enabled=0 inactive=6", skills)
+            self.assertIn("prompt-active auto-enabled skills: review", skills)
             self.assertIn("review", skills)
-            self.assertIn("status=enabled,auto", skills)
+            self.assertIn("skill_status=enabled", skills)
+            self.assertIn("skill_auto_enable_state=auto-enabled", skills)
             self.assertIn("draft", skills)
-            self.assertIn("status=inactive", skills)
-            self.assertIn("tags=review,quality", skills)
+            self.assertIn("skill_status=inactive", skills)
+            self.assertIn("skill_tags=review,quality", skills)
             self.assertIn("project context:", project_context)
-            self.assertIn("loaded skills: 7", project_context)
+            self.assertIn("skill registry: registered=7 enabled=1 inactive=6 diagnostics=0", project_context)
+            self.assertIn("skill prompt composition: auto_enabled=1 manual_enabled=0 inactive=6", project_context)
             self.assertIn("project_memory: loaded", config)
-            self.assertIn("project_skills: 7", config)
-            self.assertIn("enabled_skills: 1", config)
+            self.assertIn("skill registry: registered=7 enabled=1 inactive=6 diagnostics=0", config)
+            self.assertIn("manual skill overrides: enabled=0 disabled=0", config)
             self.assertIn("Auto-enabled project skills", prompt)
             self.assertNotIn("Manually enabled project skills", prompt)
         finally:
@@ -2704,7 +2938,7 @@ class SessionViewsTests(unittest.TestCase):
 
         try:
             session = Session(SessionConfig(cwd=cwd, interactive=False))
-            self.assertIn("status=enabled,auto", session.describe_loaded_skills())
+            self.assertIn("skill_auto_enable_state=auto-enabled", session.describe_loaded_skills())
 
             session.disable_skill("review")
             session.enable_skill("draft")
@@ -2713,18 +2947,18 @@ class SessionViewsTests(unittest.TestCase):
             config = session.describe_config()
             skills = session.describe_loaded_skills()
 
-            self.assertIn("status=disabled", skills)
-            self.assertIn("status=enabled,manual", skills)
+            self.assertIn("skill_status=disabled", skills)
+            self.assertIn("manual_override=manual-enabled", skills)
+            self.assertIn("prompt-active manually enabled skills: draft", skills)
             self.assertNotIn("Auto review guidance.", prompt)
             self.assertIn("Manually enabled project skills", prompt)
             self.assertIn("Draft guidance.", prompt)
-            self.assertIn("manual_enabled_skills: 1", config)
-            self.assertIn("manual_disabled_skills: 1", config)
+            self.assertIn("manual skill overrides: enabled=1 disabled=1", config)
 
             session.reload_project_context()
             skills_after_reload = session.describe_loaded_skills()
-            self.assertIn("status=disabled", skills_after_reload)
-            self.assertIn("status=enabled,manual", skills_after_reload)
+            self.assertIn("skill_status=disabled", skills_after_reload)
+            self.assertIn("manual_override=manual-enabled", skills_after_reload)
         finally:
             if cwd.exists():
                 shutil.rmtree(cwd)
@@ -2754,7 +2988,11 @@ class SessionViewsTests(unittest.TestCase):
             reload_status = session.describe_project_context(section="reload-status")
 
             self.assertIn("Reloaded project context.", message)
-            self.assertIn("skill set changed: no", reload_status)
+            self.assertIn("skill state changed: yes", reload_status)
+            self.assertIn("enabled skill set changed: no", reload_status)
+            self.assertIn("skill diagnostics changed: no", reload_status)
+            self.assertIn("skill resolution changed: no", reload_status)
+            self.assertIn("skill content changed: yes", reload_status)
             self.assertIn("errors: none", reload_status)
             self.assertIn("next_actions:", reload_status)
             self.assertIn("latest reload:", session.describe_project_context())
@@ -2796,7 +3034,7 @@ class SessionViewsTests(unittest.TestCase):
             rendered = session.describe_saved_sessions()
             self.assertIn("session-demo", rendered)
             self.assertIn("messages=1", rendered)
-            self.assertIn("workspace=worktree", rendered)
+            self.assertIn("workspace_state=mode:worktree", rendered)
             self.assertIn("label=missing-agent", rendered)
             self.assertIn(f"origin={cwd.resolve()}", rendered)
             self.assertIn(f"cwd={missing_cwd.resolve()}", rendered)
@@ -2834,6 +3072,18 @@ class SessionViewsTests(unittest.TestCase):
                     workspace_fallback_cwd=str(cwd.resolve()),
                     advisor_mode="interactive-review",
                     advisor_review_history=[AdvisorReviewSummary(checkpoint="final", status="approve", reason="ok")],
+                    history_boundaries=[
+                        HistoryBoundary(
+                            kind="compact",
+                            trigger="auto",
+                            trigger_reason="context usage 88.0% >= 85.0%",
+                            summary="Compacted 4 messages and kept 2 recent messages.",
+                            compaction_mode="local_estimated_summary",
+                            compacted_count=4,
+                            kept_count=2,
+                            context_summary_chars_after=120,
+                        )
+                    ],
                     messages=[{"role": "user", "content": [{"type": "text", "text": "hello"}]}],
                 ),
             )
@@ -2845,11 +3095,22 @@ class SessionViewsTests(unittest.TestCase):
             self.assertIn("saved session:", detail)
             self.assertIn("resume path: pyclaude --resume-session saved-session-demo repl", detail)
             self.assertIn("advisor activity: 1 review(s)", detail)
+            self.assertIn("history lifecycle:", detail)
+            self.assertIn("- latest boundary: compact boundary", detail)
+            self.assertIn("- latest rewindable boundary: none", detail)
+            self.assertIn("- latest compact trigger: auto", detail)
+            self.assertIn("- latest compact reason: context usage 88.0% >= 85.0%", detail)
             self.assertIn("saved session:", summary)
             self.assertIn("next actions:", summary)
+            self.assertIn("inspect focused file: /files focused", summary)
+            self.assertIn("resume repl: pyclaude --resume-session saved-session-demo repl", summary)
             self.assertIn("saved session workspace:", workspace)
-            self.assertIn("workspace health:", workspace)
+            self.assertIn("workspace state: mode=snapshot health=unavailable", workspace)
+            self.assertIn("workspace anomaly:", workspace)
+            self.assertIn("- workspace anomaly: unavailable, cleanup failed, fallback active", workspace)
+            self.assertIn("workspace recovery:", workspace)
             self.assertIn("primary action:", workspace)
+            self.assertIn("inspect sessions: /sessions show saved-session-demo summary | /sessions show saved-session-demo workspace", workspace)
         finally:
             if cwd.exists():
                 shutil.rmtree(cwd)
@@ -3752,9 +4013,11 @@ class SessionViewsTests(unittest.TestCase):
             detail = session.selected_change_detail()
 
             self.assertIn("next_actions:", detail)
-            self.assertIn("go_to_task: /task show " + task.id, detail)
+            self.assertIn("inspect_focused_file: /files show 1", detail)
+            self.assertIn("inspect_focused_diff: /changes show ", detail)
+            self.assertIn("inspect_task: /task show " + task.id, detail)
             self.assertIn("/task show " + execution.id, detail)
-            self.assertIn("go_to_plan: /plan file 1", detail)
+            self.assertIn("inspect_active_plan: /plan file 1", detail)
             self.assertIn("/plan execution 1 file 1", detail)
             self.assertIn("stay_on_surface: /changes show ", detail)
             self.assertIn("/changes working-set", detail)
@@ -3803,7 +4066,8 @@ class SessionViewsTests(unittest.TestCase):
             self.assertIn("> 2. updated b.py", detail)
             self.assertIn("Focused file (2/2)", detail)
             self.assertIn("primary_path: b.py", detail)
-            self.assertIn("go_to_task: /task show " + task.id + " file 2", detail)
+            self.assertIn("inspect_focused_file: /files show 2", detail)
+            self.assertIn("inspect_task: /task show " + task.id + " file 2", detail)
         finally:
             session.close()
             if cwd.exists():
@@ -4088,10 +4352,12 @@ class SessionViewsTests(unittest.TestCase):
             self.assertIn("estimated tokens:", summary)
             self.assertIn("| Base instructions |", summary)
             self.assertIn("| Default tools |", summary)
-            self.assertIn("working set files:", files)
-            self.assertIn("go_to_change=/changes show", files)
-            self.assertIn("go_to_task=/task show " + task.id, files)
-            self.assertIn("go_to_plan=/plan file 1", files)
+            self.assertIn("automatic compaction policy:", summary)
+            self.assertIn("working set:", files)
+            self.assertIn("inspect_focused_file=/files show 1", files)
+            self.assertIn("inspect_change=/changes show", files)
+            self.assertIn("inspect_task=/task show " + task.id, files)
+            self.assertIn("inspect_active_plan=/plan file 1", files)
             self.assertIn("filter: changes", changes)
             self.assertIn("app.py", changes)
             self.assertNotIn("notes.md", changes)
@@ -4157,6 +4423,7 @@ class SessionViewsTests(unittest.TestCase):
             auto = session.describe_files(section="auto")
             status = session.describe_status(section="workflow")
             files_render = session.describe_files()
+            working_set_render = session.describe_working_set()
 
             self.assertEqual(len(loaded.explicit_context_entries), 2)
             self.assertEqual(loaded.explicit_context_entries[0].kind, "directory")
@@ -4175,18 +4442,362 @@ class SessionViewsTests(unittest.TestCase):
             self.assertIn("| Base instructions |", summary)
             self.assertIn("| Default tools |", summary)
             self.assertIn("filter: explicit", explicit)
+            self.assertIn("explicit-only files: 0", explicit)
+            self.assertIn("automatic-only files: 1", explicit)
+            self.assertIn("overlapping files: 2", explicit)
             self.assertIn("src/app.py", explicit)
             self.assertIn("notes.md", explicit)
             self.assertNotIn("todo.md", explicit)
             self.assertIn("filter: auto", auto)
+            self.assertIn("explicit-only files: 0", auto)
+            self.assertIn("automatic-only files: 1", auto)
+            self.assertIn("overlapping files: 2", auto)
             self.assertIn("todo.md", auto)
             self.assertNotIn("src/unused.py", auto)
             self.assertIn("explicit context entries: 2", status)
             self.assertIn("explicit-context files: 2", status)
+            self.assertIn("focused file in scope because: active task, active plan, recent change, explicit context path", status)
+            self.assertIn("focused file context origin: explicit+automatic", status)
+            self.assertIn("explicit-only files: 0", status)
+            self.assertIn("automatic-only files: 1", status)
+            self.assertIn("overlapping files: 2", status)
             self.assertIn("explicit context path", files_render)
+            self.assertIn("context_origin=explicit+automatic", files_render)
+            self.assertIn("working set compare:", working_set_render)
+            self.assertIn("explicit-only files: 0", working_set_render)
+            self.assertIn("automatic-only files: 1", working_set_render)
+            self.assertIn("overlapping files: 2", working_set_render)
         finally:
             if cwd.exists():
                 shutil.rmtree(cwd)
+
+    def test_context_and_status_surface_compaction_warning_state(self) -> None:
+        session = Session(
+            SessionConfig(
+                cwd=Path(__file__).resolve().parent,
+                interactive=False,
+                max_tokens=20000,
+                max_history_messages=8,
+                history_keep_last_messages=2,
+            )
+        )
+        try:
+            session.state.messages = [
+                {"role": "user", "content": [{"type": "text", "text": "one"}]},
+                {"role": "assistant", "content": [{"type": "text", "text": "two"}]},
+                {"role": "user", "content": [{"type": "text", "text": "three"}]},
+                {"role": "assistant", "content": [{"type": "text", "text": "four"}]},
+                {"role": "user", "content": [{"type": "text", "text": "five"}]},
+                {"role": "assistant", "content": [{"type": "text", "text": "six"}]},
+            ]
+
+            policy = session.compaction_policy_payload()
+            context_summary = session.describe_context()
+            status_summary = session.describe_status()
+            status_workflow = session.describe_status(section="workflow")
+
+            self.assertEqual(policy["compaction_state"], "warning")
+            self.assertIn("message count 6 >= warning threshold 6", str(policy["compaction_reason"]))
+            self.assertIn("automatic compaction policy:", context_summary)
+            self.assertIn("state: warning", context_summary)
+            self.assertIn("reason: message count 6 >= warning threshold 6", context_summary)
+            self.assertIn("runtime budget state: warning", context_summary)
+            self.assertIn("context token source: none", context_summary)
+            self.assertIn("last turn token source: none", context_summary)
+            self.assertIn("provider usage seen: no", context_summary)
+            self.assertIn("memory compaction: warning", status_summary)
+            self.assertIn("compact reason: message count 6 >= warning threshold 6", status_summary)
+            self.assertIn("runtime budget state: warning", status_summary)
+            self.assertIn("runtime budget reason: message count 6 >= warning threshold 6", status_summary)
+            self.assertIn("last turn token source: none", status_summary)
+            self.assertIn("provider usage seen: no", status_summary)
+            self.assertIn("budget pressure: warning", status_summary)
+            self.assertIn("compact lifecycle: none", status_summary)
+            self.assertIn("memory compaction: warning", status_workflow)
+            self.assertIn("runtime budget state: warning", status_workflow)
+        finally:
+            session.close()
+
+    def test_system_prompt_blocks_surface_and_context_summary(self) -> None:
+        cwd = Path(__file__).resolve().parent / "_tmp_session_prompt_blocks"
+        if cwd.exists():
+            shutil.rmtree(cwd)
+        (cwd / ".pyclaude" / "skills").mkdir(parents=True)
+        (cwd / "CLAUDE.md").write_text("Project memory goes here.\n", encoding="utf-8")
+        (cwd / ".pyclaude" / "skills" / "review.md").write_text(
+            "---\n"
+            "auto_enable: true\n"
+            "description: Review guidance\n"
+            "---\n"
+            "Always inspect behavior before editing.\n",
+            encoding="utf-8",
+        )
+        try:
+            session = Session(SessionConfig(cwd=cwd, interactive=False))
+            session.state.context_summary = "Earlier turns compacted."
+            session.record_planning_artifact(
+                PlanningArtifact(
+                    kind="plan",
+                    goal="inspect prompt assembly",
+                    summary="Implementation Plan\n- inspect prompt assembly",
+                    task_ids=[],
+                    used_read_only_subagents=True,
+                )
+            )
+
+            blocks = session.system_prompt_blocks()
+            payload = session.system_prompt_surface_payload()
+            rendered = session.build_system_prompt()
+            context_summary = session.describe_context()
+
+            self.assertTrue(any(block.kind == "prefix" for block in blocks))
+            self.assertTrue(any(block.kind == "skills" for block in blocks))
+            self.assertTrue(any(block.kind == "planning" for block in blocks))
+            self.assertTrue(any(block.kind == "context_summary" for block in blocks))
+            self.assertGreaterEqual(payload["system_prompt_block_count"], 5)
+            self.assertIsNotNone(payload["system_prompt_dynamic_boundary_index"])
+            self.assertGreater(payload["system_prompt_prefix_chars"], 0)
+            self.assertGreater(payload["system_prompt_dynamic_chars"], 0)
+            self.assertIn("Auto-enabled project skills:", rendered)
+            self.assertIn("Recent planning artifact to reuse when relevant:", rendered)
+            self.assertIn("Compacted conversation context from earlier turns:", rendered)
+            self.assertIn("system prompt blocks:", context_summary)
+            self.assertIn("dynamic boundary:", context_summary)
+            self.assertIn("static prompt chars:", context_summary)
+            self.assertIn("dynamic prompt chars:", context_summary)
+        finally:
+            if cwd.exists():
+                shutil.rmtree(cwd)
+
+    def test_tool_schema_cache_surface_and_status_workflow(self) -> None:
+        session = Session(SessionConfig(cwd=Path(__file__).resolve().parent, interactive=False))
+        try:
+            first_specs = session.tool_specs_cached()
+            first_payload = session.tool_schema_surface_payload()
+            second_specs = session.tool_specs_cached()
+            second_payload = session.tool_schema_surface_payload()
+            workflow = session.describe_status(section="workflow")
+
+            first_names = [spec["name"] for spec in first_specs]
+            self.assertEqual(first_names, sorted(first_names))
+            self.assertEqual(first_specs, second_specs)
+            self.assertEqual(
+                first_payload["tool_schema_cache_key"],
+                second_payload["tool_schema_cache_key"],
+            )
+            self.assertEqual(
+                first_payload["tool_schema_registry_epoch"],
+                second_payload["tool_schema_registry_epoch"],
+            )
+            self.assertEqual(
+                first_payload["tool_schema_cached_count"],
+                first_payload["tool_schema_count"],
+            )
+            self.assertIn("builtin:non-deferred=", first_payload["tool_schema_order_summary"])
+            self.assertIn("mcp:non-deferred=", first_payload["tool_schema_order_summary"])
+            self.assertIn("tool schema cache:", workflow)
+            self.assertIn("tool schema order:", workflow)
+
+            self.assertTrue(session.activate_deferred_tool("ask_user_question"))
+            activated_payload = session.tool_schema_surface_payload()
+            self.assertGreater(
+                activated_payload["tool_schema_count"],
+                first_payload["tool_schema_count"],
+            )
+        finally:
+            session.close()
+
+    def test_tool_result_replacement_surfaces_context_and_status(self) -> None:
+        session = Session(SessionConfig(cwd=Path(__file__).resolve().parent, interactive=False))
+        try:
+            session.state.messages = [
+                {"role": "assistant", "content": [{"type": "text", "text": "tool call complete"}]},
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "call-1",
+                            "content": "raw result that stays in transcript",
+                            "is_error": False,
+                        }
+                    ],
+                },
+            ]
+            session.state.tool_result_replacement_records = [
+                ToolResultReplacementRecord(
+                    tool_use_id="call-1",
+                    replacement=(
+                        "Tool result replaced for context budget.\n"
+                        "tool_use_id=call-1\n"
+                        "original_chars=3200\n"
+                        "summary=trimmed"
+                    ),
+                    original_size_chars=3200,
+                    replacement_size_chars=96,
+                )
+            ]
+            session.state.tool_result_artifact_records = [
+                ToolResultArtifactRecord(
+                    tool_use_id="call-1",
+                    artifact_path=str(Path(__file__).resolve().parent / ".pyclaude" / "tool_result_artifacts" / "call-1.txt"),
+                    content_sha256="abc123",
+                    original_size_chars=3200,
+                    preview_size_chars=96,
+                    summary="trimmed",
+                )
+            ]
+            session.reconstruct_tool_result_replacement_state()
+
+            context_summary = session.describe_context()
+            workflow = session.describe_status(section="workflow")
+            compact_status = session.describe_compact(section="status")
+
+            self.assertIn("tool-result artifacts active: 1", context_summary)
+            self.assertIn("tool-result replacements active: 1", context_summary)
+            self.assertIn("replacement-aware provider view: yes", context_summary)
+            self.assertIn("tool-result replacement:", workflow)
+            self.assertIn("tool-result artifact:", workflow)
+            self.assertIn("tool-result artifacts: 1", compact_status)
+            self.assertIn("tool-result replacements: 1", compact_status)
+            self.assertIn("replacement-aware compaction: yes", compact_status)
+        finally:
+            session.close()
+
+    def test_runtime_budget_state_payload_tracks_warning_and_hard_stop(self) -> None:
+        session = Session(
+            SessionConfig(
+                cwd=Path(__file__).resolve().parent,
+                interactive=False,
+                max_tokens=20000,
+                max_history_messages=8,
+                history_keep_last_messages=2,
+                max_context_summary_chars=10,
+            )
+        )
+        try:
+            session.state.messages = [
+                {"role": "user", "content": [{"type": "text", "text": "one"}]},
+                {"role": "assistant", "content": [{"type": "text", "text": "two"}]},
+                {"role": "user", "content": [{"type": "text", "text": "three"}]},
+                {"role": "assistant", "content": [{"type": "text", "text": "four"}]},
+                {"role": "user", "content": [{"type": "text", "text": "five"}]},
+                {"role": "assistant", "content": [{"type": "text", "text": "six"}]},
+            ]
+            warning_budget = session.runtime_budget_state_payload()
+            self.assertEqual(warning_budget["budget_state"], "warning")
+            self.assertTrue(warning_budget["should_warn"])
+            self.assertFalse(warning_budget["should_compact"])
+
+            session.state.messages = []
+            session.state.context_summary = "x" * 20
+            hard_stop_budget = session.runtime_budget_state_payload()
+            self.assertEqual(hard_stop_budget["budget_state"], "hard_stop")
+            self.assertTrue(hard_stop_budget["should_stop"])
+            self.assertFalse(hard_stop_budget["would_compact"])
+            self.assertEqual(
+                session.compaction_policy_payload()["compaction_state"],
+                "auto-compact-ready",
+            )
+        finally:
+            session.close()
+
+    def test_status_views_include_recent_background_handoff_summary(self) -> None:
+        cwd = Path(__file__).resolve().parent / "_tmp_session_status_background_handoff"
+        if cwd.exists():
+            shutil.rmtree(cwd)
+        cwd.mkdir(parents=True)
+        try:
+            session = Session(SessionConfig(cwd=cwd, interactive=False))
+            saved = create_background_session(
+                cwd,
+                prompt="Saved background task",
+                provider="openai-compatible",
+                model="gpt-test",
+                status="completed",
+            )
+            update_background_session(cwd, saved.bg_id, session_id="session-saved")
+            save_transcript(
+                SessionConfig(cwd=cwd, interactive=False),
+                SessionState(
+                    session_id="session-saved",
+                    messages=[{"role": "user", "content": [{"type": "text", "text": "saved"}]}],
+                ),
+            )
+
+            status_summary = session.describe_status()
+            status_workflow = session.describe_status(section="workflow")
+
+            self.assertIn("background notifications: 1", status_summary)
+            self.assertIn(f"latest background handoff: {saved.bg_id}", status_summary)
+            self.assertIn("latest background state: completed", status_summary)
+            self.assertIn("pyclaude --resume-session session-saved repl", status_summary)
+            self.assertIn("background notifications: 1", status_workflow)
+            self.assertIn(f"latest background handoff: {saved.bg_id}", status_workflow)
+            self.assertIn("latest background state: completed", status_workflow)
+            self.assertIn(
+                "go_to_plan: /plan | pyclaude --resume-session session-saved repl",
+                status_workflow,
+            )
+        finally:
+            session.close()
+
+    def test_history_and_status_surface_recovery_compact_reason(self) -> None:
+        session = Session(
+            SessionConfig(
+                cwd=Path(__file__).resolve().parent,
+                interactive=False,
+                max_tokens=20000,
+                max_history_messages=6,
+                history_keep_last_messages=2,
+            )
+        )
+        try:
+            session.state.messages = [
+                {"role": "user", "content": [{"type": "text", "text": "one"}]},
+                {"role": "assistant", "content": [{"type": "text", "text": "two"}]},
+                {"role": "user", "content": [{"type": "text", "text": "three"}]},
+                {"role": "assistant", "content": [{"type": "text", "text": "four"}]},
+            ]
+
+            class RecoveryProvider:
+                def __init__(self) -> None:
+                    self.calls = 0
+                    self.capabilities = ProviderCapabilities(
+                        provider="fake",
+                        model="recovery-model",
+                        supports_tool_calling=True,
+                        supports_streaming=False,
+                        supports_structured_output=False,
+                    )
+
+                def create_message(self, *, messages, tools, system_prompt):
+                    del messages, tools, system_prompt
+                    self.calls += 1
+                    if self.calls == 1:
+                        raise ProviderContextLimitError("maximum context length exceeded for this request")
+                    return AssistantResponse(
+                        content=[{"type": "text", "text": "done"}],
+                        text="done",
+                        tool_calls=[],
+                    )
+
+            session.provider = RecoveryProvider()
+            result = run_query_loop(session, "hello")
+
+            self.assertEqual(result, "done")
+            history = session.describe_history(section="messages")
+            status = session.describe_status(section="workflow")
+            self.assertIn("trigger=recovery", history)
+            self.assertIn("reason=prompt-too-long: maximum context length exceeded for this request", history)
+            self.assertIn("- latest compact trigger: recovery", status)
+            self.assertIn(
+                "- latest compact reason: prompt-too-long: maximum context length exceeded for this request",
+                status,
+            )
+            self.assertIn("compact lifecycle: recovery", status)
+        finally:
+            session.close()
 
     def test_explicit_context_unresolved_entries_render_safely(self) -> None:
         cwd = Path(__file__).resolve().parent / "_tmp_session_explicit_context_unresolved"
@@ -4207,7 +4818,11 @@ class SessionViewsTests(unittest.TestCase):
             self.assertIn("resolved=no", listing)
             self.assertIn("unresolved entry count: 1", listing)
             self.assertIn("explicit-context-contributed files: 0", listing)
+            self.assertIn("explicit-only files: 0", listing)
+            self.assertIn("automatic-only files: 0", listing)
+            self.assertIn("overlapping files: 0", listing)
             self.assertIn("contributes_files=0", listing)
+            self.assertIn("cleanup_explicit_context=/add-dir remove <n> | /add-dir clear", listing)
             self.assertIn("unresolved explicit context entries: 1", status)
         finally:
             if cwd.exists():
@@ -4259,7 +4874,7 @@ class SessionViewsTests(unittest.TestCase):
             files_tasks = session.describe_files(section="tasks")
             diff_focused = session.describe_diff(section="focused")
 
-            self.assertIn("working set files:", files_context)
+            self.assertIn("working set:", files_context)
             self.assertIn("mix: diff_backed=", files_context)
             self.assertIn("1. app.py", files_context)
             self.assertIn("2. notes.md", files_context)
@@ -4268,17 +4883,19 @@ class SessionViewsTests(unittest.TestCase):
             self.assertNotIn("notes.md", files_changes)
             self.assertIn("diff summary:", diff_summary)
             self.assertIn("mix: diff_backed=", diff_summary)
-            self.assertIn("diff-backed working-set files: 1", diff_summary)
-            self.assertIn("diff-backed working set:", diff_working_set)
+            self.assertIn("working set diff-backed files: 1", diff_summary)
+            self.assertIn("working set diff:", diff_working_set)
             self.assertIn("mix: diff_backed=", diff_working_set)
             self.assertIn("app.py", diff_working_set)
             self.assertIn("focused file:", files_focused)
             self.assertIn("- focused file: notes.md", files_focused)
             self.assertIn("filter: tasks", files_tasks)
             self.assertIn("1. notes.md", files_tasks)
-            self.assertIn("stay_on_surface=/files focused", files_tasks)
+            self.assertIn("inspect_focused_file=/files show 1", files_tasks)
             self.assertIn("focused file:", diff_focused)
             self.assertIn("- focused file: notes.md", diff_focused)
+            self.assertIn("- inspect_focused_diff: /diff focused", files_focused)
+            self.assertIn("- inspect_focused_file: /files focused", diff_focused)
             self.assertIn("- diff status: no diff hunks on focused file", diff_focused)
         finally:
             if cwd.exists():
@@ -4319,15 +4936,15 @@ class SessionViewsTests(unittest.TestCase):
 
             self.assertIn("focused file:", task_focused)
             self.assertIn("- focused file: notes.md", task_focused)
-            self.assertIn("- go_to_task: /task show " + task.id, task_focused)
-            self.assertIn("focused file context:", history)
+            self.assertIn("- inspect_task: /task show " + task.id, task_focused)
+            self.assertIn("focused file:", history)
             self.assertIn("- focused file: notes.md", history)
             self.assertIn("- go_to_task: /task show " + task.id, history)
             self.assertIn("- stay_on_surface: /history changes | /files focused | /diff focused | /status workflow", history)
             self.assertIn("focused file:", change_focused)
             self.assertIn("- focused file: app.py", change_focused)
-            self.assertIn("- go_to_change: /changes show", change_focused)
-            self.assertIn("- go_to_task: none", change_focused)
+            self.assertIn("- inspect_change: /changes show", change_focused)
+            self.assertIn("- inspect_task: none", change_focused)
         finally:
             if cwd.exists():
                 shutil.rmtree(cwd)
@@ -4407,12 +5024,20 @@ class SessionViewsTests(unittest.TestCase):
             detail = session.describe_workspace_inventory_detail("detail-agent")
 
             self.assertIn("Current workspace", current)
+            self.assertIn("workspace state:", current)
+            self.assertIn("workspace anomaly:", current)
+            self.assertIn("workspace recovery:", current)
+            self.assertIn("next actions:", current)
+            self.assertIn("- workspace anomaly: unavailable, cleanup pending, fallback active", current)
+            self.assertIn("- workspace_recommended_actions: /workspaces list, /workspaces repair workspace-detail-session, /workspaces cleanup", current)
             self.assertIn("primary action: workspace_repair workspace-detail-session", current)
             self.assertIn("fallback_cwd:", current)
             self.assertIn("unavailable_reason: Workspace missing on disk.", current)
 
             self.assertIn("Isolated workspace detail", detail)
             self.assertIn("matched_workspaces: 1", detail)
+            self.assertIn("workspace anomaly:", detail)
+            self.assertIn("workspace recovery:", detail)
             self.assertIn("primary action: workspace_repair workspace-detail-session", detail)
             self.assertIn("tertiary action: /workspaces list", detail)
         finally:
