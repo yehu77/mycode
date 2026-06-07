@@ -6,6 +6,7 @@ import json
 import os
 
 from ..models import AssistantResponse, ProviderStreamEvent, TokenUsage, ToolCall
+from ..runtime.provider_cache import ProviderPromptCachePlan
 from .capabilities import ProviderCapabilities
 from .errors import (
     ProviderCapabilityError,
@@ -38,6 +39,9 @@ class OpenAICompatibleProvider:
             supports_tool_calling=True,
             supports_streaming=True,
             supports_structured_output=False,
+            supports_prompt_cache_hints=False,
+            supports_system_prompt_cache_blocks=False,
+            supports_tool_schema_cache_hints=False,
             notes=(
                 "Assumes the selected model supports chat-completions tool calling. "
                 "Streaming is wired into this runtime when the upstream API returns "
@@ -68,7 +72,9 @@ class OpenAICompatibleProvider:
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]],
         system_prompt: str,
+        cache_plan: ProviderPromptCachePlan | None = None,
     ) -> AssistantResponse:
+        del cache_plan
         client = self._ensure_client()
         try:
             response = client.chat.completions.create(
@@ -94,7 +100,9 @@ class OpenAICompatibleProvider:
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]],
         system_prompt: str,
+        cache_plan: ProviderPromptCachePlan | None = None,
     ) -> Iterator[ProviderStreamEvent]:
+        del cache_plan
         client = self._ensure_client()
         try:
             stream = client.chat.completions.create(

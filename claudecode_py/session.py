@@ -4,6 +4,7 @@ from contextlib import contextmanager
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from hashlib import sha256
 from pathlib import Path
 from threading import Thread
 from typing import Any
@@ -71,13 +72,32 @@ from .providers.errors import ProviderCapabilityError
 from .runtime.events import RuntimeEvent
 from .runtime.budget import compute_runtime_budget_state
 from .runtime.context import SessionRuntimeContext
+from .runtime.prompt_prefix import (
+    PromptPrefixAssemblyResult,
+    build_prompt_prefix_assembly,
+    prompt_prefix_surface_payload_from_assembly,
+)
+from .runtime.provider_cache import (
+    ProviderPromptCachePlan,
+    ProviderViewPrefixCostedPlan,
+    ProviderViewPrefixPlan,
+    build_provider_view_costed_plan,
+    build_provider_view_prefix_plan,
+    build_provider_prompt_cache_plan,
+    planner_downgraded,
+    prompt_prefix_cache_payload_from_plan,
+)
 from .runtime.tool_schema_cache import ToolSchemaCache, canonical_json
 from .runtime.tool_result_replacement import build_missing_artifact_replacement_preview
 from .runtime.query_loop import _create_provider_message_with_retries, _request_advisor_review, run_query_loop
 from .prompts import SystemPromptBlock, render_system_prompt_blocks
 from .session_components import (
     AdvisorSessionComponent,
+    BackgroundRuntimeSessionComponent,
+    HistoryMemorySessionComponent,
     PlanSessionComponent,
+    ProjectContextSessionComponent,
+    RuntimeStateSessionComponent,
     SymbolSurfaceSessionComponent,
     TaskDetailSessionComponent,
     WorkspaceSessionComponent,
@@ -526,6 +546,7 @@ class Session:
         self._last_memory_operation_payload: dict[str, Any] | None = None
         self._runtime_budget_state_payload: dict[str, Any] | None = None
         self._runtime_progress_surface_state: dict[str, Any] | None = None
+        self._last_prompt_prefix_assembly_payload: dict[str, Any] | None = None
         self._tool_schema_cache = ToolSchemaCache()
         self._seen_tool_result_ids: set[str] = set()
         self._tool_result_replacements: dict[str, str] = {}
@@ -682,9 +703,11 @@ class Session:
     def _invalidate_tool_schema_cache(self) -> None:
         self._tool_schema_cache.clear()
         self._runtime_budget_state_payload = None
+        self._last_prompt_prefix_assembly_payload = None
 
     def _invalidate_runtime_prompt_inspection(self) -> None:
         self._runtime_budget_state_payload = None
+        self._last_prompt_prefix_assembly_payload = None
 
     def runtime_tool_result_replacement_state(
         self,
@@ -805,6 +828,7 @@ class Session:
             self._seen_tool_result_ids.add(tool_use_id)
             existing_ids.add(tool_use_id)
         self._runtime_budget_state_payload = None
+        self._last_prompt_prefix_assembly_payload = None
 
     def _record_tool_result_artifact_records(
         self,
@@ -826,6 +850,7 @@ class Session:
             self._seen_tool_result_ids.add(tool_use_id)
             existing_ids.add(tool_use_id)
         self._runtime_budget_state_payload = None
+        self._last_prompt_prefix_assembly_payload = None
 
     def mark_tool_result_ids_seen_from_messages(self, messages: list[dict[str, Any]]) -> None:
         self._seen_tool_result_ids.update(self._message_tool_result_ids(messages))
@@ -908,10 +933,12 @@ class Session:
         ordered_tools = self._sorted_available_tools()
         source_counts: dict[tuple[str, bool], int] = {}
         cache_keys: list[str] = []
+        canonical_specs: list[dict[str, Any]] = []
         for tool in ordered_tools:
             cache_key = self._tool_schema_cache_key_for(tool)
             cache_keys.append(cache_key)
-            self._tool_schema_cache.get_or_create(cache_key, builder=tool.to_model_tool)
+            spec, _ = self._tool_schema_cache.get_or_create(cache_key, builder=tool.to_model_tool)
+            canonical_specs.append(spec)
             source = getattr(tool, "schema_source", lambda: "builtin")()
             source_counts[(source, tool.is_deferred())] = source_counts.get((source, tool.is_deferred()), 0) + 1
         order_parts = []
@@ -926,6 +953,9 @@ class Session:
             "tool_schema_cache_key": self._tool_schema_cache.combined_cache_key(cache_keys),
             "tool_schema_order_summary": ", ".join(order_parts),
             "tool_schema_registry_epoch": self._tool_schema_cache.epoch,
+            "tool_schema_signature": self._tool_schema_cache.combined_cache_key(
+                [canonical_json(spec) for spec in canonical_specs]
+            ),
         }
 
     def system_prompt_blocks(self) -> list[SystemPromptBlock]:
@@ -965,6 +995,10 @@ class Session:
                 break
         prefix_chars = sum(len(block.text) for block in blocks[:boundary_index])
         dynamic_chars = sum(len(block.text) for block in blocks[boundary_index:])
+        static_blocks = [block.text for block in blocks if block.cache_scope in {"session", "global"}]
+        static_signature = sha256(
+            canonical_json(static_blocks).encode("utf-8")
+        ).hexdigest()[:16]
         return {
             "system_prompt_block_count": len(blocks),
             "system_prompt_dynamic_boundary_index": (
@@ -978,7 +1012,110 @@ class Session:
             ),
             "system_prompt_prefix_chars": prefix_chars,
             "system_prompt_dynamic_chars": dynamic_chars,
+            "system_prompt_static_signature": static_signature,
         }
+
+    def build_provider_prompt_assembly(
+        self,
+        *,
+        messages: list[dict[str, Any]],
+        replacement_result=None,
+        compacted_before_provider: bool = False,
+    ) -> PromptPrefixAssemblyResult:
+        replacement_surface = self.tool_result_replacement_surface_payload()
+        artifact_surface = self.tool_result_artifact_surface_payload()
+        return build_prompt_prefix_assembly(
+            session=self,
+            messages=messages,
+            system_prompt_blocks=self.system_prompt_blocks(),
+            tools=self.tool_specs(),
+            replacement_result=replacement_result,
+            active_replacement_count=int(replacement_surface["replacement_active_count"] or 0),
+            active_artifact_count=int(artifact_surface["artifact_active_count"] or 0),
+            compacted_before_provider=compacted_before_provider,
+        )
+
+    def build_provider_view_prefix_plan(
+        self,
+        assembly: PromptPrefixAssemblyResult,
+        *,
+        previous_payload: dict[str, Any] | None = None,
+    ) -> ProviderViewPrefixPlan:
+        return build_provider_view_prefix_plan(
+            assembly,
+            provider_capabilities=getattr(self.provider, "capabilities", None),
+            previous_payload=previous_payload,
+        )
+
+    def build_provider_view_costed_plan(
+        self,
+        assembly: PromptPrefixAssemblyResult,
+        *,
+        previous_payload: dict[str, Any] | None = None,
+        available_reduction_candidates=None,
+        minimum_tokens_to_shed: int = 0,
+    ) -> ProviderViewPrefixCostedPlan:
+        return build_provider_view_costed_plan(
+            self,
+            self.build_provider_view_prefix_plan(
+                assembly,
+                previous_payload=previous_payload,
+            ),
+            available_reduction_candidates=available_reduction_candidates,
+            minimum_tokens_to_shed=minimum_tokens_to_shed,
+        )
+
+    def prompt_prefix_planner_downgraded(
+        self,
+        plan: ProviderViewPrefixPlan | None,
+    ) -> bool:
+        return planner_downgraded(plan)
+
+    def build_provider_prompt_cache_plan(
+        self,
+        assembly: PromptPrefixAssemblyResult,
+        *,
+        previous_payload: dict[str, Any] | None = None,
+        costed_plan: ProviderViewPrefixCostedPlan | None = None,
+    ) -> ProviderPromptCachePlan:
+        return build_provider_prompt_cache_plan(
+            costed_plan
+            or self.build_provider_view_costed_plan(
+                assembly,
+                previous_payload=previous_payload,
+            ),
+            provider_capabilities=getattr(self.provider, "capabilities", None),
+        )
+
+    def record_prompt_prefix_assembly(
+        self,
+        assembly: PromptPrefixAssemblyResult,
+        *,
+        source: str = "runtime",
+        cache_plan: ProviderPromptCachePlan | None = None,
+    ) -> dict[str, Any]:
+        payload = prompt_prefix_surface_payload_from_assembly(
+            assembly,
+            previous_payload=self._last_prompt_prefix_assembly_payload,
+            source=source,
+        )
+        payload.update(prompt_prefix_cache_payload_from_plan(cache_plan))
+        self._last_prompt_prefix_assembly_payload = dict(payload)
+        return dict(payload)
+
+    def prompt_prefix_surface_payload(self) -> dict[str, Any]:
+        if self._last_prompt_prefix_assembly_payload is not None:
+            return dict(self._last_prompt_prefix_assembly_payload)
+        inspection_messages = self.apply_tool_result_replacements_to_messages(self.state.messages)
+        assembly = self.build_provider_prompt_assembly(messages=inspection_messages)
+        cache_plan = self.build_provider_prompt_cache_plan(assembly, previous_payload=None)
+        payload = prompt_prefix_surface_payload_from_assembly(
+            assembly,
+            previous_payload=None,
+            source="inspection",
+        )
+        payload.update(prompt_prefix_cache_payload_from_plan(cache_plan))
+        return payload
 
     def execute_tool_calls(self, tool_calls, ctx: ToolContext, *, sink=None) -> list[dict[str, Any]]:
         return self._build_active_orchestrator().execute_tool_calls(tool_calls, ctx, sink=sink)
@@ -3238,7 +3375,7 @@ class Session:
         preview_payload = preview or self._history_compaction_preview_payload()
         thresholds = self._compaction_policy_thresholds()
         would_compact = bool(preview_payload.get("would_compact"))
-        message_count = len(self.state.messages)
+        message_count = len(message_override) if message_override is not None else len(self.state.messages)
         message_limit = max(int(self.config.max_history_messages), 1)
         summary_chars = len(self.state.context_summary or "")
         summary_limit = max(int(self.config.max_context_summary_chars), 1)
@@ -3304,10 +3441,12 @@ class Session:
         budget_surface: dict[str, Any] | None = None,
         compaction_policy: dict[str, Any] | None = None,
         runtime_progress: dict[str, Any] | None = None,
+        prompt_prefix_surface: dict[str, Any] | None = None,
         latest_compact_boundary: HistoryBoundary | None = None,
     ) -> dict[str, dict[str, Any]]:
         budget_surface = dict(budget_surface or self.runtime_budget_surface_payload())
         runtime_progress = dict(runtime_progress or self.runtime_progress_surface_payload())
+        prompt_prefix_surface = dict(prompt_prefix_surface or self.prompt_prefix_surface_payload())
         latest_compact_boundary = latest_compact_boundary or self._latest_history_boundary(kind="compact")
 
         budget_state = str(budget_surface.get("budget_state") or "ok")
@@ -3459,6 +3598,125 @@ class Session:
                 "budget_pressure_detail": budget_pressure_detail,
                 "budget_pressure_detail_display": budget_pressure_detail or "none",
             },
+            "prefix": {
+                "prompt_prefix_segment_count": int(
+                    prompt_prefix_surface.get("prompt_prefix_segment_count") or 0
+                ),
+                "prompt_prefix_stable_chars": int(
+                    prompt_prefix_surface.get("prompt_prefix_stable_chars") or 0
+                ),
+                "prompt_prefix_dynamic_tail_chars": int(
+                    prompt_prefix_surface.get("prompt_prefix_dynamic_tail_chars") or 0
+                ),
+                "provider_view_assembly": str(
+                    prompt_prefix_surface.get("prompt_prefix_provider_view_summary") or "none"
+                ),
+                "prompt_prefix_cache_mode": str(
+                    prompt_prefix_surface.get("prompt_prefix_cache_mode") or "disabled"
+                ),
+                "prompt_prefix_cache_supported": (
+                    "yes" if bool(prompt_prefix_surface.get("prompt_prefix_cache_supported")) else "no"
+                ),
+                "prompt_prefix_cache_provider": str(
+                    prompt_prefix_surface.get("prompt_prefix_cache_provider") or "none"
+                ),
+                "prompt_prefix_cache_summary": str(
+                    prompt_prefix_surface.get("prompt_prefix_cache_summary") or "none"
+                ),
+                "prompt_prefix_cache_fallback_reason": str(
+                    prompt_prefix_surface.get("prompt_prefix_cache_fallback_reason") or "none"
+                ),
+            "prefix_reduction_tier": str(
+                prompt_prefix_surface.get("prompt_prefix_reduction_tier") or "none"
+            ),
+            "prompt_prefix_planner_mode": str(
+                prompt_prefix_surface.get("prompt_prefix_planner_mode") or "disabled"
+            ),
+            "prompt_prefix_planner_reason": str(
+                prompt_prefix_surface.get("prompt_prefix_planner_reason") or "none"
+            ),
+                "prompt_prefix_planner_summary": str(
+                    prompt_prefix_surface.get("prompt_prefix_planner_summary") or "none"
+                ),
+                "prompt_prefix_costed_planner_mode": str(
+                    prompt_prefix_surface.get("prompt_prefix_costed_planner_mode") or "disabled"
+                ),
+                "prompt_prefix_costed_planner_reason": str(
+                    prompt_prefix_surface.get("prompt_prefix_costed_planner_reason") or "none"
+                ),
+                "prompt_prefix_target_tokens_to_shed": int(
+                    prompt_prefix_surface.get("prompt_prefix_target_tokens_to_shed") or 0
+                ),
+                "prompt_prefix_estimated_input_tokens": int(
+                    prompt_prefix_surface.get("prompt_prefix_estimated_input_tokens") or 0
+                ),
+                "prompt_prefix_estimated_stable_prefix_tokens": int(
+                    prompt_prefix_surface.get("prompt_prefix_estimated_stable_prefix_tokens") or 0
+                ),
+                "prompt_prefix_estimated_dynamic_tail_tokens": int(
+                    prompt_prefix_surface.get("prompt_prefix_estimated_dynamic_tail_tokens") or 0
+                ),
+                "prompt_prefix_selected_candidate_count": int(
+                    prompt_prefix_surface.get("prompt_prefix_selected_candidate_count") or 0
+                ),
+                "prompt_prefix_selected_candidate_summary": str(
+                    prompt_prefix_surface.get("prompt_prefix_selected_candidate_summary") or "none"
+                ),
+                "prompt_prefix_remaining_estimated_overage": int(
+                    prompt_prefix_surface.get("prompt_prefix_remaining_estimated_overage") or 0
+                ),
+                "prompt_prefix_prefix_damage_score": int(
+                    prompt_prefix_surface.get("prompt_prefix_prefix_damage_score") or 0
+                ),
+                "prompt_prefix_orchestration_mode": str(
+                    prompt_prefix_surface.get("prompt_prefix_orchestration_mode") or "disabled"
+                ),
+                "prompt_prefix_orchestration_reason": str(
+                    prompt_prefix_surface.get("prompt_prefix_orchestration_reason") or "none"
+                ),
+                "prompt_prefix_orchestration_selected_candidate_count": int(
+                    prompt_prefix_surface.get("prompt_prefix_orchestration_selected_candidate_count") or 0
+                ),
+                "prompt_prefix_orchestration_selected_candidate_summary": str(
+                    prompt_prefix_surface.get("prompt_prefix_orchestration_selected_candidate_summary") or "none"
+                ),
+                "prompt_prefix_orchestration_remaining_estimated_overage": int(
+                    prompt_prefix_surface.get("prompt_prefix_orchestration_remaining_estimated_overage") or 0
+                ),
+                "prompt_prefix_orchestration_requires_full_compaction": bool(
+                    prompt_prefix_surface.get("prompt_prefix_orchestration_requires_full_compaction")
+                ),
+                "prompt_prefix_preserved_signature": str(
+                    prompt_prefix_surface.get("prompt_prefix_preserved_signature") or "none"
+                ),
+            "prompt_prefix_preserved_segment_count": int(
+                prompt_prefix_surface.get("prompt_prefix_preserved_segment_count") or 0
+            ),
+            "prompt_prefix_preserved_message_group_count": int(
+                prompt_prefix_surface.get("prompt_prefix_preserved_message_group_count") or 0
+            ),
+            "prompt_prefix_downgraded_message_group_count": int(
+                prompt_prefix_surface.get("prompt_prefix_downgraded_message_group_count") or 0
+            ),
+            "prompt_prefix_preserved_chars": int(
+                prompt_prefix_surface.get("prompt_prefix_preserved_chars") or 0
+            ),
+            "prompt_prefix_cache_eligible_segment_count": int(
+                prompt_prefix_surface.get("prompt_prefix_cache_eligible_segment_count") or 0
+            ),
+            "prefix_signature": str(
+                prompt_prefix_surface.get("prompt_prefix_signature") or "none"
+            ),
+                "prefix_previous_signature": str(
+                    prompt_prefix_surface.get("prompt_prefix_previous_signature") or "none"
+                ),
+                "prefix_preserved": (
+                    "no" if bool(prompt_prefix_surface.get("prompt_prefix_changed")) else "yes"
+                ),
+                "prefix_change_reason": str(
+                    prompt_prefix_surface.get("prompt_prefix_change_reason") or "none"
+                ),
+            },
         }
 
     def _runtime_budget_narrative_lines(
@@ -3522,6 +3780,68 @@ class Session:
                 ]
             )
         return lines
+
+    def _prompt_prefix_narrative_lines(
+        self,
+        *,
+        narrative: dict[str, dict[str, Any]] | None = None,
+    ) -> list[str]:
+        narrative = narrative or self._runtime_narrative_payload()
+        prefix = narrative["prefix"]
+        return [
+            "prompt prefix: "
+            + (
+                f"segments={prefix['prompt_prefix_segment_count']} "
+                f"stable_chars={prefix['prompt_prefix_stable_chars']} "
+                f"dynamic_tail_chars={prefix['prompt_prefix_dynamic_tail_chars']}"
+            ),
+            "provider-view assembly: " + str(prefix["provider_view_assembly"]),
+            "prompt prefix cache mode: " + str(prefix["prompt_prefix_cache_mode"]),
+            "prompt prefix cache supported: " + str(prefix["prompt_prefix_cache_supported"]),
+            "prompt prefix cache provider: " + str(prefix["prompt_prefix_cache_provider"]),
+            "prompt prefix cache summary: " + str(prefix["prompt_prefix_cache_summary"]),
+            "prompt prefix cache fallback reason: "
+            + str(prefix["prompt_prefix_cache_fallback_reason"]),
+            "provider-view planner: " + str(prefix["prompt_prefix_planner_mode"]),
+            "prefix reduction tier: " + str(prefix["prefix_reduction_tier"]),
+            "prefix planner reason: " + str(prefix["prompt_prefix_planner_reason"]),
+            "planner summary: " + str(prefix["prompt_prefix_planner_summary"]),
+            "costed planner mode: " + str(prefix["prompt_prefix_costed_planner_mode"]),
+            "costed planner reason: " + str(prefix["prompt_prefix_costed_planner_reason"]),
+            "target tokens to shed: " + str(prefix["prompt_prefix_target_tokens_to_shed"]),
+            "estimated input tokens: " + str(prefix["prompt_prefix_estimated_input_tokens"]),
+            "estimated stable prefix tokens: "
+            + str(prefix["prompt_prefix_estimated_stable_prefix_tokens"]),
+            "estimated dynamic tail tokens: "
+            + str(prefix["prompt_prefix_estimated_dynamic_tail_tokens"]),
+            "selected candidates: " + str(prefix["prompt_prefix_selected_candidate_summary"]),
+            "remaining estimated overage: "
+            + str(prefix["prompt_prefix_remaining_estimated_overage"]),
+            "prefix damage score: " + str(prefix["prompt_prefix_prefix_damage_score"]),
+            "provider-view orchestration: " + str(prefix["prompt_prefix_orchestration_mode"]),
+            "orchestration reason: " + str(prefix["prompt_prefix_orchestration_reason"]),
+            "orchestration selected candidates: "
+            + str(prefix["prompt_prefix_orchestration_selected_candidate_summary"]),
+            "orchestration remaining overage: "
+            + str(prefix["prompt_prefix_orchestration_remaining_estimated_overage"]),
+            "full compaction required: "
+            + (
+                "yes"
+                if bool(prefix["prompt_prefix_orchestration_requires_full_compaction"])
+                else "no"
+            ),
+            "preserved prefix signature: " + str(prefix["prompt_prefix_preserved_signature"]),
+            "preserved message groups: "
+            + str(prefix["prompt_prefix_preserved_message_group_count"]),
+            "downgraded message groups: "
+            + str(prefix["prompt_prefix_downgraded_message_group_count"]),
+            "cache-eligible segments: "
+            + str(prefix["prompt_prefix_cache_eligible_segment_count"]),
+            "prefix signature: " + str(prefix["prefix_signature"]),
+            "previous prefix signature: " + str(prefix["prefix_previous_signature"]),
+            "prefix preserved: " + str(prefix["prefix_preserved"]),
+            "prefix change reason: " + str(prefix["prefix_change_reason"]),
+        ]
 
     def _runtime_progress_defaults(self) -> dict[str, Any]:
         return {
@@ -3843,8 +4163,10 @@ class Session:
         budget_surface = self.runtime_budget_surface_payload()
         replacement_surface = self.tool_result_replacement_surface_payload()
         artifact_surface = self.tool_result_artifact_surface_payload()
+        prompt_prefix_surface = self.prompt_prefix_surface_payload()
         narrative = self._runtime_narrative_payload(
             budget_surface=budget_surface,
+            prompt_prefix_surface=prompt_prefix_surface,
         )
         state = str(budget.get("budget_state") or "ok")
         if state == "warning":
@@ -3888,6 +4210,13 @@ class Session:
                     or artifact_surface["artifact_active_count"]
                 )
                 else "no"
+            ),
+            "prompt_prefix_reduction_tier": prompt_prefix_surface["prompt_prefix_reduction_tier"],
+            "prompt_prefix_signature": prompt_prefix_surface["prompt_prefix_signature"],
+            "prompt_prefix_changed": bool(prompt_prefix_surface["prompt_prefix_changed"]),
+            "prompt_prefix_change_reason": prompt_prefix_surface["prompt_prefix_change_reason"],
+            "prompt_prefix_narrative_lines": self._prompt_prefix_narrative_lines(
+                narrative=narrative
             ),
             "runtime_budget_narrative_lines": self._runtime_budget_narrative_lines(
                 narrative=narrative
@@ -3965,6 +4294,7 @@ class Session:
         latest_boundary = boundaries[-1] if boundaries else None
         latest_rewindable = self._latest_rewindable_boundary_for(boundaries)
         rewindable_count = sum(1 for boundary in boundaries if self._history_boundary_is_rewindable(boundary))
+        prompt_prefix_surface = self.prompt_prefix_surface_payload()
         lines = [
             heading,
             f"- history boundaries: {len(boundaries)}",
@@ -3986,6 +4316,10 @@ class Session:
             f"- latest compact trigger: {latest_compact_trigger or 'none'}",
             f"- latest compact reason: {latest_compact_reason or 'none'}",
             f"- latest compact summary: {latest_compact_summary or 'none'}",
+            "- prefix reduction tier: "
+            + str(prompt_prefix_surface.get("prompt_prefix_reduction_tier") or "none"),
+            "- prefix planner reason: "
+            + str(prompt_prefix_surface.get("prompt_prefix_planner_reason") or "none"),
         ]
         return lines
 
@@ -4038,6 +4372,15 @@ class Session:
             lines.append(f"new_session_id: {boundary.new_session_id}")
         if boundary.target_boundary_id:
             lines.append(f"target_boundary_id: {boundary.target_boundary_id}")
+        prompt_prefix_surface = self.prompt_prefix_surface_payload()
+        lines.extend(
+            [
+                "current prefix reduction tier: "
+                + str(prompt_prefix_surface.get("prompt_prefix_reduction_tier") or "none"),
+                "current prefix planner reason: "
+                + str(prompt_prefix_surface.get("prompt_prefix_planner_reason") or "none"),
+            ]
+        )
         return lines
 
     def _find_history_boundary_by_id(self, boundary_id: str | None) -> HistoryBoundary | None:
@@ -4682,11 +5025,13 @@ class Session:
         memory_payload = self.memory_surface_payload()
         budget_surface = self.runtime_budget_surface_payload()
         runtime_progress = self.runtime_progress_surface_payload()
+        prompt_prefix_surface = self.prompt_prefix_surface_payload()
         replacement_surface = self.tool_result_replacement_surface_payload()
         artifact_surface = self.tool_result_artifact_surface_payload()
         narrative = self._runtime_narrative_payload(
             budget_surface=budget_surface,
             runtime_progress=runtime_progress,
+            prompt_prefix_surface=prompt_prefix_surface,
         )
         execution_contract = self.execution_contract_payload()
         usage_report = collect_context_usage(self)
@@ -4779,6 +5124,123 @@ class Session:
             ),
             "status_runtime_tool_result_microcompact_summary": runtime_progress.get(
                 "runtime_tool_result_microcompact_summary"
+            ),
+            "status_prompt_prefix_segment_count": int(
+                prompt_prefix_surface.get("prompt_prefix_segment_count") or 0
+            ),
+            "status_prompt_prefix_stable_chars": int(
+                prompt_prefix_surface.get("prompt_prefix_stable_chars") or 0
+            ),
+            "status_prompt_prefix_dynamic_tail_chars": int(
+                prompt_prefix_surface.get("prompt_prefix_dynamic_tail_chars") or 0
+            ),
+            "status_prompt_prefix_cache_mode": str(
+                prompt_prefix_surface.get("prompt_prefix_cache_mode") or "disabled"
+            ),
+            "status_prompt_prefix_cache_supported": bool(
+                prompt_prefix_surface.get("prompt_prefix_cache_supported")
+            ),
+            "status_prompt_prefix_cache_provider": str(
+                prompt_prefix_surface.get("prompt_prefix_cache_provider") or "none"
+            ),
+            "status_prompt_prefix_cache_summary": str(
+                prompt_prefix_surface.get("prompt_prefix_cache_summary") or "none"
+            ),
+            "status_prompt_prefix_cache_fallback_reason": str(
+                prompt_prefix_surface.get("prompt_prefix_cache_fallback_reason") or "none"
+            ),
+            "status_prompt_prefix_reduction_tier": str(
+                prompt_prefix_surface.get("prompt_prefix_reduction_tier") or "none"
+            ),
+            "status_prompt_prefix_planner_mode": str(
+                prompt_prefix_surface.get("prompt_prefix_planner_mode") or "disabled"
+            ),
+            "status_prompt_prefix_planner_reason": str(
+                prompt_prefix_surface.get("prompt_prefix_planner_reason") or "none"
+            ),
+            "status_prompt_prefix_planner_summary": str(
+                prompt_prefix_surface.get("prompt_prefix_planner_summary") or "none"
+            ),
+            "status_prompt_prefix_costed_planner_mode": str(
+                prompt_prefix_surface.get("prompt_prefix_costed_planner_mode") or "disabled"
+            ),
+            "status_prompt_prefix_costed_planner_reason": str(
+                prompt_prefix_surface.get("prompt_prefix_costed_planner_reason") or "none"
+            ),
+            "status_prompt_prefix_target_tokens_to_shed": int(
+                prompt_prefix_surface.get("prompt_prefix_target_tokens_to_shed") or 0
+            ),
+            "status_prompt_prefix_estimated_input_tokens": int(
+                prompt_prefix_surface.get("prompt_prefix_estimated_input_tokens") or 0
+            ),
+            "status_prompt_prefix_estimated_stable_prefix_tokens": int(
+                prompt_prefix_surface.get("prompt_prefix_estimated_stable_prefix_tokens") or 0
+            ),
+            "status_prompt_prefix_estimated_dynamic_tail_tokens": int(
+                prompt_prefix_surface.get("prompt_prefix_estimated_dynamic_tail_tokens") or 0
+            ),
+            "status_prompt_prefix_selected_candidate_count": int(
+                prompt_prefix_surface.get("prompt_prefix_selected_candidate_count") or 0
+            ),
+            "status_prompt_prefix_selected_candidate_summary": str(
+                prompt_prefix_surface.get("prompt_prefix_selected_candidate_summary") or "none"
+            ),
+            "status_prompt_prefix_remaining_estimated_overage": int(
+                prompt_prefix_surface.get("prompt_prefix_remaining_estimated_overage") or 0
+            ),
+            "status_prompt_prefix_prefix_damage_score": int(
+                prompt_prefix_surface.get("prompt_prefix_prefix_damage_score") or 0
+            ),
+            "status_prompt_prefix_orchestration_mode": str(
+                prompt_prefix_surface.get("prompt_prefix_orchestration_mode") or "disabled"
+            ),
+            "status_prompt_prefix_orchestration_reason": str(
+                prompt_prefix_surface.get("prompt_prefix_orchestration_reason") or "none"
+            ),
+            "status_prompt_prefix_orchestration_selected_candidate_count": int(
+                prompt_prefix_surface.get("prompt_prefix_orchestration_selected_candidate_count") or 0
+            ),
+            "status_prompt_prefix_orchestration_selected_candidate_summary": str(
+                prompt_prefix_surface.get("prompt_prefix_orchestration_selected_candidate_summary") or "none"
+            ),
+            "status_prompt_prefix_orchestration_remaining_estimated_overage": int(
+                prompt_prefix_surface.get("prompt_prefix_orchestration_remaining_estimated_overage") or 0
+            ),
+            "status_prompt_prefix_orchestration_requires_full_compaction": bool(
+                prompt_prefix_surface.get("prompt_prefix_orchestration_requires_full_compaction")
+            ),
+            "status_prompt_prefix_preserved_signature": str(
+                prompt_prefix_surface.get("prompt_prefix_preserved_signature") or "none"
+            ),
+            "status_prompt_prefix_preserved_segment_count": int(
+                prompt_prefix_surface.get("prompt_prefix_preserved_segment_count") or 0
+            ),
+            "status_prompt_prefix_preserved_message_group_count": int(
+                prompt_prefix_surface.get("prompt_prefix_preserved_message_group_count") or 0
+            ),
+            "status_prompt_prefix_downgraded_message_group_count": int(
+                prompt_prefix_surface.get("prompt_prefix_downgraded_message_group_count") or 0
+            ),
+            "status_prompt_prefix_preserved_chars": int(
+                prompt_prefix_surface.get("prompt_prefix_preserved_chars") or 0
+            ),
+            "status_prompt_prefix_cache_eligible_segment_count": int(
+                prompt_prefix_surface.get("prompt_prefix_cache_eligible_segment_count") or 0
+            ),
+            "status_prompt_prefix_signature": str(
+                prompt_prefix_surface.get("prompt_prefix_signature") or "none"
+            ),
+            "status_prompt_prefix_previous_signature": str(
+                prompt_prefix_surface.get("prompt_prefix_previous_signature") or "none"
+            ),
+            "status_prompt_prefix_changed": bool(
+                prompt_prefix_surface.get("prompt_prefix_changed")
+            ),
+            "status_prompt_prefix_change_reason": str(
+                prompt_prefix_surface.get("prompt_prefix_change_reason") or "none"
+            ),
+            "status_provider_view_assembly_summary": str(
+                prompt_prefix_surface.get("prompt_prefix_provider_view_summary") or "none"
             ),
             "status_background_summary": str(
                 background_handoff.get("background_handoff_selected_completion_summary") or "none"
@@ -5433,6 +5895,7 @@ class Session:
                 summary=(
                     f"Compacted {preview['compacted_count']} messages and kept "
                     f"{preview['kept_count']} recent messages. "
+                    "prefix-preserving reduction=full_compaction "
                     f"tool-result replacements={preview.get('replacement_records_active', 0)} "
                     f"tool-result artifacts={preview.get('artifact_records_active', 0)} "
                     f"replacement-aware={'yes' if preview.get('replacement_aware_compaction') else 'no'}."
@@ -5464,6 +5927,7 @@ class Session:
             message=(
                 f"compacted {preview['compacted_count']} messages into context_summary; "
                 f"kept last {preview['kept_count']} messages"
+                "; prefix-preserving reduction=full_compaction"
                 + (
                     f"; tool-result replacements={preview.get('replacement_records_active', 0)}"
                     if int(preview.get("replacement_records_active", 0) or 0) > 0
@@ -5510,6 +5974,43 @@ class Session:
             f"boundary kind: {event_payload['boundary_kind']}",
             f"existing summary chars: {event_payload['existing_summary_chars']}",
         ]
+        prompt_prefix_surface = self.prompt_prefix_surface_payload()
+        lines.extend(
+            [
+                "provider-view planner: "
+                + str(prompt_prefix_surface.get("prompt_prefix_planner_mode") or "disabled"),
+                "prefix reduction tier: "
+                + str(prompt_prefix_surface.get("prompt_prefix_reduction_tier") or "none"),
+                "prefix planner reason: "
+                + str(prompt_prefix_surface.get("prompt_prefix_planner_reason") or "none"),
+                "provider-view orchestration: "
+                + str(prompt_prefix_surface.get("prompt_prefix_orchestration_mode") or "disabled"),
+                "selected candidates: "
+                + str(
+                    prompt_prefix_surface.get(
+                        "prompt_prefix_orchestration_selected_candidate_summary"
+                    )
+                    or "none"
+                ),
+                "remaining overage: "
+                + str(
+                    prompt_prefix_surface.get(
+                        "prompt_prefix_orchestration_remaining_estimated_overage"
+                    )
+                    or 0
+                ),
+                "full compaction required: "
+                + (
+                    "yes"
+                    if bool(
+                        prompt_prefix_surface.get(
+                            "prompt_prefix_orchestration_requires_full_compaction"
+                        )
+                    )
+                    else "no"
+                ),
+            ]
+        )
         if bool(preview["would_compact"]):
             lines.append(
                 f"compacted context summary chars after compact: {event_payload['merged_summary_chars']}"
@@ -5560,6 +6061,43 @@ class Session:
             f"existing summary chars: {event_payload['existing_summary_chars']}",
             f"compacted context summary chars after compact: {event_payload['merged_summary_chars']}",
         ]
+        prompt_prefix_surface = self.prompt_prefix_surface_payload()
+        lines.extend(
+            [
+                "provider-view planner: "
+                + str(prompt_prefix_surface.get("prompt_prefix_planner_mode") or "disabled"),
+                "prefix reduction tier: "
+                + str(prompt_prefix_surface.get("prompt_prefix_reduction_tier") or "none"),
+                "prefix planner reason: "
+                + str(prompt_prefix_surface.get("prompt_prefix_planner_reason") or "none"),
+                "provider-view orchestration: "
+                + str(prompt_prefix_surface.get("prompt_prefix_orchestration_mode") or "disabled"),
+                "selected candidates: "
+                + str(
+                    prompt_prefix_surface.get(
+                        "prompt_prefix_orchestration_selected_candidate_summary"
+                    )
+                    or "none"
+                ),
+                "remaining overage: "
+                + str(
+                    prompt_prefix_surface.get(
+                        "prompt_prefix_orchestration_remaining_estimated_overage"
+                    )
+                    or 0
+                ),
+                "full compaction required: "
+                + (
+                    "yes"
+                    if bool(
+                        prompt_prefix_surface.get(
+                            "prompt_prefix_orchestration_requires_full_compaction"
+                        )
+                    )
+                    else "no"
+                ),
+            ]
+        )
         lines.extend(render_compaction_policy(policy_payload).splitlines())
         lines.extend(self._memory_operation_surface_policy_lines("compact"))
         lines.extend(self._compact_instruction_lines(preview))
@@ -9998,6 +10536,7 @@ class Session:
             report,
             system_prompt_surface=self.system_prompt_surface_payload(),
             replacement_surface=replacement_surface,
+            prompt_prefix_surface=self.prompt_prefix_surface_payload(),
         ) + "\n\n" + render_compaction_policy(
             self.compaction_policy_payload(report=report)
         )
@@ -11849,6 +12388,14 @@ class Session:
             return f"[artifact:reuse] {event.message}"
         if event.kind == "tool_result_microcompacted":
             return f"[microcompact] {event.message}"
+        if event.kind == "prompt_cache_hints_applied":
+            return f"[cache] {event.message}"
+        if event.kind == "prompt_cache_hints_fallback":
+            return f"[cache:fallback] {event.message}"
+        if event.kind == "prompt_prefix_planner_applied":
+            return f"[planner] {event.message}"
+        if event.kind == "prompt_prefix_planner_downgraded":
+            return f"[planner:downgraded] {event.message}"
         if event.kind == "tool_batch_started":
             return f"[tool:batch:start] {event.message}"
         if event.kind == "tool_batch_finished":
@@ -12110,6 +12657,124 @@ class Session:
 
 
 _SESSION_COMPONENT_METHODS: dict[str, tuple[str, ...]] = {
+    "_runtime_state_component": (
+        "tool_result_replacement_surface_payload",
+        "tool_result_artifact_surface_payload",
+        "tool_schema_surface_payload",
+        "system_prompt_surface_payload",
+        "build_provider_prompt_assembly",
+        "build_provider_prompt_cache_plan",
+        "record_prompt_prefix_assembly",
+        "prompt_prefix_surface_payload",
+        "refresh_runtime_budget_state",
+        "runtime_budget_state_payload",
+        "runtime_budget_surface_payload",
+        "_runtime_narrative_payload",
+        "_runtime_budget_narrative_lines",
+        "_runtime_compact_lifecycle_narrative_lines",
+        "_runtime_progress_narrative_lines",
+        "_prompt_prefix_narrative_lines",
+        "_runtime_progress_defaults",
+        "_runtime_waiting_tool_summary_for_event",
+        "_runtime_last_tool_summary_for_event",
+        "_runtime_progress_snapshot",
+        "_apply_runtime_progress_event_to_snapshot",
+        "_record_runtime_progress_event",
+        "runtime_progress_surface_payload",
+        "_record_runtime_usage_event",
+        "should_emit_budget_pressure_event",
+        "compaction_policy_payload",
+    ),
+    "_history_memory_component": (
+        "describe_history",
+        "describe_compact",
+        "_history_state_payload",
+        "_history_state_lines",
+        "_record_history_boundary",
+        "_latest_history_boundary",
+        "_history_boundary_is_rewindable",
+        "_latest_rewindable_boundary_for",
+        "_render_history_boundary_summary",
+        "_history_boundary_kind_label",
+        "_history_boundary_snapshot_available",
+        "_history_lifecycle_lines",
+        "_history_boundary_preview_lines",
+        "_find_history_boundary_by_id",
+        "_history_boundary_lineage_summary",
+        "_history_boundary_compare_payload",
+        "_history_boundary_compare_lines",
+        "_history_boundary_restore_effect_lines",
+        "_history_boundary_lines_for",
+        "_history_boundary_lines",
+        "_normalize_memory_operation",
+        "_memory_operation_semantics",
+        "_memory_operation_payload",
+        "_remember_memory_operation",
+        "_current_memory_operation_payload",
+        "memory_surface_payload",
+        "_memory_operation_surface_policy",
+        "_apply_memory_operation_surface_policy",
+        "_memory_operation_surface_policy_lines",
+        "_rewindable_boundaries",
+        "_resolve_rewind_boundary",
+        "rewind_boundary_preview_payload",
+        "describe_rewind",
+        "rewind_to_boundary",
+        "_history_compaction_event_payload",
+        "compact_history_into_context_summary",
+        "_history_compaction_keep_last",
+        "_history_compaction_preview_payload",
+        "_merge_context_summary",
+        "apply_history_compaction",
+        "_describe_compact_status",
+        "_describe_compact_preview",
+        "_compact_instruction_lines",
+        "_history_section_lines",
+        "_history_focus_summary_lines",
+    ),
+    "_project_context_component": (
+        "describe_project_context",
+        "_describe_project_context_summary",
+        "describe_project_memory",
+        "_loaded_skill_status_parts",
+        "_loaded_skill_source_payload",
+        "_loaded_skill_manual_override_state",
+        "_loaded_skill_payload",
+        "_loaded_skill_registry_payload",
+        "_skill_registry_summary_lines",
+        "_skill_diagnostic_lines",
+        "_skill_registry_next_actions",
+        "skills_surface_payload",
+        "_skill_toggle_command",
+        "_loaded_skill_groups",
+        "_render_loaded_skill_lines",
+        "describe_loaded_skills",
+        "_plugin_contribution_labels",
+        "_plugin_source_label",
+        "_plugin_reload_state_payload",
+        "plugin_surface_payload",
+        "_plugin_toggle_command",
+        "describe_plugins",
+        "describe_plugin",
+        "_project_context_reload_snapshot",
+        "_record_project_context_reload_result",
+        "_last_project_context_reload_summary_line",
+        "_describe_project_context_reload_status",
+        "_skill_reload_state_payload",
+        "_yes_no",
+        "reload_project_context",
+    ),
+    "_background_runtime_component": (
+        "background_surface_payload",
+        "background_registry_payload",
+        "background_handoff_payload",
+        "_background_runtime_progress_metadata",
+        "_background_recent_activity_from_metadata",
+        "_background_last_tool_summary_for_event",
+        "_background_waiting_tool_summary_for_event",
+        "_compact_runtime_progress_text",
+        "_estimate_runtime_progress_tokens",
+    ),
     "_workspace_component": (
         "current_workspace_action_bundle",
         "task_workspace_action_bundle",
@@ -12232,6 +12897,10 @@ def _install_session_component_delegates() -> None:
     original_init = Session.__init__
 
     def componentized_init(self: Session, *args: Any, **kwargs: Any) -> None:
+        self._runtime_state_component = RuntimeStateSessionComponent(self)
+        self._history_memory_component = HistoryMemorySessionComponent(self)
+        self._project_context_component = ProjectContextSessionComponent(self)
+        self._background_runtime_component = BackgroundRuntimeSessionComponent(self)
         self._workspace_component = WorkspaceSessionComponent(self)
         self._task_detail_component = TaskDetailSessionComponent(self)
         self._symbol_surface_component = SymbolSurfaceSessionComponent(self)

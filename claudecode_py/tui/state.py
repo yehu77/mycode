@@ -306,6 +306,18 @@ class TuiState:
         if event.kind == "tool_result_replacement_reapplied":
             self.append_event(f"[replacement] {event.message}")
             return
+        if event.kind == "prompt_cache_hints_applied":
+            self.append_event(f"[cache] {event.message}")
+            return
+        if event.kind == "prompt_cache_hints_fallback":
+            self.append_event(f"[cache:fallback] {event.message}")
+            return
+        if event.kind == "prompt_prefix_planner_applied":
+            self.append_event(f"[planner] {event.message}")
+            return
+        if event.kind == "prompt_prefix_planner_downgraded":
+            self.append_event(f"[planner:downgraded] {event.message}")
+            return
         if event.kind == "budget_pressure":
             self.append_event(f"[budget] {event.message}")
             return
@@ -1084,6 +1096,86 @@ class TuiState:
             + str(
                 status_metadata.get("status_runtime_tool_result_microcompact_summary") or "none"
             ),
+            "prompt prefix: "
+            + (
+                f"segments={int(status_metadata.get('status_prompt_prefix_segment_count') or 0)} "
+                f"stable_chars={int(status_metadata.get('status_prompt_prefix_stable_chars') or 0)} "
+                f"dynamic_tail_chars={int(status_metadata.get('status_prompt_prefix_dynamic_tail_chars') or 0)}"
+            ),
+            "provider-view assembly: "
+            + str(status_metadata.get("status_provider_view_assembly_summary") or "none"),
+            "prompt prefix cache mode: "
+            + str(status_metadata.get("status_prompt_prefix_cache_mode") or "disabled"),
+            "prompt prefix cache supported: "
+            + (
+                "yes"
+                if bool(status_metadata.get("status_prompt_prefix_cache_supported"))
+                else "no"
+            ),
+            "prompt prefix cache provider: "
+            + str(status_metadata.get("status_prompt_prefix_cache_provider") or "none"),
+            "prompt prefix cache summary: "
+            + str(status_metadata.get("status_prompt_prefix_cache_summary") or "none"),
+            "prompt prefix cache fallback reason: "
+            + str(status_metadata.get("status_prompt_prefix_cache_fallback_reason") or "none"),
+            "provider-view planner: "
+            + str(status_metadata.get("status_prompt_prefix_planner_mode") or "disabled"),
+            "prefix reduction tier: "
+            + str(status_metadata.get("status_prompt_prefix_reduction_tier") or "none"),
+            "prefix planner reason: "
+            + str(status_metadata.get("status_prompt_prefix_planner_reason") or "none"),
+            "planner summary: "
+            + str(status_metadata.get("status_prompt_prefix_planner_summary") or "none"),
+            "costed planner mode: "
+            + str(status_metadata.get("status_prompt_prefix_costed_planner_mode") or "disabled"),
+            "costed planner reason: "
+            + str(status_metadata.get("status_prompt_prefix_costed_planner_reason") or "none"),
+            "target tokens to shed: "
+            + str(status_metadata.get("status_prompt_prefix_target_tokens_to_shed") or 0),
+            "selected candidates: "
+            + str(status_metadata.get("status_prompt_prefix_selected_candidate_summary") or "none"),
+            "remaining estimated overage: "
+            + str(status_metadata.get("status_prompt_prefix_remaining_estimated_overage") or 0),
+            "provider-view orchestration: "
+            + str(status_metadata.get("status_prompt_prefix_orchestration_mode") or "disabled"),
+            "orchestration reason: "
+            + str(status_metadata.get("status_prompt_prefix_orchestration_reason") or "none"),
+            "orchestration selected candidates: "
+            + str(
+                status_metadata.get(
+                    "status_prompt_prefix_orchestration_selected_candidate_summary"
+                )
+                or "none"
+            ),
+            "orchestration remaining overage: "
+            + str(
+                status_metadata.get(
+                    "status_prompt_prefix_orchestration_remaining_estimated_overage"
+                )
+                or 0
+            ),
+            "full compaction required: "
+            + (
+                "yes"
+                if bool(
+                    status_metadata.get(
+                        "status_prompt_prefix_orchestration_requires_full_compaction"
+                    )
+                )
+                else "no"
+            ),
+            "preserved prefix signature: "
+            + str(status_metadata.get("status_prompt_prefix_preserved_signature") or "none"),
+            "preserved message groups: "
+            + str(
+                status_metadata.get("status_prompt_prefix_preserved_message_group_count") or 0
+            ),
+            "prefix signature: "
+            + str(status_metadata.get("status_prompt_prefix_signature") or "none"),
+            "prefix preserved: "
+            + ("no" if bool(status_metadata.get("status_prompt_prefix_changed")) else "yes"),
+            "prefix change reason: "
+            + str(status_metadata.get("status_prompt_prefix_change_reason") or "none"),
             "budget pressure: "
             + (
                 str(status_metadata.get("status_budget_reason") or "none")

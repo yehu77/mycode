@@ -110,6 +110,7 @@ def render_context_usage(
     *,
     system_prompt_surface: dict[str, Any] | None = None,
     replacement_surface: dict[str, Any] | None = None,
+    prompt_prefix_surface: dict[str, Any] | None = None,
 ) -> str:
     lines = [
         "## Context Usage",
@@ -136,6 +137,83 @@ def render_context_usage(
                 "tool-result replacements active: "
                 + str(replacement_surface.get("replacement_active_count", 0)),
                 "replacement-aware provider view: yes",
+            ]
+        )
+    if prompt_prefix_surface is not None:
+        lines.extend(
+            [
+                "prompt prefix: "
+                + (
+                    f"segments={prompt_prefix_surface.get('prompt_prefix_segment_count', 0)} "
+                    f"stable_chars={prompt_prefix_surface.get('prompt_prefix_stable_chars', 0)} "
+                    f"dynamic_tail_chars={prompt_prefix_surface.get('prompt_prefix_dynamic_tail_chars', 0)}"
+                ),
+                "provider-view assembly: "
+                + str(prompt_prefix_surface.get("prompt_prefix_provider_view_summary") or "none"),
+                "prompt prefix cache mode: "
+                + str(prompt_prefix_surface.get("prompt_prefix_cache_mode") or "disabled"),
+                "prompt prefix cache supported: "
+                + ("yes" if bool(prompt_prefix_surface.get("prompt_prefix_cache_supported")) else "no"),
+                "prompt prefix cache provider: "
+                + str(prompt_prefix_surface.get("prompt_prefix_cache_provider") or "none"),
+                "prompt prefix cache summary: "
+                + str(prompt_prefix_surface.get("prompt_prefix_cache_summary") or "none"),
+                "prompt prefix cache fallback reason: "
+                + str(prompt_prefix_surface.get("prompt_prefix_cache_fallback_reason") or "none"),
+                "provider-view planner: "
+                + str(prompt_prefix_surface.get("prompt_prefix_planner_mode") or "disabled"),
+                "prefix reduction tier: "
+                + str(prompt_prefix_surface.get("prompt_prefix_reduction_tier") or "none"),
+                "planner reason: "
+                + str(prompt_prefix_surface.get("prompt_prefix_planner_reason") or "none"),
+                "costed planner mode: "
+                + str(prompt_prefix_surface.get("prompt_prefix_costed_planner_mode") or "disabled"),
+                "costed planner reason: "
+                + str(prompt_prefix_surface.get("prompt_prefix_costed_planner_reason") or "none"),
+                "target tokens to shed: "
+                + str(prompt_prefix_surface.get("prompt_prefix_target_tokens_to_shed") or 0),
+                "selected candidates: "
+                + str(prompt_prefix_surface.get("prompt_prefix_selected_candidate_summary") or "none"),
+                "remaining estimated overage: "
+                + str(prompt_prefix_surface.get("prompt_prefix_remaining_estimated_overage") or 0),
+                "provider-view orchestration: "
+                + str(prompt_prefix_surface.get("prompt_prefix_orchestration_mode") or "disabled"),
+                "orchestration reason: "
+                + str(prompt_prefix_surface.get("prompt_prefix_orchestration_reason") or "none"),
+                "orchestration selected candidates: "
+                + str(
+                    prompt_prefix_surface.get(
+                        "prompt_prefix_orchestration_selected_candidate_summary"
+                    )
+                    or "none"
+                ),
+                "orchestration remaining overage: "
+                + str(
+                    prompt_prefix_surface.get(
+                        "prompt_prefix_orchestration_remaining_estimated_overage"
+                    )
+                    or 0
+                ),
+                "full compaction required: "
+                + (
+                    "yes"
+                    if bool(
+                        prompt_prefix_surface.get(
+                            "prompt_prefix_orchestration_requires_full_compaction"
+                        )
+                    )
+                    else "no"
+                ),
+                "preserved prefix signature: "
+                + str(prompt_prefix_surface.get("prompt_prefix_preserved_signature") or "none"),
+                "preserved message groups: "
+                + str(prompt_prefix_surface.get("prompt_prefix_preserved_message_group_count") or 0),
+                "prefix signature: "
+                + str(prompt_prefix_surface.get("prompt_prefix_signature") or "none"),
+                "prefix preserved: "
+                + ("no" if bool(prompt_prefix_surface.get("prompt_prefix_changed")) else "yes"),
+                "prefix change reason: "
+                + str(prompt_prefix_surface.get("prompt_prefix_change_reason") or "none"),
             ]
         )
     lines.extend(
@@ -188,6 +266,9 @@ def render_compaction_policy(policy: dict[str, Any]) -> str:
             + ("yes" if bool(policy.get("provider_usage_seen")) else "no")
         )
         lines.append("budget pressure: " + str(policy.get("budget_pressure") or "ok"))
+    prompt_prefix_lines = policy.get("prompt_prefix_narrative_lines")
+    if isinstance(prompt_prefix_lines, list) and prompt_prefix_lines:
+        lines.extend(str(item) for item in prompt_prefix_lines if str(item).strip())
     if policy.get("compact_preview_action"):
         lines.append(f"preview action: {policy['compact_preview_action']}")
     if policy.get("compact_apply_action"):

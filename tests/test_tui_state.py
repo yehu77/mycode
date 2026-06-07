@@ -1815,6 +1815,34 @@ class TuiStateTests(unittest.TestCase):
                 "status_runtime_parallel_batch_size": 2,
                 "status_runtime_last_result_summary": "ok results=2",
                 "status_runtime_compact_recovery_summary": "retry succeeded after recovery compact",
+                "status_prompt_prefix_segment_count": 9,
+                "status_prompt_prefix_stable_chars": 1400,
+                "status_prompt_prefix_dynamic_tail_chars": 260,
+                "status_prompt_prefix_reduction_tier": "artifact_indirection",
+                "status_prompt_prefix_planner_mode": "provider_hinted",
+                "status_prompt_prefix_planner_reason": "artifact_indirection_active",
+                "status_prompt_prefix_planner_summary": "preserved_groups=1 downgraded_groups=0 eligible_segments=4",
+                "status_prompt_prefix_costed_planner_mode": "selected",
+                "status_prompt_prefix_costed_planner_reason": "artifact_indirection_active",
+                "status_prompt_prefix_target_tokens_to_shed": 2200,
+                "status_prompt_prefix_estimated_input_tokens": 7200,
+                "status_prompt_prefix_estimated_stable_prefix_tokens": 4100,
+                "status_prompt_prefix_estimated_dynamic_tail_tokens": 3100,
+                "status_prompt_prefix_selected_candidate_count": 1,
+                "status_prompt_prefix_selected_candidate_summary": "artifact_indirection shed_tokens=2200 damage=1",
+                "status_prompt_prefix_remaining_estimated_overage": 0,
+                "status_prompt_prefix_prefix_damage_score": 1,
+                "status_prompt_prefix_orchestration_mode": "selected",
+                "status_prompt_prefix_orchestration_reason": "artifact_indirection_active",
+                "status_prompt_prefix_orchestration_selected_candidate_count": 1,
+                "status_prompt_prefix_orchestration_selected_candidate_summary": "artifact_indirection tool_use_id=tool-1 shed_tokens=2200 damage=1",
+                "status_prompt_prefix_orchestration_remaining_estimated_overage": 0,
+                "status_prompt_prefix_orchestration_requires_full_compaction": False,
+                "status_prompt_prefix_signature": "prefixsig0000001",
+                "status_prompt_prefix_previous_signature": "prefixsig0000000",
+                "status_prompt_prefix_changed": True,
+                "status_prompt_prefix_change_reason": "provider_view_messages",
+                "status_provider_view_assembly_summary": "replacement-aware=yes microcompact-aware=no",
                 "status_working_set_summary": "mix: diff_backed=1 context_only=0 explicit=0 task=0 plan=0 change=1",
                 "status_focused_file_summary": "demo.py (change)",
                 "status_plan_summary": "map runtime",
@@ -1940,6 +1968,29 @@ class TuiStateTests(unittest.TestCase):
         self.assertIn("last tool outcome: read_file | ok | ok (25ms)", rendered)
         self.assertIn("parallel batch: active size=2", rendered)
         self.assertIn("last tool-result summary: ok results=2", rendered)
+        self.assertIn("prompt prefix: segments=9 stable_chars=1400 dynamic_tail_chars=260", rendered)
+        self.assertIn("provider-view assembly: replacement-aware=yes microcompact-aware=no", rendered)
+        self.assertIn("provider-view planner: provider_hinted", rendered)
+        self.assertIn("prefix planner reason: artifact_indirection_active", rendered)
+        self.assertIn("costed planner mode: selected", rendered)
+        self.assertIn("costed planner reason: artifact_indirection_active", rendered)
+        self.assertIn("target tokens to shed: 2200", rendered)
+        self.assertIn(
+            "selected candidates: artifact_indirection shed_tokens=2200 damage=1",
+            rendered,
+        )
+        self.assertIn("remaining estimated overage: 0", rendered)
+        self.assertIn("provider-view orchestration: selected", rendered)
+        self.assertIn("orchestration reason: artifact_indirection_active", rendered)
+        self.assertIn(
+            "orchestration selected candidates: artifact_indirection tool_use_id=tool-1 shed_tokens=2200 damage=1",
+            rendered,
+        )
+        self.assertIn("full compaction required: no", rendered)
+        self.assertIn("prefix reduction tier: artifact_indirection", rendered)
+        self.assertIn("prefix signature: prefixsig0000001", rendered)
+        self.assertIn("prefix preserved: no", rendered)
+        self.assertIn("prefix change reason: provider_view_messages", rendered)
         self.assertIn("budget pressure: context summary chars 15 >= warning threshold 12", rendered)
         self.assertIn("compact recovery: retry succeeded after recovery compact", rendered)
         self.assertIn("Plugin Registry", rendered)

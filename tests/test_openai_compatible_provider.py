@@ -8,6 +8,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from claudecode_py.providers.openai_compatible import OpenAICompatibleProvider
+from claudecode_py.runtime.provider_cache import ProviderPromptCachePlan
 
 
 def _chunk(*, content: str = "", tool_calls=None, finish_reason=None):
@@ -22,6 +23,47 @@ def _tool_call_delta(*, index: int, id: str | None = None, name: str | None = No
 
 
 class OpenAICompatibleProviderStreamingTests(unittest.TestCase):
+    def test_stream_message_ignores_cache_plan_safely(self) -> None:
+        provider = OpenAICompatibleProvider(
+            model="gpt-test",
+            max_tokens=256,
+            api_key="k",
+            base_url="https://example.test/v1",
+        )
+
+        class FakeCompletions:
+            def __init__(self) -> None:
+                self.calls = []
+
+            def create(self, **kwargs):
+                self.calls.append(kwargs)
+                return iter([_chunk(content="ok"), _chunk(finish_reason="stop")])
+
+        fake_completions = FakeCompletions()
+        provider._client = SimpleNamespace(chat=SimpleNamespace(completions=fake_completions))
+        cache_plan = ProviderPromptCachePlan(
+            system_prompt="system",
+            tools=[],
+            messages=[{"role": "user", "content": [{"type": "text", "text": "hi"}]}],
+            cache_hints=(),
+            provider_cache_supported=False,
+            provider_cache_mode="diagnostic_only",
+            provider_cache_summary="stable prefix preserved",
+            provider_cache_provider="openai-compatible",
+        )
+
+        events = list(
+            provider.stream_message(
+                messages=[{"role": "user", "content": [{"type": "text", "text": "hi"}]}],
+                tools=[],
+                system_prompt="system",
+                cache_plan=cache_plan,
+            )
+        )
+
+        self.assertEqual([event.text for event in events[:-1]], ["ok"])
+        self.assertEqual(fake_completions.calls[0]["messages"][0]["role"], "system")
+
     def test_stream_message_builds_final_response(self) -> None:
         provider = OpenAICompatibleProvider(
             model="gpt-test",

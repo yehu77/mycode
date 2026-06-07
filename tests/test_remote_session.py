@@ -562,6 +562,45 @@ class _FakeBridgeClient:
                 "status_runtime_parallel_batch_size": 2,
                 "status_runtime_last_result_summary": "ok results=2",
                 "status_runtime_compact_recovery_summary": "starting compact recovery after prompt-too-long",
+                "status_prompt_prefix_segment_count": 7,
+                "status_prompt_prefix_stable_chars": 1200,
+                "status_prompt_prefix_dynamic_tail_chars": 240,
+                "status_prompt_prefix_cache_mode": "provider_hinted",
+                "status_prompt_prefix_cache_supported": True,
+                "status_prompt_prefix_cache_provider": "anthropic",
+                "status_prompt_prefix_cache_summary": "stable prefix preserved",
+                "status_prompt_prefix_cache_fallback_reason": "none",
+                "status_prompt_prefix_reduction_tier": "artifact_indirection",
+                "status_prompt_prefix_planner_mode": "provider_hinted",
+                "status_prompt_prefix_planner_reason": "artifact_indirection_active",
+                "status_prompt_prefix_planner_summary": "preserved_groups=1 downgraded_groups=0 eligible_segments=4",
+                "status_prompt_prefix_costed_planner_mode": "selected",
+                "status_prompt_prefix_costed_planner_reason": "artifact_indirection_active",
+                "status_prompt_prefix_target_tokens_to_shed": 2200,
+                "status_prompt_prefix_estimated_input_tokens": 7200,
+                "status_prompt_prefix_estimated_stable_prefix_tokens": 4100,
+                "status_prompt_prefix_estimated_dynamic_tail_tokens": 3100,
+                "status_prompt_prefix_selected_candidate_count": 1,
+                "status_prompt_prefix_selected_candidate_summary": "artifact_indirection shed_tokens=2200 damage=1",
+                "status_prompt_prefix_remaining_estimated_overage": 0,
+                "status_prompt_prefix_prefix_damage_score": 1,
+                "status_prompt_prefix_orchestration_mode": "selected",
+                "status_prompt_prefix_orchestration_reason": "artifact_indirection_active",
+                "status_prompt_prefix_orchestration_selected_candidate_count": 1,
+                "status_prompt_prefix_orchestration_selected_candidate_summary": "artifact_indirection tool_use_id=tool-1 shed_tokens=2200 damage=1",
+                "status_prompt_prefix_orchestration_remaining_estimated_overage": 0,
+                "status_prompt_prefix_orchestration_requires_full_compaction": False,
+                "status_prompt_prefix_preserved_signature": "preservedprefix0001",
+                "status_prompt_prefix_preserved_segment_count": 4,
+                "status_prompt_prefix_preserved_message_group_count": 1,
+                "status_prompt_prefix_downgraded_message_group_count": 0,
+                "status_prompt_prefix_preserved_chars": 1080,
+                "status_prompt_prefix_cache_eligible_segment_count": 4,
+                "status_prompt_prefix_signature": "abc123prefix0001",
+                "status_prompt_prefix_previous_signature": "prevprefix000001",
+                "status_prompt_prefix_changed": True,
+                "status_prompt_prefix_change_reason": "provider_view_messages",
+                "status_provider_view_assembly_summary": "replacement-aware=yes microcompact-aware=no",
                 "status_background_summary": "Background session completed.",
                 "status_background_notification_count": 1,
                 "status_background_latest_handoff": "bg-456",
@@ -1223,6 +1262,53 @@ class RemoteSessionProxyTests(unittest.TestCase):
             "starting compact recovery after prompt-too-long",
         )
         self.assertEqual(proxy.status_surface_payload()["status_focused_file_path"], "demo.py")
+        self.assertEqual(proxy.status_surface_payload()["status_prompt_prefix_segment_count"], 7)
+        self.assertEqual(proxy.status_surface_payload()["status_prompt_prefix_stable_chars"], 1200)
+        self.assertEqual(
+            proxy.status_surface_payload()["status_prompt_prefix_reduction_tier"],
+            "artifact_indirection",
+        )
+        self.assertEqual(
+            proxy.status_surface_payload()["status_prompt_prefix_planner_mode"],
+            "provider_hinted",
+        )
+        self.assertEqual(
+            proxy.status_surface_payload()["status_prompt_prefix_planner_reason"],
+            "artifact_indirection_active",
+        )
+        self.assertEqual(
+            proxy.status_surface_payload()["status_prompt_prefix_costed_planner_mode"],
+            "selected",
+        )
+        self.assertEqual(
+            proxy.status_surface_payload()["status_prompt_prefix_costed_planner_reason"],
+            "artifact_indirection_active",
+        )
+        self.assertEqual(
+            proxy.status_surface_payload()["status_prompt_prefix_selected_candidate_summary"],
+            "artifact_indirection shed_tokens=2200 damage=1",
+        )
+        self.assertEqual(
+            proxy.status_surface_payload()["status_prompt_prefix_orchestration_mode"],
+            "selected",
+        )
+        self.assertEqual(
+            proxy.status_surface_payload()["status_prompt_prefix_orchestration_reason"],
+            "artifact_indirection_active",
+        )
+        self.assertEqual(
+            proxy.status_surface_payload()["status_prompt_prefix_signature"],
+            "abc123prefix0001",
+        )
+        self.assertTrue(proxy.status_surface_payload()["status_prompt_prefix_changed"])
+        self.assertEqual(
+            proxy.status_surface_payload()["status_prompt_prefix_change_reason"],
+            "provider_view_messages",
+        )
+        self.assertEqual(
+            proxy.status_surface_payload()["status_provider_view_assembly_summary"],
+            "replacement-aware=yes microcompact-aware=no",
+        )
         self.assertEqual(proxy.status_surface_payload()["status_mcp_health"], "servers=0 connected=0 failed=0 retrying=0")
         self.assertEqual(proxy.status_surface_payload()["status_permission_summary"], "mode=default workspace_rules=0 session_rules=0")
         self.assertEqual(proxy.status_surface_payload()["status_skill_registry_summary"], "registered=0 enabled=0 inactive=0 diagnostics=0")

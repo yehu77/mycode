@@ -45,6 +45,10 @@ def _runtime_event_from_payload(event_payload: dict[str, Any]) -> RuntimeEvent |
         "tool_result_artifact_created",
         "tool_result_artifact_reused",
         "tool_result_microcompacted",
+        "prompt_cache_hints_applied",
+        "prompt_cache_hints_fallback",
+        "prompt_prefix_planner_applied",
+        "prompt_prefix_planner_downgraded",
         "budget_pressure",
         "compact_recovery_started",
         "compact_recovery_finished",
@@ -1853,6 +1857,121 @@ class RemoteSessionProxy:
             ),
             "status_runtime_tool_result_microcompact_summary": payload.get(
                 "status_runtime_tool_result_microcompact_summary"
+            ),
+            "status_prompt_prefix_segment_count": payload.get(
+                "status_prompt_prefix_segment_count"
+            ),
+            "status_prompt_prefix_stable_chars": payload.get(
+                "status_prompt_prefix_stable_chars"
+            ),
+            "status_prompt_prefix_dynamic_tail_chars": payload.get(
+                "status_prompt_prefix_dynamic_tail_chars"
+            ),
+            "status_prompt_prefix_cache_mode": payload.get(
+                "status_prompt_prefix_cache_mode"
+            ),
+            "status_prompt_prefix_cache_supported": payload.get(
+                "status_prompt_prefix_cache_supported"
+            ),
+            "status_prompt_prefix_cache_provider": payload.get(
+                "status_prompt_prefix_cache_provider"
+            ),
+            "status_prompt_prefix_cache_summary": payload.get(
+                "status_prompt_prefix_cache_summary"
+            ),
+            "status_prompt_prefix_cache_fallback_reason": payload.get(
+                "status_prompt_prefix_cache_fallback_reason"
+            ),
+            "status_prompt_prefix_reduction_tier": payload.get(
+                "status_prompt_prefix_reduction_tier"
+            ),
+            "status_prompt_prefix_planner_mode": payload.get(
+                "status_prompt_prefix_planner_mode"
+            ),
+            "status_prompt_prefix_planner_reason": payload.get(
+                "status_prompt_prefix_planner_reason"
+            ),
+            "status_prompt_prefix_planner_summary": payload.get(
+                "status_prompt_prefix_planner_summary"
+            ),
+            "status_prompt_prefix_costed_planner_mode": payload.get(
+                "status_prompt_prefix_costed_planner_mode"
+            ),
+            "status_prompt_prefix_costed_planner_reason": payload.get(
+                "status_prompt_prefix_costed_planner_reason"
+            ),
+            "status_prompt_prefix_target_tokens_to_shed": payload.get(
+                "status_prompt_prefix_target_tokens_to_shed"
+            ),
+            "status_prompt_prefix_estimated_input_tokens": payload.get(
+                "status_prompt_prefix_estimated_input_tokens"
+            ),
+            "status_prompt_prefix_estimated_stable_prefix_tokens": payload.get(
+                "status_prompt_prefix_estimated_stable_prefix_tokens"
+            ),
+            "status_prompt_prefix_estimated_dynamic_tail_tokens": payload.get(
+                "status_prompt_prefix_estimated_dynamic_tail_tokens"
+            ),
+            "status_prompt_prefix_selected_candidate_count": payload.get(
+                "status_prompt_prefix_selected_candidate_count"
+            ),
+            "status_prompt_prefix_selected_candidate_summary": payload.get(
+                "status_prompt_prefix_selected_candidate_summary"
+            ),
+            "status_prompt_prefix_remaining_estimated_overage": payload.get(
+                "status_prompt_prefix_remaining_estimated_overage"
+            ),
+            "status_prompt_prefix_prefix_damage_score": payload.get(
+                "status_prompt_prefix_prefix_damage_score"
+            ),
+            "status_prompt_prefix_orchestration_mode": payload.get(
+                "status_prompt_prefix_orchestration_mode"
+            ),
+            "status_prompt_prefix_orchestration_reason": payload.get(
+                "status_prompt_prefix_orchestration_reason"
+            ),
+            "status_prompt_prefix_orchestration_selected_candidate_count": payload.get(
+                "status_prompt_prefix_orchestration_selected_candidate_count"
+            ),
+            "status_prompt_prefix_orchestration_selected_candidate_summary": payload.get(
+                "status_prompt_prefix_orchestration_selected_candidate_summary"
+            ),
+            "status_prompt_prefix_orchestration_remaining_estimated_overage": payload.get(
+                "status_prompt_prefix_orchestration_remaining_estimated_overage"
+            ),
+            "status_prompt_prefix_orchestration_requires_full_compaction": payload.get(
+                "status_prompt_prefix_orchestration_requires_full_compaction"
+            ),
+            "status_prompt_prefix_preserved_signature": payload.get(
+                "status_prompt_prefix_preserved_signature"
+            ),
+            "status_prompt_prefix_preserved_segment_count": payload.get(
+                "status_prompt_prefix_preserved_segment_count"
+            ),
+            "status_prompt_prefix_preserved_message_group_count": payload.get(
+                "status_prompt_prefix_preserved_message_group_count"
+            ),
+            "status_prompt_prefix_downgraded_message_group_count": payload.get(
+                "status_prompt_prefix_downgraded_message_group_count"
+            ),
+            "status_prompt_prefix_preserved_chars": payload.get(
+                "status_prompt_prefix_preserved_chars"
+            ),
+            "status_prompt_prefix_cache_eligible_segment_count": payload.get(
+                "status_prompt_prefix_cache_eligible_segment_count"
+            ),
+            "status_prompt_prefix_signature": payload.get(
+                "status_prompt_prefix_signature"
+            ),
+            "status_prompt_prefix_previous_signature": payload.get(
+                "status_prompt_prefix_previous_signature"
+            ),
+            "status_prompt_prefix_changed": payload.get("status_prompt_prefix_changed"),
+            "status_prompt_prefix_change_reason": payload.get(
+                "status_prompt_prefix_change_reason"
+            ),
+            "status_provider_view_assembly_summary": payload.get(
+                "status_provider_view_assembly_summary"
             ),
             "status_background_summary": payload.get("status_background_summary"),
             "status_background_notification_count": payload.get("status_background_notification_count"),

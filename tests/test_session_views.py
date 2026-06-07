@@ -104,6 +104,26 @@ class SessionViewsTests(unittest.TestCase):
         self.assertIn("read_file:", rendered)
         self.assertIn("task_stop:", rendered)
 
+    def test_session_delegate_components_cover_runtime_history_project_context_and_background(self) -> None:
+        session = Session(SessionConfig(cwd=Path(__file__).resolve().parent, interactive=False))
+
+        session._runtime_state_component.runtime_budget_state_payload = lambda: {"owner": "runtime"}
+        session._history_memory_component.memory_surface_payload = lambda: {"owner": "history"}
+        session._project_context_component.describe_project_context = lambda section="summary": (
+            f"owner=project-context section={section}"
+        )
+        session._background_runtime_component.background_surface_payload = lambda: {
+            "owner": "background"
+        }
+
+        self.assertEqual(session.runtime_budget_state_payload(), {"owner": "runtime"})
+        self.assertEqual(session.memory_surface_payload(), {"owner": "history"})
+        self.assertEqual(
+            session.describe_project_context(section="skills"),
+            "owner=project-context section=skills",
+        )
+        self.assertEqual(session.background_surface_payload(), {"owner": "background"})
+
     def test_describe_permissions_explains_segment_aware_shell_rules(self) -> None:
         session = Session(SessionConfig(cwd=Path(__file__).resolve().parent, interactive=False))
 
@@ -4547,8 +4567,10 @@ class SessionViewsTests(unittest.TestCase):
 
             blocks = session.system_prompt_blocks()
             payload = session.system_prompt_surface_payload()
+            prefix_payload = session.prompt_prefix_surface_payload()
             rendered = session.build_system_prompt()
             context_summary = session.describe_context()
+            workflow = session.describe_status(section="workflow")
 
             self.assertTrue(any(block.kind == "prefix" for block in blocks))
             self.assertTrue(any(block.kind == "skills" for block in blocks))
@@ -4558,6 +4580,28 @@ class SessionViewsTests(unittest.TestCase):
             self.assertIsNotNone(payload["system_prompt_dynamic_boundary_index"])
             self.assertGreater(payload["system_prompt_prefix_chars"], 0)
             self.assertGreater(payload["system_prompt_dynamic_chars"], 0)
+            self.assertIn("system_prompt_static_signature", payload)
+            self.assertGreater(prefix_payload["prompt_prefix_segment_count"], 0)
+            self.assertEqual(prefix_payload["prompt_prefix_reduction_tier"], "none")
+            self.assertEqual(prefix_payload["prompt_prefix_cache_mode"], "provider_hinted")
+            self.assertTrue(prefix_payload["prompt_prefix_cache_supported"])
+            self.assertEqual(prefix_payload["prompt_prefix_cache_provider"], "anthropic")
+            self.assertIn("stable prefix preserved", prefix_payload["prompt_prefix_cache_summary"])
+            self.assertEqual(prefix_payload["prompt_prefix_planner_mode"], "provider_hinted")
+            self.assertIn("prompt_prefix_preserved_signature", prefix_payload)
+            self.assertGreaterEqual(
+                prefix_payload["prompt_prefix_preserved_message_group_count"], 0
+            )
+            self.assertEqual(prefix_payload["prompt_prefix_costed_planner_mode"], "under_budget")
+            self.assertEqual(prefix_payload["prompt_prefix_costed_planner_reason"], "under_budget")
+            self.assertEqual(prefix_payload["prompt_prefix_target_tokens_to_shed"], 0)
+            self.assertEqual(prefix_payload["prompt_prefix_remaining_estimated_overage"], 0)
+            self.assertEqual(prefix_payload["prompt_prefix_orchestration_mode"], "under_budget")
+            self.assertEqual(prefix_payload["prompt_prefix_orchestration_reason"], "under_budget")
+            self.assertEqual(
+                prefix_payload["prompt_prefix_orchestration_selected_candidate_summary"],
+                "none",
+            )
             self.assertIn("Auto-enabled project skills:", rendered)
             self.assertIn("Recent planning artifact to reuse when relevant:", rendered)
             self.assertIn("Compacted conversation context from earlier turns:", rendered)
@@ -4565,6 +4609,37 @@ class SessionViewsTests(unittest.TestCase):
             self.assertIn("dynamic boundary:", context_summary)
             self.assertIn("static prompt chars:", context_summary)
             self.assertIn("dynamic prompt chars:", context_summary)
+            self.assertIn("prompt prefix:", context_summary)
+            self.assertIn("provider-view assembly:", context_summary)
+            self.assertIn("prompt prefix cache mode:", context_summary)
+            self.assertIn("prompt prefix cache supported:", context_summary)
+            self.assertIn("prompt prefix cache provider:", context_summary)
+            self.assertIn("prompt prefix cache summary:", context_summary)
+            self.assertIn("prompt prefix cache fallback reason:", context_summary)
+            self.assertIn("provider-view planner:", context_summary)
+            self.assertIn("planner reason:", context_summary)
+            self.assertIn("costed planner mode:", context_summary)
+            self.assertIn("costed planner reason:", context_summary)
+            self.assertIn("target tokens to shed:", context_summary)
+            self.assertIn("selected candidates:", context_summary)
+            self.assertIn("remaining estimated overage:", context_summary)
+            self.assertIn("provider-view orchestration:", context_summary)
+            self.assertIn("orchestration reason:", context_summary)
+            self.assertIn("full compaction required:", context_summary)
+            self.assertIn("preserved prefix signature:", context_summary)
+            self.assertIn("preserved message groups:", context_summary)
+            self.assertIn("prefix reduction tier:", context_summary)
+            self.assertIn("prefix signature:", context_summary)
+            self.assertIn("prompt prefix cache mode:", workflow)
+            self.assertIn("prompt prefix cache provider:", workflow)
+            self.assertIn("provider-view planner:", workflow)
+            self.assertIn("prefix planner reason:", workflow)
+            self.assertIn("costed planner mode:", workflow)
+            self.assertIn("costed planner reason:", workflow)
+            self.assertIn("selected candidates:", workflow)
+            self.assertIn("provider-view orchestration:", workflow)
+            self.assertIn("orchestration reason:", workflow)
+            self.assertIn("preserved prefix signature:", workflow)
         finally:
             if cwd.exists():
                 shutil.rmtree(cwd)
@@ -4595,6 +4670,11 @@ class SessionViewsTests(unittest.TestCase):
             )
             self.assertIn("builtin:non-deferred=", first_payload["tool_schema_order_summary"])
             self.assertIn("mcp:non-deferred=", first_payload["tool_schema_order_summary"])
+            self.assertIn("tool_schema_signature", first_payload)
+            self.assertIn("prompt prefix:", workflow)
+            self.assertIn("provider-view assembly:", workflow)
+            self.assertIn("prefix reduction tier:", workflow)
+            self.assertIn("prefix signature:", workflow)
             self.assertIn("tool schema cache:", workflow)
             self.assertIn("tool schema order:", workflow)
 
@@ -4656,11 +4736,14 @@ class SessionViewsTests(unittest.TestCase):
             self.assertIn("tool-result artifacts active: 1", context_summary)
             self.assertIn("tool-result replacements active: 1", context_summary)
             self.assertIn("replacement-aware provider view: yes", context_summary)
+            self.assertIn("prefix reduction tier: artifact_indirection", context_summary)
             self.assertIn("tool-result replacement:", workflow)
             self.assertIn("tool-result artifact:", workflow)
+            self.assertIn("prefix reduction tier:", workflow)
             self.assertIn("tool-result artifacts: 1", compact_status)
             self.assertIn("tool-result replacements: 1", compact_status)
             self.assertIn("replacement-aware compaction: yes", compact_status)
+            self.assertIn("prefix reduction tier:", compact_status)
         finally:
             session.close()
 

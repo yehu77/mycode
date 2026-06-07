@@ -187,6 +187,7 @@ def _status_active_workflow_lines(
         )
         lines.extend(
             [
+                *session._prompt_prefix_narrative_lines(narrative=runtime_narrative),
                 "tool schema cache: "
                 + (
                     f"cached={tool_schema_surface.get('tool_schema_cached_count', 0)} "

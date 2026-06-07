@@ -13,10 +13,11 @@ Hosted product flows are intentionally out of scope unless they are required to 
 ## Current Status
 
 - The core local coding-agent runtime is implemented and usable.
-- The full Python test suite currently passes: `628 passed`.
+- The full Python test suite currently passes: `604 passed, 1 skipped`.
 - Project-local external plugin loading, session/resume continuity, and session-level working-set/file-context navigation are implemented and validated.
 - local plugin workflow depth now includes shared `/plugins` and `/plugin show` vocabulary, explicit contribution and diagnostics inspection, reload-state reporting, structured stdio/remote plugin metadata, and TUI plugin dashboard integration
 - `/context` now provides a dedicated REPL/headless context-usage surface aligned with the runtime prompt/tool chain.
+- the local runtime now includes shared budget/recovery mechanics plus a provider-view prompt-prefix planner with deterministic prefix signatures, reduction tiers, and replacement-aware assembly summaries across `/context`, `/status`, stdio/remote, and TUI
 - `/project-context` now provides a dedicated REPL/headless project memory / skills / plugins / reload-status inspection surface above the local context workflow.
 - `/files` and `/diff` now provide explicit REPL/headless entry surfaces for working-set files, focused file context, and diff-backed local work.
 - `/compact` now provides a manual conversation-compaction surface above the existing `context_summary` and auto-compaction path.
@@ -26,6 +27,7 @@ Hosted product flows are intentionally out of scope unless they are required to 
 - background-agent local scope now includes follow-up steering, main-session handoff notifications, runtime-grade progress metadata, and project-local agent definition inspection through `/agents`.
 - `/status` now acts as a shared session dashboard across REPL, TUI, stdio, and remote surfaces, including memory lifecycle, background notifications, runtime health, and stable action routing.
 - the local skills workflow now includes shared registry/reload/prompt-composition inspection across REPL, TUI, stdio, and remote, plus a dedicated TUI `Skill Registry` block.
+- `Session` now acts more cleanly as the facade/coordinator while runtime-state, history/memory, project-context, and background-runtime ownership are delegated to dedicated session collaborators.
 - Recent test hygiene work added `pytest.ini` collection guards and excludes transient cache/temp artifacts such as `pytest-cache-files-*`, `tests/_tmp*`, and test-local `.pyclaude` residue.
 
 ## Current Capabilities
@@ -51,6 +53,7 @@ Hosted product flows are intentionally out of scope unless they are required to 
 
 - shared session runtime with transcript persistence
 - tool-calling query loop with approval flow and change tracking
+- shared runtime budget state, prompt-too-long compact-retry recovery, and unified budget/progress narratives across `/context`, `/status`, stdio/remote, and TUI
 - default tool surfaces plus plugin-backed commands
 - task/checklist storage and task-detail views
 - isolated child/background workspaces with health tracking and cleanup/repair flows
@@ -59,6 +62,7 @@ Hosted product flows are intentionally out of scope unless they are required to 
 - a dedicated `/context` surface that estimates current prompt/tool context usage from the real runtime input chain
 - compact `/files` and `/diff` surfaces layered on top of the same focused-file and working-set model
 - explicit context paths that persist with saved sessions and contribute to the same working-set model with `explicit context path` scope reasoning
+- provider-view prompt assembly with prompt blocks, tool-schema caching, deterministic prompt-prefix signatures, explicit reduction tiers, and replacement/artifact/microcompact-aware provider-view planning
 
 ### Providers and MCP
 
@@ -510,6 +514,6 @@ python -m pytest --collect-only -q
 
 ## Related Documents
 
-- [../README.md](../README.md): repository overview and project positioning
 - [CLAUDE.md](CLAUDE.md): current implementation status and next-stage roadmap
 - [PARITY_MATRIX.md](PARITY_MATRIX.md): upstream-to-Python parity tracking for local-agent-relevant surfaces
+- [UPSTREAM_SOURCE_ALIGNMENT.md](UPSTREAM_SOURCE_ALIGNMENT.md): mechanism-depth comparison against the upstream Claude Code source implementation

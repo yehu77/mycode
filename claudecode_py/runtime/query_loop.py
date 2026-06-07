@@ -13,6 +13,10 @@ from ..providers.errors import (
     ProviderTimeoutError,
 )
 from .events import EventSink, RuntimeEvent, summarize_tool_input
+from .reduction_orchestration import (
+    ProviderViewReductionOrchestrationResult,
+    build_provider_view_reduction_orchestration,
+)
 from .tool_result_replacement import (
     ToolResultBudgetResult,
     apply_tool_result_budget_to_messages,
@@ -473,13 +477,95 @@ def _normalize_context_limit_reason(exc: ProviderContextLimitError, limit: int =
     return prefix + message
 
 
+def _emit_prompt_prefix_planner_events(
+    session: "Session",
+    cache_plan,
+    sink: EventSink,
+) -> None:
+    prefix_plan = getattr(cache_plan, "prefix_plan", None)
+    if prefix_plan is None:
+        return
+    summary = (
+        f"tier={prefix_plan.selected_reduction_tier} "
+        f"reason={prefix_plan.planner_reason} "
+        f"preserved_groups={prefix_plan.preserved_message_group_count} "
+        f"downgraded_groups={prefix_plan.downgraded_message_group_count}"
+    )
+    if session.prompt_prefix_planner_downgraded(prefix_plan):
+        sink(
+            RuntimeEvent(
+                kind="prompt_prefix_planner_downgraded",
+                message=summary,
+                replacement_reason=prefix_plan.planner_reason,
+            )
+        )
+        return
+    if (
+        prefix_plan.previous_preserved_signature is None
+        or prefix_plan.previous_preserved_signature != prefix_plan.preserved_prefix_signature
+    ):
+        sink(
+            RuntimeEvent(
+                kind="prompt_prefix_planner_applied",
+                message=summary,
+                replacement_reason=prefix_plan.planner_reason,
+            )
+        )
+
+
 def _create_message_with_retries(
     session: "Session",
     sink: EventSink,
     *,
     turn_user_prompt: str | None = None,
     messages_override: list[dict] | None = None,
+    assembly_override=None,
+    cache_plan_override=None,
 ):
+    if assembly_override is not None:
+        cache_plan = cache_plan_override or session.build_provider_prompt_cache_plan(
+            assembly_override,
+            previous_payload=session._last_prompt_prefix_assembly_payload,
+        )
+        session.mark_tool_result_ids_seen_from_messages(assembly_override.messages)
+        response, streamed_text = _create_provider_message_with_retries(
+            session.provider,
+            session=session,
+            messages=assembly_override.messages,
+            tools=assembly_override.tools,
+            system_prompt=assembly_override.system_prompt,
+            cache_plan=cache_plan,
+            sink=sink,
+            allow_streaming=not session.has_advisor_model(),
+        )
+        session.record_prompt_prefix_assembly(
+            assembly_override,
+            source="runtime",
+            cache_plan=cache_plan,
+        )
+        if cache_plan.provider_cache_fallback_reason not in {None, "", "none"}:
+            sink(
+                RuntimeEvent(
+                    kind="prompt_cache_hints_fallback",
+                    message=(
+                        f"provider={cache_plan.provider_cache_provider} "
+                        f"reason={cache_plan.provider_cache_fallback_reason}"
+                    ),
+                    is_error=True,
+                )
+            )
+        elif cache_plan.provider_cache_mode == "provider_hinted":
+            sink(
+                RuntimeEvent(
+                    kind="prompt_cache_hints_applied",
+                    message=(
+                        f"provider={cache_plan.provider_cache_provider} "
+                        f"summary={cache_plan.provider_cache_summary}"
+                    ),
+                )
+            )
+        _emit_prompt_prefix_planner_events(session, cache_plan, sink)
+        return response, streamed_text
     messages = messages_override or _messages_for_provider_call(
         session,
         turn_user_prompt=turn_user_prompt,
@@ -504,28 +590,49 @@ def _create_message_with_compact_recovery(
 ):
     attempted_recovery = False
     while True:
-        replacement_result = _replacement_aware_provider_view(
+        orchestration = _orchestrated_provider_view(
             session,
             turn_user_prompt=turn_user_prompt,
         )
-        _persist_and_emit_tool_result_replacement_events(session, replacement_result, sink)
+        _persist_and_emit_tool_result_replacement_events(
+            session,
+            orchestration.final_reduction_result,
+            sink,
+        )
         compacted = _enforce_message_budget(
             session,
             sink,
-            messages_override=replacement_result.messages,
+            messages_override=orchestration.final_messages,
         )
         if compacted:
-            replacement_result = _replacement_aware_provider_view(
+            orchestration = _orchestrated_provider_view(
                 session,
                 turn_user_prompt=turn_user_prompt,
             )
-            _persist_and_emit_tool_result_replacement_events(session, replacement_result, sink)
+            _persist_and_emit_tool_result_replacement_events(
+                session,
+                orchestration.final_reduction_result,
+                sink,
+            )
+        assembly = orchestration.final_assembly
+        cache_plan = orchestration.final_cache_plan
+        if compacted:
+            assembly = session.build_provider_prompt_assembly(
+                messages=orchestration.final_messages,
+                replacement_result=orchestration.final_reduction_result,
+                compacted_before_provider=True,
+            )
+            cache_plan = session.build_provider_prompt_cache_plan(
+                assembly,
+                previous_payload=session._last_prompt_prefix_assembly_payload,
+            )
+            _copy_orchestration_summary(orchestration, cache_plan)
         try:
             return _create_message_with_retries(
                 session,
                 sink,
-                turn_user_prompt=turn_user_prompt,
-                messages_override=replacement_result.messages,
+                assembly_override=assembly,
+                cache_plan_override=cache_plan,
             )
         except ProviderContextLimitError as exc:
             if attempted_recovery:
@@ -533,7 +640,7 @@ def _create_message_with_compact_recovery(
             preview = session._history_compaction_preview_payload()
             budget = session.refresh_runtime_budget_state(
                 preview=preview,
-                message_override=replacement_result.messages,
+                message_override=orchestration.final_messages,
             )
             if not bool(budget.get("would_compact")) or not bool(preview.get("would_compact")):
                 raise
@@ -565,13 +672,17 @@ def _create_message_with_compact_recovery(
                 trigger_reason=reason,
                 trigger="recovery",
             )
-            refreshed_view = _replacement_aware_provider_view(
+            refreshed_orchestration = _orchestrated_provider_view(
                 session,
                 turn_user_prompt=turn_user_prompt,
             )
-            _persist_and_emit_tool_result_replacement_events(session, refreshed_view, sink)
+            _persist_and_emit_tool_result_replacement_events(
+                session,
+                refreshed_orchestration.final_reduction_result,
+                sink,
+            )
             refreshed = session.refresh_runtime_budget_state(
-                message_override=refreshed_view.messages
+                message_override=refreshed_orchestration.final_messages
             )
             refreshed_state = str(refreshed.get("budget_state") or "ok")
             if refreshed_state in {"compact_needed", "hard_stop"}:
@@ -608,6 +719,7 @@ def _create_provider_message_with_retries(
     messages: list[dict],
     tools: list[dict],
     system_prompt: str,
+    cache_plan=None,
     sink: EventSink,
     allow_streaming: bool,
 ):
@@ -621,6 +733,7 @@ def _create_provider_message_with_retries(
                 messages=messages,
                 tools=tools,
                 system_prompt=system_prompt,
+                cache_plan=cache_plan,
                 sink=sink,
                 allow_streaming=allow_streaming,
             )
@@ -642,16 +755,48 @@ def _create_provider_message_with_retries(
 
 
 def _create_message_once(session: "Session", sink: EventSink):
-    replacement_result = _replacement_aware_provider_view(session)
-    _persist_and_emit_tool_result_replacement_events(session, replacement_result, sink)
-    return _create_provider_message_once(
+    orchestration = _orchestrated_provider_view(session)
+    _persist_and_emit_tool_result_replacement_events(
+        session,
+        orchestration.final_reduction_result,
+        sink,
+    )
+    assembly = orchestration.final_assembly
+    cache_plan = orchestration.final_cache_plan
+    session.mark_tool_result_ids_seen_from_messages(assembly.messages)
+    response, streamed_text = _create_provider_message_once(
         session.provider,
-        messages=replacement_result.messages,
-        tools=session.tool_specs(),
-        system_prompt=session.build_system_prompt(),
+        messages=assembly.messages,
+        tools=assembly.tools,
+        system_prompt=assembly.system_prompt,
+        cache_plan=cache_plan,
         sink=sink,
         allow_streaming=not session.has_advisor_model(),
     )
+    session.record_prompt_prefix_assembly(assembly, source="runtime", cache_plan=cache_plan)
+    if cache_plan.provider_cache_fallback_reason not in {None, "", "none"}:
+        sink(
+            RuntimeEvent(
+                kind="prompt_cache_hints_fallback",
+                message=(
+                    f"provider={cache_plan.provider_cache_provider} "
+                    f"reason={cache_plan.provider_cache_fallback_reason}"
+                ),
+                is_error=True,
+            )
+        )
+    elif cache_plan.provider_cache_mode == "provider_hinted":
+        sink(
+            RuntimeEvent(
+                kind="prompt_cache_hints_applied",
+                message=(
+                    f"provider={cache_plan.provider_cache_provider} "
+                    f"summary={cache_plan.provider_cache_summary}"
+                ),
+            )
+        )
+    _emit_prompt_prefix_planner_events(session, cache_plan, sink)
+    return response, streamed_text
 
 
 def _create_provider_message_once(
@@ -660,6 +805,7 @@ def _create_provider_message_once(
     messages: list[dict],
     tools: list[dict],
     system_prompt: str,
+    cache_plan=None,
     sink: EventSink,
     allow_streaming: bool,
 ):
@@ -673,10 +819,12 @@ def _create_provider_message_once(
     ):
         response = None
         streamed_text = False
-        for event in provider.stream_message(
+        for event in _stream_provider_message(
+            provider,
             messages=messages,
             tools=tools,
             system_prompt=system_prompt,
+            cache_plan=cache_plan,
         ):
             if event.kind == "text_delta" and event.text:
                 streamed_text = True
@@ -689,13 +837,63 @@ def _create_provider_message_once(
         return response, streamed_text
 
     return (
-        provider.create_message(
+        _create_provider_message(
+            provider,
             messages=messages,
             tools=tools,
             system_prompt=system_prompt,
+            cache_plan=cache_plan,
         ),
         False,
     )
+
+
+def _create_provider_message(provider, *, messages, tools, system_prompt, cache_plan):
+    if cache_plan is None:
+        return provider.create_message(
+            messages=messages,
+            tools=tools,
+            system_prompt=system_prompt,
+        )
+    try:
+        return provider.create_message(
+            messages=messages,
+            tools=tools,
+            system_prompt=system_prompt,
+            cache_plan=cache_plan,
+        )
+    except TypeError as exc:
+        if "cache_plan" not in str(exc):
+            raise
+        return provider.create_message(
+            messages=messages,
+            tools=tools,
+            system_prompt=system_prompt,
+        )
+
+
+def _stream_provider_message(provider, *, messages, tools, system_prompt, cache_plan):
+    if cache_plan is None:
+        return provider.stream_message(
+            messages=messages,
+            tools=tools,
+            system_prompt=system_prompt,
+        )
+    try:
+        return provider.stream_message(
+            messages=messages,
+            tools=tools,
+            system_prompt=system_prompt,
+            cache_plan=cache_plan,
+        )
+    except TypeError as exc:
+        if "cache_plan" not in str(exc):
+            raise
+        return provider.stream_message(
+            messages=messages,
+            tools=tools,
+            system_prompt=system_prompt,
+        )
 
 
 def _review_final_text_with_advisor(
@@ -1009,6 +1207,39 @@ def _replacement_aware_provider_view(
 ) -> ToolResultBudgetResult:
     messages = _messages_for_provider_call(session, turn_user_prompt=turn_user_prompt)
     return apply_tool_result_budget_to_messages(session, messages)
+
+
+def _orchestrated_provider_view(
+    session: "Session",
+    *,
+    turn_user_prompt: str | None = None,
+) -> ProviderViewReductionOrchestrationResult:
+    messages = _messages_for_provider_call(session, turn_user_prompt=turn_user_prompt)
+    return build_provider_view_reduction_orchestration(
+        session,
+        raw_messages=messages,
+        previous_payload=session._last_prompt_prefix_assembly_payload,
+    )
+
+
+def _copy_orchestration_summary(
+    orchestration: ProviderViewReductionOrchestrationResult,
+    cache_plan,
+) -> None:
+    cache_plan.orchestration_mode = orchestration.final_cache_plan.orchestration_mode
+    cache_plan.orchestration_reason = orchestration.final_cache_plan.orchestration_reason
+    cache_plan.orchestration_selected_candidate_count = (
+        orchestration.final_cache_plan.orchestration_selected_candidate_count
+    )
+    cache_plan.orchestration_selected_candidate_summary = (
+        orchestration.final_cache_plan.orchestration_selected_candidate_summary
+    )
+    cache_plan.orchestration_remaining_estimated_overage = (
+        orchestration.final_cache_plan.orchestration_remaining_estimated_overage
+    )
+    cache_plan.orchestration_requires_full_compaction = (
+        orchestration.final_cache_plan.orchestration_requires_full_compaction
+    )
 
 
 def _persist_and_emit_tool_result_replacement_events(

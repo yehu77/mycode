@@ -1,4 +1,5 @@
 from .advisor import AdvisorSessionComponent
+from .background_runtime import BackgroundRuntimeSessionComponent
 from .change_history_views import (
     change_stack_entry_action_groups,
     describe_change_stack,
@@ -51,7 +52,10 @@ from .file_context_views import (
     render_files_inventory_text,
     working_set_files_payload,
 )
+from .history_memory import HistoryMemorySessionComponent
 from .plan import PlanSessionComponent
+from .project_context import ProjectContextSessionComponent
+from .runtime_state import RuntimeStateSessionComponent
 from .summary_surfaces import (
     describe_config,
     describe_provider,
@@ -85,6 +89,7 @@ from .workflow_surface import (
 
 __all__ = [
     "AdvisorSessionComponent",
+    "BackgroundRuntimeSessionComponent",
     "change_stack_entry_action_groups",
     "describe_change_stack",
     "describe_config",
@@ -93,7 +98,9 @@ __all__ = [
     "focused_path_from_payload",
     "history_section_lines",
     "history_focus_summary_lines",
+    "HistoryMemorySessionComponent",
     "PlanSessionComponent",
+    "ProjectContextSessionComponent",
     "preferred_active_plan_execution_file_index",
     "preferred_active_plan_file_index",
     "preferred_active_plan_scout_file_index",
@@ -158,4 +165,5 @@ __all__ = [
     "render_summary_field_lines",
     "render_surface_metadata_section",
     "render_workflow_action_sections",
+    "RuntimeStateSessionComponent",
 ]

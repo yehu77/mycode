@@ -479,6 +479,58 @@ class QueryLoopTests(unittest.TestCase):
         self.assertEqual(runtime_budget["last_turn_token_count"], 18)
         self.assertTrue(runtime_budget["provider_usage_seen"])
 
+    def test_query_loop_emits_prompt_cache_hints_applied_for_cache_capable_provider(self) -> None:
+        session = Session(
+            SessionConfig(
+                cwd=Path(__file__).resolve().parent,
+                interactive=False,
+            )
+        )
+        events: list[RuntimeEvent] = []
+
+        class CacheAwareProvider:
+            def __init__(self) -> None:
+                self.capabilities = ProviderCapabilities(
+                    provider="anthropic",
+                    model="cache-model",
+                    supports_tool_calling=True,
+                    supports_streaming=False,
+                    supports_structured_output=False,
+                    supports_prompt_cache_hints=True,
+                    supports_system_prompt_cache_blocks=True,
+                    supports_tool_schema_cache_hints=True,
+                )
+                self.cache_plans = []
+
+            def create_message(self, *, messages, tools, system_prompt, cache_plan=None):
+                del messages, tools, system_prompt
+                self.cache_plans.append(cache_plan)
+                return AssistantResponse(
+                    content=[{"type": "text", "text": "done"}],
+                    text="done",
+                    tool_calls=[],
+                )
+
+        provider = CacheAwareProvider()
+        session.provider = provider
+
+        result = run_query_loop(session, "hello", sink=events.append)
+
+        self.assertEqual(result, "done")
+        non_null_cache_plans = [plan for plan in provider.cache_plans if plan is not None]
+        self.assertTrue(non_null_cache_plans)
+        self.assertEqual(non_null_cache_plans[0].provider_cache_mode, "provider_hinted")
+        self.assertIn(
+            non_null_cache_plans[0].orchestration_mode,
+            {"under_budget", "selected"},
+        )
+        self.assertTrue(any(event.kind == "prompt_cache_hints_applied" for event in events))
+        self.assertTrue(any(event.kind == "prompt_prefix_planner_applied" for event in events))
+        self.assertEqual(
+            session.prompt_prefix_surface_payload()["prompt_prefix_cache_mode"],
+            "provider_hinted",
+        )
+
     def test_query_loop_records_estimated_usage_in_runtime_budget_state(self) -> None:
         session = Session(
             SessionConfig(

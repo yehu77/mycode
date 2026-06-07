@@ -5,6 +5,7 @@ from typing import Any
 import os
 
 from ..models import AssistantResponse, ProviderStreamEvent, TokenUsage, ToolCall
+from ..runtime.provider_cache import ProviderPromptCachePlan
 from .capabilities import ProviderCapabilities
 from .errors import (
     ProviderCapabilityError,
@@ -29,6 +30,9 @@ class AnthropicProvider:
             supports_tool_calling=True,
             supports_streaming=True,
             supports_structured_output=False,
+            supports_prompt_cache_hints=True,
+            supports_system_prompt_cache_blocks=True,
+            supports_tool_schema_cache_hints=True,
             notes="Anthropic tool use and SDK streaming are enabled.",
         )
 
@@ -53,15 +57,16 @@ class AnthropicProvider:
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]],
         system_prompt: str,
+        cache_plan: ProviderPromptCachePlan | None = None,
     ) -> AssistantResponse:
         client = self._ensure_client()
         try:
-            response = client.messages.create(
-                model=self.model,
-                max_tokens=self.max_tokens,
-                system=system_prompt,
+            response = self._create_with_optional_cache_hints(
+                client,
                 messages=messages,
                 tools=tools,
+                system_prompt=system_prompt,
+                cache_plan=cache_plan,
             )
         except Exception as exc:  # noqa: BLE001
             raise self._wrap_error(exc) from exc
@@ -74,15 +79,16 @@ class AnthropicProvider:
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]],
         system_prompt: str,
+        cache_plan: ProviderPromptCachePlan | None = None,
     ) -> Iterator[ProviderStreamEvent]:
         client = self._ensure_client()
         try:
-            with client.messages.stream(
-                model=self.model,
-                max_tokens=self.max_tokens,
-                system=system_prompt,
+            with self._stream_with_optional_cache_hints(
+                client,
                 messages=messages,
                 tools=tools,
+                system_prompt=system_prompt,
+                cache_plan=cache_plan,
             ) as stream:
                 for text in stream.text_stream:
                     if text:
@@ -95,6 +101,123 @@ class AnthropicProvider:
             kind="response",
             response=self._build_response_from_message(final_message),
         )
+
+    def _create_with_optional_cache_hints(
+        self,
+        client,
+        *,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        system_prompt: str,
+        cache_plan: ProviderPromptCachePlan | None,
+    ):
+        hinted_kwargs = self._request_kwargs(
+            messages=messages,
+            tools=tools,
+            system_prompt=system_prompt,
+            cache_plan=cache_plan,
+        )
+        try:
+            return client.messages.create(**hinted_kwargs)
+        except Exception as exc:  # noqa: BLE001
+            if not self._should_fallback_cache_plan(exc, cache_plan):
+                raise
+            assert cache_plan is not None
+            cache_plan.mark_fallback(self._cache_plan_fallback_reason(exc))
+            return client.messages.create(
+                **self._request_kwargs(
+                    messages=messages,
+                    tools=tools,
+                    system_prompt=system_prompt,
+                    cache_plan=None,
+                )
+            )
+
+    def _stream_with_optional_cache_hints(
+        self,
+        client,
+        *,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        system_prompt: str,
+        cache_plan: ProviderPromptCachePlan | None,
+    ):
+        hinted_kwargs = self._request_kwargs(
+            messages=messages,
+            tools=tools,
+            system_prompt=system_prompt,
+            cache_plan=cache_plan,
+        )
+        try:
+            return client.messages.stream(**hinted_kwargs)
+        except Exception as exc:  # noqa: BLE001
+            if not self._should_fallback_cache_plan(exc, cache_plan):
+                raise
+            assert cache_plan is not None
+            cache_plan.mark_fallback(self._cache_plan_fallback_reason(exc))
+            return client.messages.stream(
+                **self._request_kwargs(
+                    messages=messages,
+                    tools=tools,
+                    system_prompt=system_prompt,
+                    cache_plan=None,
+                )
+            )
+
+    def _request_kwargs(
+        self,
+        *,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        system_prompt: str,
+        cache_plan: ProviderPromptCachePlan | None,
+    ) -> dict[str, Any]:
+        request_tools = tools
+        request_system: str | list[dict[str, Any]] = system_prompt
+        if (
+            cache_plan is not None
+            and cache_plan.provider_cache_mode == "provider_hinted"
+            and self.capabilities.supports_prompt_cache_hints
+        ):
+            if cache_plan.system_prompt_blocks:
+                request_system = [dict(block) for block in cache_plan.system_prompt_blocks]
+            request_tools = [dict(tool) for tool in cache_plan.tools]
+        return {
+            "model": self.model,
+            "max_tokens": self.max_tokens,
+            "system": request_system,
+            "messages": messages,
+            "tools": request_tools,
+        }
+
+    def _should_fallback_cache_plan(
+        self,
+        exc: Exception,
+        cache_plan: ProviderPromptCachePlan | None,
+    ) -> bool:
+        if cache_plan is None or cache_plan.provider_cache_mode != "provider_hinted":
+            return False
+        status_code = getattr(exc, "status_code", None)
+        message = str(exc).lower()
+        if status_code not in {400, 422} and "extra inputs are not permitted" not in message:
+            return False
+        cache_markers = (
+            "cache_control",
+            "cache control",
+            "cache scope",
+            "system",
+            "input should be",
+            "extra inputs are not permitted",
+        )
+        return any(marker in message for marker in cache_markers)
+
+    def _cache_plan_fallback_reason(self, exc: Exception) -> str:
+        status_code = getattr(exc, "status_code", None)
+        prefix = f"status={status_code} " if status_code is not None else ""
+        message = " ".join(str(exc).strip().split())
+        if len(message) > 160:
+            message = message[:157] + "..."
+        return prefix + message
 
     def _wrap_error(self, exc: Exception):
         status_code = getattr(exc, "status_code", None)

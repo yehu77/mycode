@@ -4,9 +4,7 @@ This document tracks parity between the upstream Claude Code source tree in `../
 
 It is intentionally scoped to the local coding-agent goal of this project.
 
-For a deeper runtime-only comparison of the upstream `query/context/state/tools`
-chain versus the Python implementation, see
-`CORE_RUNTIME_DIFF_MATRIX.md`.
+For mechanism-depth comparison against the upstream source implementation, see `UPSTREAM_SOURCE_ALIGNMENT.md`. This matrix stays high-level and decision-oriented.
 
 ## Status Legend
 
@@ -58,7 +56,7 @@ The project is not targeting full hosted product parity.
 
 | Upstream subsystem | Upstream source area | Python equivalent | Status | Notes |
 |---|---|---|---|---|
-| Session runtime and message loop | `src/query/*`, `src/context/*`, `src/state/*`, `src/tools/*` | `claudecode_py/runtime/*`, `session.py`, `tools/*` | Implemented | This is one of the strongest parts of the Python port, now including a shared runtime budget state, compact-retry recovery for prompt-too-long failures, unified budget/progress narratives across `/context` and `/status`, and richer runtime-progress summaries for local consumers |
+| Session runtime and message loop | `src/query/*`, `src/context/*`, `src/state/*`, `src/tools/*` | `claudecode_py/runtime/*`, `session.py`, `tools/*` | Implemented | This is one of the strongest parts of the Python port, now including a shared runtime budget state, compact-retry recovery for prompt-too-long failures, unified budget/progress narratives across `/context` and `/status`, richer runtime-progress summaries for local consumers, and a provider-view prompt-prefix planner with deterministic prefix signatures and reduction tiers |
 | Tool orchestration and approvals | `src/tools/*`, permission/context layers | `runtime/context.py`, `runtime/query_loop.py`, tool set, permission manager | Implemented | Local tool-call loop and approval handling are in place, with richer lifecycle events for batches, approval wait, result summaries, budget pressure, and compact recovery now flowing through stdio/remote/TUI and background progress surfaces |
 | Transcript / persistence | session/state/storage layers | `storage/transcript.py`, session persistence, checklist/task storage | Implemented | Local persistence is strong and test-covered |
 | Provider abstraction | model/provider layers | `providers/anthropic.py`, `providers/openai_compatible.py` | Implemented | Practical local coverage is present |
@@ -71,7 +69,7 @@ The project is not targeting full hosted product parity.
 | Symbol indexing / navigation | IDE/context/navigation surfaces | `indexing/*`, IDE action commands, `/symbol` | Implemented | Local parity is strong for Python/JS/TS repository navigation |
 | Session continuity and resume UX | session restore / resume / attach surfaces | `session_factory.py`, `storage/transcript.py`, `service/stdio.py`, CLI resume/attach flow | Implemented | Saved-session restore, latest-session restore, workspace fallback handling, and live-vs-saved continuation semantics are implemented and aligned across CLI/service surfaces |
 | Workspace / file-context ergonomics | local context, diff, and file-navigation surfaces | `session.py`, `session_components/*`, `tui/*` focused file-context and working-set workflow | Partial | Focused-file navigation and session-level working-set cohesion across change/task/plan/status surfaces are implemented, and REPL/headless `/files`, `/add-dir`, `/diff`, `/changes`, and `/workspaces` now expose deeper inspection and explicit context curation on top of the same local model while `/context` covers usage inspection; remaining work is additive workflow polish rather than basic capability gaps |
-| Session architecture ownership | implicit session/state ownership across upstream modules | `session.py` plus `session_components/workspace.py`, `task_detail.py`, `symbol_surface.py`, `advisor.py`, `plan.py` | Partial | `Session` is now a much thinner facade and the main responsibility slices have dedicated owners, but small residue cleanup may continue |
+| Session architecture ownership | implicit session/state ownership across upstream modules | `session.py` plus `session_components/*` collaborators for workspace, task detail, symbol surface, advisor, plan, runtime state, history/memory, project-context, and background runtime | Implemented | `Session` now acts primarily as the facade/coordinator while the main runtime, history/memory, project-context, and background-progress slices have explicit owners; remaining work is narrow residue cleanup rather than a major ownership gap |
 
 ## Current Read of Overall Parity
 
@@ -101,7 +99,7 @@ The project is not targeting full hosted product parity.
 - TUI/product shell breadth outside the local workflow
 - remaining file/context/diff breadth outside the now-implemented focused-file, working-set, `/context` usage, `/files`, and `/diff` workflow
 - remaining local workflow polish beyond the current working-set, `/context` usage, `/files`, and `/diff` model
-- deeper prompt-assembly/context-prefix mechanics and broader hosted transport/runtime breadth beyond the now-complete local runtime budget/progress line
+- broader hosted transport/runtime breadth and provider-native cache-control/product infrastructure beyond the now-complete local runtime budget/progress and prompt-prefix lines
 
 ### Explicitly Not Targeted
 
