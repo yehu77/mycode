@@ -1,10 +1,10 @@
-# Python ClaudeCode Status
+# Python Codex Status
 
-This file is the working engineering ledger for the Python ClaudeCode reproduction effort.
+This file is the working engineering ledger for the Python Codex reproduction effort.
 
 ## Goal
 
-Build and maintain a locally usable coding agent in Python that reproduces the core Claude Code local workflow:
+Build and maintain a locally usable coding agent in Python that reproduces the core Codex local workflow:
 
 - prompt -> model -> tool loop
 - planning, read-only scout flows, and execution review surfaces
@@ -124,12 +124,6 @@ Operationally, this is beyond skeleton status. It is already a usable local codi
 - smaller maintainability cleanups around the now-deeper runtime, prompt-prefix, and surface helpers
 - additive TUI workflow polish beyond the already-implemented local dashboard and inspection depth
 - selective, capability-gated experiments only if we later choose to get closer to provider-native cache-control/runtime breadth without widening the default local-first scope
-
-### Provider-View Runtime Follow-Up
-
-- Current Shape: the provider-view path already has prompt blocks, tool-schema caching, deterministic prefix signatures, replacement/artifact indirection, cost-aware prefix planning, and plan-first reduction orchestration for main-turn and compact-retry calls.
-- Current Boundary: the remaining gap is refinement rather than missing mechanism, with heuristic local costing, conservative candidate search, and narrower orchestration coverage outside the main turn.
-- Remaining Work: if this line is reopened, prioritize deeper candidate sequencing, tighter preserved-prefix accounting, and better workflow consumption in `/context`, `/status workflow`, TUI, stdio, and remote before widening provider breadth.
 
 ## Current Repo Health
 
