@@ -14,6 +14,7 @@ from .local_commands import (
     handle_model_command,
     handle_permissions_command,
     handle_plan_command,
+    handle_planning_command,
     handle_project_context_command,
     handle_rewind_command,
     handle_sessions_command,
@@ -117,8 +118,13 @@ def build_core_commands() -> list[ReplCommand]:
         ),
         ReplCommand(
             "/plan",
-            "Inspect or manage planning artifacts",
+            "Enter plan mode, show the current plan file, or continue a planning request",
             lambda session, args: handle_plan_command(session, args),
+        ),
+        ReplCommand(
+            "/planning",
+            "Inspect or manage planning artifacts and planning history",
+            lambda session, args: handle_planning_command(session, args),
         ),
         ReplCommand(
             "/permissions",
@@ -266,7 +272,7 @@ def _clear_command(session: "Session", args: str) -> str:
     if raw == "symbol":
         return session.clear_symbol_surface()
     if raw == "plan":
-        return session.clear_active_plan()
+        return session.clear_plan_runtime_state()
     if raw == "session":
         return str(session.clear_session_reset().get("text", ""))
     return "Usage: /clear [history|changes|symbol|plan|session]"

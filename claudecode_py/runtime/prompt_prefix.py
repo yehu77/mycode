@@ -4,7 +4,11 @@ from dataclasses import dataclass
 from hashlib import sha256
 from typing import Any, TYPE_CHECKING
 
-from ..prompts import SystemPromptBlock, render_system_prompt_blocks
+from ..prompts import (
+    PromptAttachment,
+    SystemPromptBlock,
+    render_provider_system_prompt,
+)
 from .tool_result_replacement import ToolResultBudgetResult
 from .tool_schema_cache import canonical_json
 
@@ -29,6 +33,7 @@ class PrefixSegment:
 class PromptPrefixAssemblyResult:
     system_prompt: str
     system_prompt_blocks: tuple[SystemPromptBlock, ...]
+    prompt_attachments: tuple[PromptAttachment, ...]
     tools: list[dict[str, Any]]
     messages: list[dict[str, Any]]
     segments: tuple[PrefixSegment, ...]
@@ -45,6 +50,9 @@ class PromptPrefixAssemblyResult:
     replacement_aware_provider_view: bool
     microcompact_aware_provider_view: bool
     provider_view_message_count: int
+    prompt_attachment_count: int
+    prompt_attachment_kinds: tuple[str, ...]
+    prompt_attachment_summaries: tuple[str, ...]
     microcompacted_message_group_count: int
     microcompacted_message_group_indices: tuple[int, ...]
     replacement_count: int
@@ -63,6 +71,7 @@ def build_prompt_prefix_assembly(
     session: "Session",
     messages: list[dict[str, Any]],
     system_prompt_blocks: list[SystemPromptBlock],
+    prompt_attachments: list[PromptAttachment],
     tools: list[dict[str, Any]],
     replacement_result: ToolResultBudgetResult | None = None,
     active_replacement_count: int = 0,
@@ -94,6 +103,20 @@ def build_prompt_prefix_assembly(
         )
         if stable:
             stable_segment_signatures.append(signature)
+
+    for index, attachment in enumerate(prompt_attachments):
+        text = str(attachment.text or "")
+        signature = _signature_for_text(text)
+        segments.append(
+            PrefixSegment(
+                segment_id=f"prompt_attachment:{index}:{attachment.kind}",
+                kind=f"prompt_attachment:{attachment.kind}",
+                stable=False,
+                char_count=len(text),
+                signature=signature,
+                summary=attachment.summary,
+            )
+        )
 
     tool_bundle = canonical_json(tools)
     segments.append(
@@ -195,8 +218,9 @@ def build_prompt_prefix_assembly(
         active_artifact_count=active_artifact_count,
     )
     return PromptPrefixAssemblyResult(
-        system_prompt=render_system_prompt_blocks(system_prompt_blocks),
+        system_prompt=render_provider_system_prompt(system_prompt_blocks, prompt_attachments),
         system_prompt_blocks=tuple(system_prompt_blocks),
+        prompt_attachments=tuple(prompt_attachments),
         tools=list(tools),
         messages=list(messages),
         segments=tuple(segments),
@@ -219,6 +243,9 @@ def build_prompt_prefix_assembly(
         ),
         microcompact_aware_provider_view=bool(microcompact_count),
         provider_view_message_count=len(messages),
+        prompt_attachment_count=len(prompt_attachments),
+        prompt_attachment_kinds=tuple(attachment.kind for attachment in prompt_attachments),
+        prompt_attachment_summaries=tuple(attachment.summary for attachment in prompt_attachments),
         microcompacted_message_group_count=len(
             replacement_result.microcompacted_message_group_indices
         )
@@ -268,6 +295,40 @@ def prompt_prefix_surface_payload_from_assembly(
         str(previous_payload.get("prompt_prefix_tool_schema_signature") or "").strip() or None
     )
     changed = bool(previous_signature) and previous_signature != assembly.stable_prefix_signature
+    attachment_mode = _attachment_mode_from_summaries(
+        assembly.prompt_attachment_summaries,
+        assembly.prompt_attachment_kinds,
+    )
+    previous_attachment_mode = (
+        str(previous_payload.get("prompt_prefix_attachment_mode") or "").strip() or "none"
+    )
+    previous_attachment_summary = (
+        ",".join(
+            str(item)
+            for item in (previous_payload.get("prompt_prefix_attachment_summaries") or [])
+            if str(item)
+        )
+        or "none"
+    )
+    current_attachment_summary = (
+        ",".join(assembly.prompt_attachment_summaries)
+        if assembly.prompt_attachment_summaries
+        else "none"
+    )
+    previous_workflow_mode = (
+        str(previous_payload.get("plan_workflow_mode") or "").strip() or "none"
+    )
+    current_workflow_mode = _attachment_workflow_mode_from_summaries(
+        assembly.prompt_attachment_summaries
+    )
+    attachment_change_reason = _attachment_change_reason(
+        previous_attachment_mode=previous_attachment_mode,
+        current_attachment_mode=attachment_mode,
+        previous_attachment_summary=previous_attachment_summary,
+        current_attachment_summary=current_attachment_summary,
+        previous_workflow_mode=previous_workflow_mode,
+        current_workflow_mode=current_workflow_mode,
+    )
     if not previous_signature:
         change_reason = "none"
     elif not changed:
@@ -293,7 +354,24 @@ def prompt_prefix_surface_payload_from_assembly(
         "prompt_prefix_change_reason": change_reason,
         "prompt_prefix_provider_view_summary": (
             f"replacement-aware={'yes' if assembly.replacement_aware_provider_view else 'no'} "
-            f"microcompact-aware={'yes' if assembly.microcompact_aware_provider_view else 'no'}"
+            f"microcompact-aware={'yes' if assembly.microcompact_aware_provider_view else 'no'} "
+            f"attachments={','.join(assembly.prompt_attachment_kinds) if assembly.prompt_attachment_kinds else 'none'} "
+            f"attachment_mode={attachment_mode}"
+        ),
+        "prompt_prefix_attachment_count": assembly.prompt_attachment_count,
+        "prompt_prefix_attachment_summary": (
+            ",".join(assembly.prompt_attachment_kinds) if assembly.prompt_attachment_kinds else "none"
+        ),
+        "prompt_prefix_attachment_kinds": list(assembly.prompt_attachment_kinds),
+        "prompt_prefix_attachment_summaries": list(assembly.prompt_attachment_summaries),
+        "prompt_prefix_attachment_mode": attachment_mode,
+        "prompt_prefix_attachment_change_reason": attachment_change_reason,
+        "prompt_prefix_plan_mode_attachment_active": "plan_mode" in assembly.prompt_attachment_kinds,
+        "prompt_prefix_plan_mode_reentry_attachment_active": (
+            "plan_mode_reentry" in assembly.prompt_attachment_kinds
+        ),
+        "prompt_prefix_plan_mode_exit_attachment_active": (
+            "plan_mode_exit" in assembly.prompt_attachment_kinds
         ),
         "prompt_prefix_replacement_aware_provider_view": assembly.replacement_aware_provider_view,
         "prompt_prefix_microcompact_aware_provider_view": assembly.microcompact_aware_provider_view,
@@ -343,3 +421,54 @@ def _signature_for_parts(parts: list[str]) -> str:
 
 def _signature_for_text(text: str) -> str:
     return sha256(str(text or "").encode("utf-8")).hexdigest()[:16]
+
+
+def _attachment_mode_from_summaries(
+    summaries: tuple[str, ...],
+    kinds: tuple[str, ...],
+) -> str:
+    if any(summary.startswith("plan_mode_exit:") for summary in summaries):
+        return "exit"
+    if any(summary.startswith("plan_mode_reentry:") for summary in summaries):
+        return "reentry"
+    if any(summary.endswith(":sparse") for summary in summaries):
+        return "sparse"
+    if any(summary.endswith(":full") for summary in summaries):
+        return "full"
+    if "plan_mode" in kinds:
+        return "full"
+    return "none"
+
+
+def _attachment_workflow_mode_from_summaries(summaries: tuple[str, ...]) -> str:
+    for summary in summaries:
+        if ":interview" in summary:
+            return "interview"
+        if ":five_phase" in summary:
+            return "five_phase"
+    return "none"
+
+
+def _attachment_change_reason(
+    *,
+    previous_attachment_mode: str,
+    current_attachment_mode: str,
+    previous_attachment_summary: str,
+    current_attachment_summary: str,
+    previous_workflow_mode: str,
+    current_workflow_mode: str,
+) -> str:
+    if previous_attachment_summary == "none":
+        return "none"
+    if previous_attachment_mode == "reentry" and current_attachment_mode in {"full", "sparse"}:
+        return "reentry_consumed"
+    if previous_attachment_mode == "exit" and current_attachment_mode == "none":
+        return "exit_consumed"
+    if previous_workflow_mode != "none" and current_workflow_mode != "none":
+        if previous_workflow_mode != current_workflow_mode:
+            return "workflow_family_change"
+    if previous_attachment_mode == current_attachment_mode:
+        if previous_attachment_summary != current_attachment_summary:
+            return "attachment_content_change"
+        return "none"
+    return "attachment_mode_change"

@@ -21,12 +21,14 @@ class PluginSkillDefinition:
     path: Path | None = None
 
     def to_loaded_skill(self, *, cwd: Path, plugin_name: str) -> LoadedSkill:
+        resolved_path = (
+            self.path
+            or (cwd / ".pyclaude" / "plugins" / plugin_name / f"{self.name}.md").resolve()
+        )
         return LoadedSkill(
             name=self.name,
-            path=(
-                self.path
-                or (cwd / ".pyclaude" / "plugins" / plugin_name / f"{self.name}.md").resolve()
-            ),
+            path=resolved_path,
+            skill_root=resolved_path.parent,
             content=self.content,
             description=self.description,
             auto_enable=self.auto_enable,

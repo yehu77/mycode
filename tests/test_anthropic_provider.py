@@ -103,6 +103,47 @@ class AnthropicProviderStreamingTests(unittest.TestCase):
             {"type": "ephemeral", "scope": "org"},
         )
 
+    def test_create_message_applies_model_and_effort_overrides(self) -> None:
+        provider = AnthropicProvider(
+            model="claude-sonnet",
+            max_tokens=256,
+            api_key="k",
+        )
+
+        class FakeMessages:
+            def __init__(self) -> None:
+                self.calls = []
+
+            def create(self, **kwargs):
+                self.calls.append(kwargs)
+                return SimpleNamespace(
+                    content=[SimpleNamespace(type="text", text="done")],
+                    stop_reason="end_turn",
+                    usage=None,
+                )
+
+        fake_messages = FakeMessages()
+        provider._client = SimpleNamespace(messages=fake_messages)
+
+        response = provider.create_message(
+            messages=[{"role": "user", "content": [{"type": "text", "text": "hi"}]}],
+            tools=[],
+            system_prompt="system",
+            model_override="claude-opus-4-6",
+            effort_override="high",
+        )
+
+        self.assertEqual(response.text, "done")
+        self.assertEqual(fake_messages.calls[0]["model"], "claude-opus-4-6")
+        self.assertEqual(
+            fake_messages.calls[0]["extra_headers"],
+            {"anthropic-beta": "effort-2025-11-24"},
+        )
+        self.assertEqual(
+            fake_messages.calls[0]["extra_body"],
+            {"output_config": {"effort": "high"}},
+        )
+
     def test_create_message_falls_back_to_plain_path_when_cache_hints_are_rejected(self) -> None:
         provider = AnthropicProvider(
             model="claude-test",

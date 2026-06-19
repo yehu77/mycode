@@ -33,6 +33,9 @@ class CommandRegistry:
     def add_command(self, command: ReplCommand) -> None:
         self._commands[command.name] = command
 
+    def has_command(self, name: str) -> bool:
+        return name in self._commands
+
     def render_help(self) -> str:
         lines = ["Available REPL commands:"]
         width = max((len(name) for name in self._commands), default=0)

@@ -1818,6 +1818,9 @@ class TuiStateTests(unittest.TestCase):
                 "status_prompt_prefix_segment_count": 9,
                 "status_prompt_prefix_stable_chars": 1400,
                 "status_prompt_prefix_dynamic_tail_chars": 260,
+                "status_prompt_prefix_attachment_summary": "plan_mode",
+                "status_prompt_prefix_attachment_mode": "full",
+                "status_prompt_prefix_attachment_change_reason": "none",
                 "status_prompt_prefix_reduction_tier": "artifact_indirection",
                 "status_prompt_prefix_planner_mode": "provider_hinted",
                 "status_prompt_prefix_planner_reason": "artifact_indirection_active",
@@ -1842,6 +1845,15 @@ class TuiStateTests(unittest.TestCase):
                 "status_prompt_prefix_previous_signature": "prefixsig0000000",
                 "status_prompt_prefix_changed": True,
                 "status_prompt_prefix_change_reason": "provider_view_messages",
+                "status_plan_workflow_mode": "five_phase",
+                "status_plan_workflow_phase_family": "five_phase",
+                "status_plan_workflow_branch_identity": "five_phase_branch",
+                "status_plan_workflow_agent_count": 1,
+                "status_plan_workflow_explore_agent_count": 3,
+                "status_plan_instruction_state": "plan_mode_active",
+                "status_plan_instruction_attachment_mode": "full",
+                "status_plan_instruction_reentry_active": False,
+                "status_plan_instruction_exit_active": False,
                 "status_provider_view_assembly_summary": "replacement-aware=yes microcompact-aware=no",
                 "status_working_set_summary": "mix: diff_backed=1 context_only=0 explicit=0 task=0 plan=0 change=1",
                 "status_focused_file_summary": "demo.py (change)",
@@ -1964,6 +1976,14 @@ class TuiStateTests(unittest.TestCase):
         self.assertIn("status_workspace_primary_action: workspace_cleanup_preview", rendered)
         self.assertIn("runtime progress: read_file: waiting for approval (read)", rendered)
         self.assertIn("active tool: waiting_for_approval read_file", rendered)
+        self.assertIn("plan attachments: plan_mode", rendered)
+        self.assertIn("plan attachment mode: full", rendered)
+        self.assertIn("plan workflow: five_phase agents=1 explore_agents=3", rendered)
+        self.assertIn("plan workflow branch: five_phase_branch", rendered)
+        self.assertIn(
+            "plan attachment state: plan_mode_active mode=full reentry=no exit=no",
+            rendered,
+        )
         self.assertIn('active tool input: {"path":"demo.py"}', rendered)
         self.assertIn("last tool outcome: read_file | ok | ok (25ms)", rendered)
         self.assertIn("parallel batch: active size=2", rendered)

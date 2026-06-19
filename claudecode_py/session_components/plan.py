@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import difflib
 from datetime import datetime
@@ -115,7 +115,7 @@ class PlanSessionComponent:
     ) -> str:
         artifact = self.active_planning_artifact()
         if artifact is None:
-            return "No active planning artifact for /plan scouts."
+            return "No active planning artifact for /planning scouts."
         snapshots = self._planning_artifact_scout_snapshots(artifact)
         scout_context = self._session.resolve_active_plan_scout_file_context(  # noqa: SLF001
             selected_index=selected_index,
@@ -145,10 +145,10 @@ class PlanSessionComponent:
                             selected_snapshot["task_id"]
                         ),
                         file_index=effective_file_index,
-                        parent_command="/plan scouts",
+                        parent_command="/planning scouts",
                         category_label="category",
                         category_value=str(selected_snapshot.get("category") or "(unknown)"),
-                        stay_actions=["/plan scouts"],
+                        stay_actions=["/planning scouts"],
                     )
                 )
             detail_lines = self._render_planning_artifact_scout_detail(
@@ -201,7 +201,7 @@ class PlanSessionComponent:
                     parent_actions=[
                         self._focus_preserving_task_show_action(str(selected_snapshot["task_id"]))
                     ],
-                    stay_actions=["/plan scouts"],
+                    stay_actions=["/planning scouts"],
                     file_index=effective_file_index,
                 )
             )
@@ -229,7 +229,7 @@ class PlanSessionComponent:
     ) -> str:
         artifact = self.active_planning_artifact()
         if artifact is None:
-            return "No active planning artifact for /plan execution."
+            return "No active planning artifact for /planning execution."
         snapshots = self._planning_artifact_execution_snapshots(artifact)
         execution_context = self._session.resolve_active_plan_execution_file_context(  # noqa: SLF001
             selected_index=selected_index,
@@ -262,11 +262,11 @@ class PlanSessionComponent:
                             selected_snapshot["task_id"]
                         ),
                         file_index=effective_file_index,
-                        parent_command="/plan execution",
+                        parent_command="/planning execution",
                         category_label="phase",
                         category_value=str(selected_snapshot.get("phase") or "(unknown)"),
                         extra_bits=[f"plan_status={selected_snapshot.get('plan_status', '(unknown)')}"],
-                        stay_actions=["/plan execution", "/plan advisor", "/advisor status"],
+                        stay_actions=["/planning execution", "/planning advisor", "/advisor status"],
                     )
                 )
             detail_lines = self._render_planning_artifact_execution_detail(
@@ -306,7 +306,7 @@ class PlanSessionComponent:
                 "selected_execution_task_action: "
                 + self._focus_preserving_task_show_action(str(selected_snapshot["task_id"]))
             )
-            lines.append("selected_execution_plan_advisor_action: /plan advisor")
+            lines.append("selected_execution_plan_advisor_action: /planning advisor")
             lines.append("selected_execution_advisor_status_action: /advisor status")
             selected_task_context = self._session.resolve_task_file_context(  # noqa: SLF001
                 str(selected_snapshot["task_id"]),
@@ -329,7 +329,7 @@ class PlanSessionComponent:
                     parent_actions=[
                         self._focus_preserving_task_show_action(str(selected_snapshot["task_id"]))
                     ],
-                    stay_actions=["/plan execution", "/plan advisor", "/advisor status"],
+                    stay_actions=["/planning execution", "/planning advisor", "/advisor status"],
                     file_index=effective_file_index,
                 )
             )
@@ -562,7 +562,7 @@ class PlanSessionComponent:
         artifact_id = kwargs.get("artifact_id")
         artifact = self._resolve_timeline_artifact(artifact_id)
         if artifact is None:
-            return "No active planning artifact for /plan timeline."
+            return "No active planning artifact for /planning timeline."
         normalized_filter = self._normalize_timeline_kind_filter(kind_filter)
         normalized_delta = self._normalize_timeline_delta_mode(delta_mode)
         normalized_phase = self._normalize_timeline_phase_filter(phase_filter)
@@ -695,17 +695,17 @@ class PlanSessionComponent:
                 include_empty=False,
             )
         )
-        lines.append("- /plan timeline all")
-        lines.append("- /plan timeline execution")
-        lines.append("- /plan timeline advisor")
-        lines.append("- /plan timeline all delta=after-drift")
-        lines.append("- /plan timeline all focus=execution")
-        lines.append("- /plan timeline all compare=after-drift-vs-all")
-        lines.append("- /plan timeline all compare=execution-vs-scout")
-        lines.append("- /plan scouts")
-        lines.append("- /plan execution")
-        lines.append("- /plan advisor")
-        lines.append("- /plan lineage")
+        lines.append("- /planning timeline all")
+        lines.append("- /planning timeline execution")
+        lines.append("- /planning timeline advisor")
+        lines.append("- /planning timeline all delta=after-drift")
+        lines.append("- /planning timeline all focus=execution")
+        lines.append("- /planning timeline all compare=after-drift-vs-all")
+        lines.append("- /planning timeline all compare=execution-vs-scout")
+        lines.append("- /planning scouts")
+        lines.append("- /planning execution")
+        lines.append("- /planning advisor")
+        lines.append("- /planning lineage")
         return "\n".join(lines)
 
     def describe_active_plan_replay_at(self, selected_index: int = 0, **kwargs: Any) -> str:
@@ -722,7 +722,7 @@ class PlanSessionComponent:
         artifact_id = kwargs.get("artifact_id")
         artifact = self._resolve_timeline_artifact(artifact_id)
         if artifact is None:
-            return "No active planning artifact for /plan replay."
+            return "No active planning artifact for /planning replay."
         normalized_filter = self._normalize_timeline_kind_filter(kind_filter)
         normalized_delta = self._normalize_timeline_delta_mode(delta_mode)
         normalized_phase = self._normalize_timeline_phase_filter(phase_filter)
@@ -838,8 +838,8 @@ class PlanSessionComponent:
             replay_command_args.append(f"compare={normalized_compare}")
         replay_command_args.append(f"artifact={replay_artifact.artifact_id}")
         replay_actions: dict[str, str | None] = {
-            "previous": "/plan replay " + " ".join([f"at={replay_index}", *replay_command_args]) if replay_index > 0 else None,
-            "next": "/plan replay " + " ".join([f"at={replay_index + 2}", *replay_command_args]) if replay_index + 1 < len(replay_entries) else None,
+            "previous": "/planning replay " + " ".join([f"at={replay_index}", *replay_command_args]) if replay_index > 0 else None,
+            "next": "/planning replay " + " ".join([f"at={replay_index + 2}", *replay_command_args]) if replay_index + 1 < len(replay_entries) else None,
             "primary": primary_action or None,
             "secondary": secondary_action or None,
         }
@@ -860,9 +860,9 @@ class PlanSessionComponent:
                 focus_mode=normalized_focus,
             )
             lines.extend(compare_artifact_actions)
-        lines.append("- /plan timeline all")
-        lines.append("- /plan execution")
-        lines.append("- /plan advisor")
+        lines.append("- /planning timeline all")
+        lines.append("- /planning execution")
+        lines.append("- /planning advisor")
         return "\n".join(lines)
 
     def describe_active_plan_audit_at(self, selected_index: int | None = None, **kwargs: Any) -> str:
@@ -870,10 +870,10 @@ class PlanSessionComponent:
         artifact_id = kwargs.get("artifact_id")
         artifact = self._resolve_timeline_artifact(artifact_id)
         if artifact is None:
-            return "No active planning artifact for /plan audit."
+            return "No active planning artifact for /planning audit."
         lineage = self._planning_artifact_lineage(artifact)
         if not lineage:
-            return "No planning artifact lineage available for /plan audit."
+            return "No planning artifact lineage available for /planning audit."
         artifact_index = 0
         for index, item in enumerate(lineage):
             if item.artifact_id == artifact.artifact_id:
@@ -955,19 +955,19 @@ class PlanSessionComponent:
                 {
                     "selected_replay": selected_primary_action,
                     "selected_timeline": selected_secondary_action,
-                    "selected_show": f"/plan show {selected.artifact_id}",
-                    "selected_replay_previous": f"/plan replay latest artifact={selected.artifact_id}",
-                    "previous_show": f"/plan show {selected.supersedes_artifact_id}" if selected.supersedes_artifact_id else None,
-                    "next_show": f"/plan show {selected.superseded_by_artifact_id}" if selected.superseded_by_artifact_id else None,
+                    "selected_show": f"/planning show {selected.artifact_id}",
+                    "selected_replay_previous": f"/planning replay latest artifact={selected.artifact_id}",
+                    "previous_show": f"/planning show {selected.supersedes_artifact_id}" if selected.supersedes_artifact_id else None,
+                    "next_show": f"/planning show {selected.superseded_by_artifact_id}" if selected.superseded_by_artifact_id else None,
                 },
                 heading="next_actions:",
                 line_prefix="- ",
                 include_empty=False,
             )
         )
-        lines.append("- /plan lineage")
-        lines.append("- /plan timeline all")
-        lines.append("- /plan replay latest")
+        lines.append("- /planning lineage")
+        lines.append("- /planning timeline all")
+        lines.append("- /planning replay latest")
         return "\n".join(lines)
 
     def describe_active_plan_lineage(self) -> str:
@@ -977,7 +977,7 @@ class PlanSessionComponent:
         session = self._session
         artifact = self.active_planning_artifact()
         if artifact is None:
-            return "No active planning artifact for /plan lineage."
+            return "No active planning artifact for /planning lineage."
         lineage = self._planning_artifact_lineage(artifact)
         normalized_index = max(0, min(selected_index, len(lineage) - 1)) if lineage else 0
         selected = lineage[normalized_index] if lineage else artifact
@@ -1046,11 +1046,11 @@ class PlanSessionComponent:
                 f"supersedes={item.supersedes_artifact_id or 'none'} "
                 f"superseded_by={item.superseded_by_artifact_id or 'none'}"
             )
-            action_bits = [f"/plan show {item.artifact_id}"]
+            action_bits = [f"/planning show {item.artifact_id}"]
             if item.artifact_id != active_id:
-                action_bits.append(f"/plan revert {item.artifact_id}")
+                action_bits.append(f"/planning revert {item.artifact_id}")
             else:
-                action_bits.append(f"/plan derive {item.goal}")
+                action_bits.append(f"/planning derive {item.goal}")
             line += " actions=" + " | ".join(action_bits)
             lines.append(line)
         return lines
@@ -1064,7 +1064,7 @@ class PlanSessionComponent:
         session = self._session
         if not lineage:
             return []
-        lines: list[str] = [f"- selected: /plan derive {current_artifact.goal}"]
+        lines: list[str] = [f"- selected: /planning derive {current_artifact.goal}"]
         current_index = 0
         active_id = session.state.active_planning_artifact_id
         for index, item in enumerate(lineage):
@@ -1073,21 +1073,21 @@ class PlanSessionComponent:
                 break
         if current_index > 0:
             previous = lineage[current_index - 1]
-            lines.append(f"- revert_to_previous: /plan revert {previous.artifact_id}")
+            lines.append(f"- revert_to_previous: /planning revert {previous.artifact_id}")
         if current_index < len(lineage) - 1:
             next_item = lineage[current_index + 1]
-            lines.append(f"- inspect_newer_revision: /plan show {next_item.artifact_id}")
-            lines.append(f"- reactivate_newer_revision: /plan revert {next_item.artifact_id}")
-        lines.append(f"- inspect_selected: /plan show {current_artifact.artifact_id}")
+            lines.append(f"- inspect_newer_revision: /planning show {next_item.artifact_id}")
+            lines.append(f"- reactivate_newer_revision: /planning revert {next_item.artifact_id}")
+        lines.append(f"- inspect_selected: /planning show {current_artifact.artifact_id}")
         if active_id and active_id != current_artifact.artifact_id:
-            lines.append(f"- inspect_active_plan: /plan show {active_id}")
+            lines.append(f"- inspect_active_plan: /planning show {active_id}")
         return lines
 
     def _lineage_default_action(self, artifact) -> str:
         active_id = self._session.state.active_planning_artifact_id
         if artifact.artifact_id == active_id:
-            return f"/plan derive {artifact.goal}"
-        return f"/plan revert {artifact.artifact_id}"
+            return f"/planning derive {artifact.goal}"
+        return f"/planning revert {artifact.artifact_id}"
 
     def _planning_artifact_lineage(self, artifact) -> list[Any]:
         artifact_map = {item.artifact_id: item for item in self.planning_artifacts()}
@@ -1135,8 +1135,8 @@ class PlanSessionComponent:
             "entries": entries,
             "audit_summary": self._timeline_audit_summary(entries),
             "section_summaries": self._timeline_section_summaries(entries),
-            "primary_action": f"/plan replay latest artifact={artifact.artifact_id}",
-            "secondary_action": f"/plan timeline all artifact={artifact.artifact_id}",
+            "primary_action": f"/planning replay latest artifact={artifact.artifact_id}",
+            "secondary_action": f"/planning timeline all artifact={artifact.artifact_id}",
         }
 
     def _planning_artifact_lineage_audit_summary(
@@ -1197,7 +1197,7 @@ class PlanSessionComponent:
                 f"latest_execution={summary['latest_execution_status']} "
                 f"latest_advisor={summary['latest_advisor_status']} "
                 f"latest_drift={summary['latest_drift_status']}{drift_suffix} "
-                f"actions={item['primary_action']} | {item['secondary_action']} | /plan show {artifact.artifact_id}"
+                f"actions={item['primary_action']} | {item['secondary_action']} | /planning show {artifact.artifact_id}"
             )
             lines.append(line)
         return lines
@@ -1312,8 +1312,8 @@ class PlanSessionComponent:
                     max_lines=6,
                     max_chars=800,
                 ),
-                "primary_action": f"/plan show {artifact.artifact_id}",
-                "secondary_action": "/plan lineage",
+                "primary_action": f"/planning show {artifact.artifact_id}",
+                "secondary_action": "/planning lineage",
             }
         ]
         if artifact.advisor_status:
@@ -1332,7 +1332,7 @@ class PlanSessionComponent:
                     "section": "Plan Setup",
                     "summary": f"artifact_review status={artifact.advisor_status}",
                     "detail": "\n".join(detail_lines),
-                    "primary_action": "/plan advisor",
+                    "primary_action": "/planning advisor",
                     "secondary_action": "/advisor status",
                 }
             )
@@ -1357,7 +1357,7 @@ class PlanSessionComponent:
                     "summary": f"session_review checkpoint={review.checkpoint} status={review.status}",
                     "detail": "\n".join(detail_lines),
                     "primary_action": "/advisor status",
-                    "secondary_action": "/plan advisor",
+                    "secondary_action": "/planning advisor",
                 }
             )
         if session.state.last_plan_drift_context:
@@ -1383,7 +1383,7 @@ class PlanSessionComponent:
                     ),
                     "detail": "\n".join(detail_lines),
                     "primary_action": self._timeline_drift_primary_action(artifact),
-                    "secondary_action": "/plan execution",
+                    "secondary_action": "/planning execution",
                 }
             )
         filtered = [
@@ -1424,7 +1424,7 @@ class PlanSessionComponent:
             category = str(snapshot.get("category") or "(unknown)").strip()
             summary = f"category={category} " + " ".join(summary_bits)
             primary_action = self._focus_preserving_task_show_action(task_id)
-            secondary_action = self._session.active_plan_scout_command_for_task(task_id) or "/plan scouts"
+            secondary_action = self._session.active_plan_scout_command_for_task(task_id) or "/planning scouts"
         else:
             phase = str(snapshot.get("phase") or "running").strip()
             plan_status = str(snapshot.get("plan_status") or "on-plan").strip()
@@ -1771,16 +1771,16 @@ class PlanSessionComponent:
                     current_entries,
                     fallback=self._timeline_drift_primary_action(artifact),
                 ),
-                left_secondary_action="/plan timeline all delta=after-drift",
+                left_secondary_action="/planning timeline all delta=after-drift",
                 right_primary_action=self._timeline_entries_primary_action(
                     baseline,
                     fallback=self._timeline_default_view_action(kind_filter),
                 ),
-                right_secondary_action="/plan execution",
-                advisor_primary_action="/plan advisor",
+                right_secondary_action="/planning execution",
+                advisor_primary_action="/planning advisor",
                 advisor_secondary_action="/advisor status",
                 drift_primary_action=self._timeline_drift_primary_action(artifact),
-                drift_secondary_action="/plan execution",
+                drift_secondary_action="/planning execution",
                 artifact=artifact,
                 current_entries=current_entries,
                 phase_filter=phase_filter,
@@ -1809,18 +1809,18 @@ class PlanSessionComponent:
                 right_entries=scout_entries,
                 left_primary_action=self._timeline_entries_primary_action(
                     execution_entries,
-                    fallback="/plan execution",
+                    fallback="/planning execution",
                 ),
-                left_secondary_action="/plan execution",
+                left_secondary_action="/planning execution",
                 right_primary_action=self._timeline_entries_primary_action(
                     scout_entries,
-                    fallback="/plan scouts",
+                    fallback="/planning scouts",
                 ),
-                right_secondary_action="/plan scouts",
-                advisor_primary_action="/plan advisor",
+                right_secondary_action="/planning scouts",
+                advisor_primary_action="/planning advisor",
                 advisor_secondary_action="/advisor status",
                 drift_primary_action=self._timeline_drift_primary_action(artifact),
-                drift_secondary_action="/plan execution",
+                drift_secondary_action="/planning execution",
                 artifact=artifact,
                 current_entries=current_entries,
                 phase_filter=phase_filter,
@@ -1835,8 +1835,8 @@ class PlanSessionComponent:
                         "label": "active-vs-previous",
                         "summary": "no previous lineage artifact",
                         "detail": "",
-                        "primary_action": f"/plan show {artifact.artifact_id}",
-                        "secondary_action": "/plan lineage",
+                        "primary_action": f"/planning show {artifact.artifact_id}",
+                        "secondary_action": "/planning lineage",
                     }
                 ]
             previous_entries = self._planning_artifact_timeline_entries(
@@ -1855,16 +1855,16 @@ class PlanSessionComponent:
                     current_entries,
                     fallback=self._timeline_default_view_action(kind_filter),
                 ),
-                left_secondary_action=f"/plan show {artifact.artifact_id}",
+                left_secondary_action=f"/planning show {artifact.artifact_id}",
                 right_primary_action=self._timeline_entries_primary_action(
                     previous_entries,
-                    fallback=f"/plan show {previous.artifact_id}",
+                    fallback=f"/planning show {previous.artifact_id}",
                 ),
-                right_secondary_action=f"/plan show {previous.artifact_id}",
-                advisor_primary_action="/plan advisor",
+                right_secondary_action=f"/planning show {previous.artifact_id}",
+                advisor_primary_action="/planning advisor",
                 advisor_secondary_action="/advisor status",
                 drift_primary_action=self._timeline_drift_primary_action(artifact),
-                drift_secondary_action="/plan execution",
+                drift_secondary_action="/planning execution",
                 artifact=artifact,
                 current_entries=current_entries,
                 phase_filter=phase_filter,
@@ -2436,10 +2436,10 @@ class PlanSessionComponent:
             artifact_id=previous.artifact_id,
         )
         return [
-            f"- compare_current_replay: /plan replay latest {current_suffix}",
-            f"- compare_previous_replay: /plan replay latest {previous_suffix}",
-            f"- compare_current_timeline: /plan timeline {current_suffix}",
-            f"- compare_previous_timeline: /plan timeline {previous_suffix}",
+            f"- compare_current_replay: /planning replay latest {current_suffix}",
+            f"- compare_previous_replay: /planning replay latest {previous_suffix}",
+            f"- compare_current_timeline: /planning timeline {current_suffix}",
+            f"- compare_previous_timeline: /planning timeline {previous_suffix}",
         ]
 
     def _render_lineage_replay_compare(
@@ -2649,12 +2649,12 @@ class PlanSessionComponent:
 
     def _timeline_default_view_action(self, kind_filter: str) -> str:
         if kind_filter == "scout":
-            return "/plan scouts"
+            return "/planning scouts"
         if kind_filter == "advisor":
-            return "/plan advisor"
+            return "/planning advisor"
         if kind_filter == "drift":
             return "/advisor status"
-        return "/plan execution"
+        return "/planning execution"
 
     def _resolve_timeline_artifact(self, artifact_id: str | None):
         raw = (artifact_id or "").strip()
@@ -2736,14 +2736,14 @@ class PlanSessionComponent:
 
     def _timeline_section_default_action(self, section: str) -> str:
         if section == "Plan Setup":
-            return "/plan show latest"
+            return "/planning show latest"
         if section == "Scout Research":
-            return "/plan scouts"
+            return "/planning scouts"
         if section == "Execution Loop":
-            return "/plan execution"
+            return "/planning execution"
         if section == "Advisor & Drift":
-            return "/plan advisor"
-        return "/plan timeline all"
+            return "/planning advisor"
+        return "/planning timeline all"
 
     def _timeline_section_timeline_action(self, section: str, *, artifact_id: str | None) -> str:
         phase_map = {
@@ -2762,7 +2762,7 @@ class PlanSessionComponent:
         artifact_id: str | None,
         delta_mode: str | None = None,
     ) -> str:
-        parts = ["/plan", "timeline", "all", f"phase={phase}"]
+        parts = ["/planning", "timeline", "all", f"phase={phase}"]
         if delta_mode and delta_mode != "none":
             parts.append(f"delta={delta_mode}")
         if artifact_id:
@@ -3094,7 +3094,7 @@ class PlanSessionComponent:
                     change_actions.append(file_command)
         if focused_path:
             task_actions.extend(session._related_task_commands_for_change_path(focused_path))
-        plan_actions = ["/plan advisor"]
+        plan_actions = ["/planning advisor"]
         if focused_path:
             plan_actions = session._related_plan_commands_for_change_path(focused_path) + plan_actions
         lines.append("")
@@ -3104,7 +3104,7 @@ class PlanSessionComponent:
                     "go_to_task": self._dedupe_actions(task_actions),
                     "go_to_change": self._dedupe_actions(change_actions),
                     "go_to_plan": self._dedupe_actions(plan_actions),
-                    "stay_on_surface": ["/plan advisor"],
+                    "stay_on_surface": ["/planning advisor"],
                 },
                 ordered_keys=("go_to_task", "go_to_change", "go_to_plan", "stay_on_surface"),
                 line_prefix="",
@@ -3213,16 +3213,16 @@ class PlanSessionComponent:
         lines.append("")
         lines.append("next_actions:")
         if active:
-            lines.append(f"- /plan derive {artifact.goal}")
-            lines.append("- /plan scouts")
-            lines.append("- /plan lineage")
+            lines.append(f"- /planning derive {artifact.goal}")
+            lines.append("- /planning scouts")
+            lines.append("- /planning lineage")
         else:
-            lines.append(f"- /plan revert {artifact.artifact_id}")
-            lines.append(f"- /plan use {artifact.artifact_id}")
+            lines.append(f"- /planning revert {artifact.artifact_id}")
+            lines.append(f"- /planning use {artifact.artifact_id}")
         if artifact.supersedes_artifact_id:
-            lines.append(f"- /plan show {artifact.supersedes_artifact_id}")
+            lines.append(f"- /planning show {artifact.supersedes_artifact_id}")
         if artifact.superseded_by_artifact_id:
-            lines.append(f"- /plan show {artifact.superseded_by_artifact_id}")
+            lines.append(f"- /planning show {artifact.superseded_by_artifact_id}")
         return lines
 
     def _render_recent_plan_drift_analysis(
@@ -3820,7 +3820,7 @@ class PlanSessionComponent:
         session = self._session
         target = identifier.strip()
         if not target:
-            return "Usage: /plan use <artifact-id|latest>"
+            return "Usage: /planning use <artifact-id|latest>"
         artifact = self.resolve_planning_artifact(target)
         if artifact is None:
             return f'Unknown planning artifact "{target}".'
@@ -3835,7 +3835,7 @@ class PlanSessionComponent:
         session = self._session
         target = identifier.strip()
         if not target:
-            return "Usage: /plan revert <artifact-id|latest>"
+            return "Usage: /planning revert <artifact-id|latest>"
         artifact = self.resolve_planning_artifact(target)
         if artifact is None:
             return f'Unknown planning artifact "{target}".'
@@ -3931,3 +3931,4 @@ class PlanSessionComponent:
             derivation_reason=derivation_reason,
             sink=sink,
         )
+

@@ -150,6 +150,16 @@ def render_context_usage(
                 ),
                 "provider-view assembly: "
                 + str(prompt_prefix_surface.get("prompt_prefix_provider_view_summary") or "none"),
+                "plan attachments: "
+                + str(prompt_prefix_surface.get("prompt_prefix_attachment_summary") or "none"),
+                "plan attachment mode: "
+                + str(prompt_prefix_surface.get("prompt_prefix_attachment_mode") or "none"),
+                "plan workflow: "
+                + (
+                    f"{prompt_prefix_surface.get('plan_workflow_mode') or 'five_phase'} "
+                    f"agents={prompt_prefix_surface.get('plan_workflow_agent_count') or 1} "
+                    f"explore_agents={prompt_prefix_surface.get('plan_workflow_explore_agent_count') or 3}"
+                ),
                 "prompt prefix cache mode: "
                 + str(prompt_prefix_surface.get("prompt_prefix_cache_mode") or "disabled"),
                 "prompt prefix cache supported: "
@@ -214,6 +224,11 @@ def render_context_usage(
                 + ("no" if bool(prompt_prefix_surface.get("prompt_prefix_changed")) else "yes"),
                 "prefix change reason: "
                 + str(prompt_prefix_surface.get("prompt_prefix_change_reason") or "none"),
+                "plan attachment change reason: "
+                + str(
+                    prompt_prefix_surface.get("prompt_prefix_attachment_change_reason")
+                    or "none"
+                ),
             ]
         )
     lines.extend(

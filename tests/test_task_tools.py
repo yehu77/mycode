@@ -125,8 +125,17 @@ class TaskToolsTests(unittest.TestCase):
                 prompt: str,
                 isolated_workspace: bool = False,
                 read_only: bool = False,
+                model_override: str | None = None,
+                agent_type: str | None = None,
             ):
-                self.captured = (description, prompt, isolated_workspace, read_only)
+                self.captured = (
+                    description,
+                    prompt,
+                    isolated_workspace,
+                    read_only,
+                    model_override,
+                    agent_type,
+                )
                 return "task-1"
 
         fake_session = FakeSession()
@@ -147,7 +156,7 @@ class TaskToolsTests(unittest.TestCase):
             ctx,
         )
 
-        self.assertEqual(fake_session.captured, ("demo", "analyze", True, False))
+        self.assertEqual(fake_session.captured, ("demo", "analyze", True, False, None, None))
         self.assertIn("isolated_workspace: True", result)
 
     def test_agent_tool_forces_read_only_when_session_requires_it(self) -> None:
@@ -164,8 +173,17 @@ class TaskToolsTests(unittest.TestCase):
                 prompt: str,
                 isolated_workspace: bool = False,
                 read_only: bool = False,
+                model_override: str | None = None,
+                agent_type: str | None = None,
             ):
-                self.captured = (description, prompt, isolated_workspace, read_only)
+                self.captured = (
+                    description,
+                    prompt,
+                    isolated_workspace,
+                    read_only,
+                    model_override,
+                    agent_type,
+                )
                 return "planned"
 
         fake_session = FakeSession()
@@ -187,9 +205,221 @@ class TaskToolsTests(unittest.TestCase):
 
         self.assertEqual(
             fake_session.captured,
-            ("map the runtime", "inspect the session factory", False, True),
+            ("map the runtime", "inspect the session factory", False, True, None, None),
         )
         self.assertIn("Sub-agent result (read-only planning):", result)
+
+    def test_agent_tool_named_explore_agent_forces_read_only_profile(self) -> None:
+        cwd = Path(__file__).resolve().parent
+
+        class FakeSession:
+            def resolve_agent_runtime_profile(self, agent_type: str | None):
+                self.requested_agent_type = agent_type
+                return {
+                    "name": "Explore",
+                    "execution": "child-session",
+                    "tool_policy": "read-only-subagent",
+                    "model_override": None,
+                    "read_only": True,
+                    "run_in_background": False,
+                    "isolated_workspace": False,
+                    "planning_only": True,
+                }
+
+            def run_subagent(
+                self,
+                *,
+                description: str,
+                prompt: str,
+                isolated_workspace: bool = False,
+                read_only: bool = False,
+                model_override: str | None = None,
+                agent_type: str | None = None,
+            ):
+                self.captured = (
+                    description,
+                    prompt,
+                    isolated_workspace,
+                    read_only,
+                    model_override,
+                    agent_type,
+                )
+                return "recon"
+
+        fake_session = FakeSession()
+        ctx = ToolContext(
+            cwd=cwd,
+            permission_manager=PermissionManager(interactive=False),
+            task_manager=TaskManager(),
+            session=fake_session,  # type: ignore[arg-type]
+        )
+
+        result = AgentTool().execute(
+            {
+                "agent_type": "Explore",
+                "description": "map existing runtime paths",
+                "prompt": "find reuse candidates",
+                "read_only": False,
+            },
+            ctx,
+        )
+
+        payload = result
+
+        self.assertEqual(fake_session.requested_agent_type, "Explore")
+        self.assertEqual(
+            fake_session.captured,
+            ("map existing runtime paths", "find reuse candidates", False, True, None, "Explore"),
+        )
+        self.assertEqual(payload["status"], "completed")
+        self.assertEqual(payload["agent_type"], "Explore")
+        self.assertEqual(payload["workflow_phase"], "phase_1_initial_understanding")
+        self.assertEqual(payload["contribution_kind"], "reconnaissance_findings")
+        self.assertIn("Phase 1 reconnaissance", payload["role_summary"])
+        self.assertIn("Relevant files and modules", payload["expected_output_sections"])
+        self.assertIn("Phase 2 design", payload["main_thread_usage"])
+        self.assertEqual(payload["result_markdown"], "recon")
+
+    def test_agent_tool_named_plan_agent_resolves_read_only_profile(self) -> None:
+        cwd = Path(__file__).resolve().parent
+
+        class FakeSession:
+            def resolve_agent_runtime_profile(self, agent_type: str | None):
+                self.requested_agent_type = agent_type
+                return {
+                    "name": "Plan",
+                    "execution": "child-session",
+                    "tool_policy": "read-only-subagent",
+                    "model_override": None,
+                    "read_only": True,
+                    "run_in_background": False,
+                    "isolated_workspace": False,
+                    "planning_only": True,
+                }
+
+            def run_subagent(
+                self,
+                *,
+                description: str,
+                prompt: str,
+                isolated_workspace: bool = False,
+                read_only: bool = False,
+                model_override: str | None = None,
+                agent_type: str | None = None,
+            ):
+                self.captured = (
+                    description,
+                    prompt,
+                    isolated_workspace,
+                    read_only,
+                    model_override,
+                    agent_type,
+                )
+                return "designed"
+
+        fake_session = FakeSession()
+        ctx = ToolContext(
+            cwd=cwd,
+            permission_manager=PermissionManager(interactive=False),
+            task_manager=TaskManager(),
+            session=fake_session,  # type: ignore[arg-type]
+        )
+
+        result = AgentTool().execute(
+            {
+                "agent_type": "Plan",
+                "description": "design the implementation",
+                "prompt": "use the exploration results",
+                "read_only": False,
+            },
+            ctx,
+        )
+
+        payload = result
+
+        self.assertEqual(fake_session.requested_agent_type, "Plan")
+        self.assertEqual(
+            fake_session.captured,
+            ("design the implementation", "use the exploration results", False, True, None, "Plan"),
+        )
+        self.assertEqual(payload["status"], "completed")
+        self.assertEqual(payload["agent_type"], "Plan")
+        self.assertEqual(payload["workflow_phase"], "phase_2_design")
+        self.assertEqual(payload["contribution_kind"], "implementation_design")
+        self.assertIn("Phase 2 design agent", payload["role_summary"])
+        self.assertIn("Ordered implementation steps", payload["expected_output_sections"])
+        self.assertIn("final plan writing", payload["main_thread_usage"])
+        self.assertEqual(payload["result_markdown"], "designed")
+
+    def test_agent_tool_named_planning_agent_rejects_background_override(self) -> None:
+        cwd = Path(__file__).resolve().parent
+
+        class FakeSession:
+            def resolve_agent_runtime_profile(self, agent_type: str | None):
+                return {
+                    "name": "Explore",
+                    "execution": "child-session",
+                    "tool_policy": "read-only-subagent",
+                    "model_override": None,
+                    "read_only": True,
+                    "run_in_background": False,
+                    "isolated_workspace": False,
+                    "planning_only": True,
+                }
+
+        ctx = ToolContext(
+            cwd=cwd,
+            permission_manager=PermissionManager(interactive=False),
+            task_manager=TaskManager(),
+            session=FakeSession(),  # type: ignore[arg-type]
+        )
+
+        with self.assertRaises(ValueError) as denied:
+            AgentTool().execute(
+                {
+                    "agent_type": "Explore",
+                    "description": "map existing runtime paths",
+                    "prompt": "find reuse candidates",
+                    "run_in_background": True,
+                },
+                ctx,
+            )
+        self.assertIn("foreground-only", str(denied.exception))
+
+    def test_agent_tool_named_planning_agent_rejects_isolated_workspace_override(self) -> None:
+        cwd = Path(__file__).resolve().parent
+
+        class FakeSession:
+            def resolve_agent_runtime_profile(self, agent_type: str | None):
+                return {
+                    "name": "Plan",
+                    "execution": "child-session",
+                    "tool_policy": "read-only-subagent",
+                    "model_override": None,
+                    "read_only": True,
+                    "run_in_background": False,
+                    "isolated_workspace": False,
+                    "planning_only": True,
+                }
+
+        ctx = ToolContext(
+            cwd=cwd,
+            permission_manager=PermissionManager(interactive=False),
+            task_manager=TaskManager(),
+            session=FakeSession(),  # type: ignore[arg-type]
+        )
+
+        with self.assertRaises(ValueError) as denied:
+            AgentTool().execute(
+                {
+                    "agent_type": "Plan",
+                    "description": "design the implementation",
+                    "prompt": "use the exploration results",
+                    "isolated_workspace": True,
+                },
+                ctx,
+            )
+        self.assertIn("isolated workspace", str(denied.exception))
 
 
 if __name__ == "__main__":

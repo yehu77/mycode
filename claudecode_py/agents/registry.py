@@ -153,6 +153,21 @@ def merge_agent_registries(*registries: AgentDefinitionRegistry) -> AgentDefinit
                 merged.add_definition(definition)
                 continue
             if definition.source == "project-local" and existing.source == "builtin":
+                from .builtin import is_builtin_planning_agent_name
+
+                if is_builtin_planning_agent_name(existing.name):
+                    merged.add_diagnostic(
+                        AgentDefinitionDiagnostic(
+                            name=definition.name,
+                            source=definition.source,
+                            path=definition.path or Path(definition.name),
+                            error=(
+                                f'Project-local agent definition "{definition.name}" cannot override '
+                                "builtin planning agents Explore or Plan."
+                            ),
+                        )
+                    )
+                    continue
                 merged.add_shadowed(
                     ShadowedAgentDefinition(
                         name=existing.name,

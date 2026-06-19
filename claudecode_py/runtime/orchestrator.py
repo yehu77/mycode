@@ -1,14 +1,21 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from time import perf_counter
 from typing import Any
 
-from ..models import ToolCall
+from ..models import Message, ToolCall
 from ..permission_display import PermissionDisplayContext, render_permission_display_compact
 from ..permissions import PermissionDeniedError
-from ..tools.base import BaseTool, ToolContext, format_tool_output
+from ..tools.base import (
+    BaseTool,
+    ToolContext,
+    ToolContextUpdate,
+    ToolSessionMutation,
+    format_tool_output,
+    normalize_tool_execution_payload,
+)
 from .events import EventSink, RuntimeEvent, null_sink, summarize_tool_input
 
 
@@ -17,6 +24,40 @@ class ToolExecutionResult:
     tool_call_id: str
     content: str
     is_error: bool = False
+    new_messages: tuple[Message, ...] = ()
+    context_update: ToolContextUpdate | None = None
+    session_mutation: ToolSessionMutation | None = None
+
+
+@dataclass(slots=True)
+class ToolBatchExecutionResult:
+    tool_result_blocks: list[dict[str, Any]]
+    new_messages: list[Message]
+    context_updates: tuple[ToolContextUpdate, ...]
+    session_mutations: tuple[ToolSessionMutation, ...]
+    tool_result_count: int
+    inline_message_count: int
+
+
+def normalize_tool_batch_execution_result(value: Any) -> ToolBatchExecutionResult:
+    if isinstance(value, ToolBatchExecutionResult):
+        return ToolBatchExecutionResult(
+            tool_result_blocks=[dict(block) for block in value.tool_result_blocks],
+            new_messages=[dict(message) for message in value.new_messages],
+            context_updates=tuple(value.context_updates),
+            session_mutations=tuple(value.session_mutations),
+            tool_result_count=int(value.tool_result_count or len(value.tool_result_blocks)),
+            inline_message_count=int(value.inline_message_count or len(value.new_messages)),
+        )
+    tool_result_blocks = [dict(block) for block in list(value or [])]
+    return ToolBatchExecutionResult(
+        tool_result_blocks=tool_result_blocks,
+        new_messages=[],
+        context_updates=(),
+        session_mutations=(),
+        tool_result_count=len(tool_result_blocks),
+        inline_message_count=0,
+    )
 
 
 class ToolOrchestrator:
@@ -32,7 +73,7 @@ class ToolOrchestrator:
         ctx: ToolContext,
         *,
         sink: EventSink | None = None,
-    ) -> list[dict[str, Any]]:
+    ) -> ToolBatchExecutionResult:
         event_sink = sink or null_sink
         results: list[ToolExecutionResult] = []
         for batch in self._partition(tool_calls):
@@ -61,7 +102,7 @@ class ToolOrchestrator:
                     result_count=len(batch),
                 )
             )
-        return [
+        tool_result_blocks = [
             {
                 "type": "tool_result",
                 "tool_use_id": result.tool_call_id,
@@ -70,6 +111,23 @@ class ToolOrchestrator:
             }
             for result in results
         ]
+        new_messages: list[Message] = []
+        context_updates: list[ToolContextUpdate] = []
+        session_mutations: list[ToolSessionMutation] = []
+        for result in results:
+            new_messages.extend(dict(message) for message in result.new_messages)
+            if result.context_update is not None:
+                context_updates.append(result.context_update)
+            if result.session_mutation is not None:
+                session_mutations.append(result.session_mutation)
+        return ToolBatchExecutionResult(
+            tool_result_blocks=tool_result_blocks,
+            new_messages=new_messages,
+            context_updates=tuple(context_updates),
+            session_mutations=tuple(session_mutations),
+            tool_result_count=len(tool_result_blocks),
+            inline_message_count=len(new_messages),
+        )
 
     def _run_one(
         self,
@@ -114,7 +172,8 @@ class ToolOrchestrator:
                     tool_call_id=call.id,
                 )
             )
-            result = tool.execute(call.input, ctx)
+            result = tool.execute(call.input, replace(ctx, tool_call_id=call.id))
+            payload = normalize_tool_execution_payload(result)
             duration_ms = int((perf_counter() - started) * 1000)
             sink(
                 RuntimeEvent(
@@ -125,7 +184,13 @@ class ToolOrchestrator:
                     duration_ms=duration_ms,
                 )
             )
-            return ToolExecutionResult(call.id, format_tool_output(result))
+            return ToolExecutionResult(
+                call.id,
+                format_tool_output(payload.result),
+                new_messages=tuple(dict(message) for message in payload.new_messages),
+                context_update=payload.context_update,
+                session_mutation=payload.session_mutation,
+            )
         except PermissionDeniedError as exc:
             duration_ms = int((perf_counter() - started) * 1000)
             permission_context = PermissionDisplayContext(

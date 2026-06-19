@@ -5,6 +5,7 @@ from pathlib import Path
 import shutil
 from collections import Counter
 
+from .registry import CommandExecution
 from ..storage.transcript import list_transcripts, load_transcript, load_transcript_by_session_id
 
 
@@ -49,13 +50,45 @@ _SESSIONS_COMMAND_USAGE = (
 _CONFIG_COMMAND_USAGE = "Usage: /config [summary|workspace|runtime|permissions|plugins|mcp]"
 _MODEL_COMMAND_USAGE = "Usage: /model [summary|capabilities|advisor]"
 _STATUS_COMMAND_USAGE = "Usage: /status [summary|workspace|workflow|resume]"
-_PLAN_SCOUTS_USAGE = "Usage: /plan scouts [<n> [file <m>]]"
-_PLAN_EXECUTION_USAGE = "Usage: /plan execution [<n> [file <m>]]"
+_PLAN_SCOUTS_USAGE = "Usage: /planning scouts [<n> [file <m>]]"
+_PLAN_EXECUTION_USAGE = "Usage: /planning execution [<n> [file <m>]]"
+_PLANNING_COMMAND_USAGE = (
+    "Usage: /planning [list|show [id|latest]|file <n>|scouts [<n> [file <m>]]|"
+    "execution [<n> [file <m>]]|advisor|audit [artifact=<id|active|previous>]|"
+    "timeline [all|plan|scout|execution|advisor|drift] "
+    "[delta=none|before-drift|after-drift|since-derived] "
+    "[phase=none|plan-setup|scout-research|execution-loop|advisor-drift] "
+    "[focus=scout|execution|task:<id>] "
+    "[compare=after-drift-vs-all|execution-vs-scout|active-vs-previous] "
+    "[artifact=<id|active|previous>]|replay [latest|at=<n>] "
+    "[all|plan|scout|execution|advisor|drift] "
+    "[delta=none|before-drift|after-drift|since-derived] "
+    "[phase=none|plan-setup|scout-research|execution-loop|advisor-drift] "
+    "[focus=scout|execution|task:<id>] "
+    "[compare=after-drift-vs-all|execution-vs-scout|active-vs-previous] "
+    "[artifact=<id|active|previous>]|lineage|use <id>|revert <id>|clear|derive [goal]]"
+)
 _CONTEXT_COMMAND_USAGE = "Usage: /context [summary]"
 _ADD_DIR_COMMAND_USAGE = "Usage: /add-dir <path>|list|clear|remove <n>"
 _PROJECT_CONTEXT_COMMAND_USAGE = "Usage: /project-context [summary|memory|skills|plugins|reload-status]"
 _FILES_COMMAND_USAGE = "Usage: /files [context|working-set|focused|changes|tasks|plan|explicit|auto|show <n>]"
 _DIFF_COMMAND_USAGE = "Usage: /diff [summary|focused|working-set|change <index-or-change-id> [file <n>]]"
+_LEGACY_PLAN_ARTIFACT_ACTIONS = {
+    "list",
+    "show",
+    "file",
+    "scouts",
+    "execution",
+    "advisor",
+    "audit",
+    "timeline",
+    "replay",
+    "lineage",
+    "use",
+    "revert",
+    "clear",
+    "derive",
+}
 
 
 def handle_install_command(_session: "Session", args: str) -> str:
@@ -257,8 +290,45 @@ def handle_project_context_command(session: "Session", args: str) -> str:
     return _PROJECT_CONTEXT_COMMAND_USAGE
 
 
-def handle_plan_command(session: "Session", args: str) -> str:
+def handle_plan_command(session: "Session", args: str) -> str | CommandExecution:
     raw = args.strip()
+    if not raw:
+        if session.in_plan_mode():
+            return session.describe_current_plan_mode()
+        plan_path = session.enter_plan_mode()
+        return "Enabled plan mode.\n" + f"plan_file: {plan_path}"
+    lowered = raw.lower()
+    if lowered == "open":
+        if not session.in_plan_mode():
+            session.enter_plan_mode()
+        return session.open_plan_file()
+    action = raw.split(maxsplit=1)[0].lower()
+    if action in _LEGACY_PLAN_ARTIFACT_ACTIONS:
+        return handle_planning_command(session, raw, command_name="/plan")
+    if session.in_plan_mode():
+        return session.describe_current_plan_mode()
+    session.enter_plan_mode()
+    return CommandExecution(
+        prompt=raw,
+        progress_message="Planning in plan mode",
+        metadata={
+            "command_policy_name": "plan-mode",
+            "command_policy_source": "repl:/plan",
+            "command_kind": "plan-mode",
+        },
+    )
+
+
+def handle_planning_command(
+    session: "Session",
+    args: str,
+    *,
+    command_name: str = "/planning",
+) -> str:
+    raw = args.strip()
+    scouts_usage = f"Usage: {command_name} scouts [<n> [file <m>]]"
+    execution_usage = f"Usage: {command_name} execution [<n> [file <m>]]"
+    file_usage = f"Usage: {command_name} file <n>"
     if not raw:
         session.remember_plan_context_focus_payload(
             session.active_plan_file_context_payload(),
@@ -280,21 +350,21 @@ def handle_plan_command(session: "Session", args: str) -> str:
         )
         return session.describe_active_plan_scouts(preserve_current_focus=True)
     if raw.startswith("scouts "):
-        parsed_scouts = _parse_plan_child_selector(raw.split()[1:], usage=_PLAN_SCOUTS_USAGE)
+        parsed_scouts = _parse_plan_child_selector(raw.split()[1:], usage=scouts_usage)
         if isinstance(parsed_scouts, str):
             return parsed_scouts
         scout_count = session.active_plan_scout_count()
         if scout_count <= 0:
-            return "No active planning artifact for /plan scouts."
+            return f"No active planning artifact for {command_name} scouts."
         selected_index = int(parsed_scouts["selected_index"])
         if selected_index >= scout_count:
-            return _PLAN_SCOUTS_USAGE
+            return scouts_usage
         file_index = parsed_scouts["file_index"]
         if file_index is not None:
             payload = session.active_plan_scout_file_context_payload(selected_index=selected_index)
             file_count = int(payload.get("file_context_file_count") or 0) if isinstance(payload, dict) else 0
             if file_count <= 0 or file_index >= file_count:
-                return _PLAN_SCOUTS_USAGE
+                return scouts_usage
             session.remember_plan_context_focus_payload(payload, file_index=int(file_index))
         else:
             session.remember_plan_context_focus_payload(
@@ -315,21 +385,21 @@ def handle_plan_command(session: "Session", args: str) -> str:
         )
         return session.describe_active_plan_execution(preserve_current_focus=True)
     if raw.startswith("execution "):
-        parsed_execution = _parse_plan_child_selector(raw.split()[1:], usage=_PLAN_EXECUTION_USAGE)
+        parsed_execution = _parse_plan_child_selector(raw.split()[1:], usage=execution_usage)
         if isinstance(parsed_execution, str):
             return parsed_execution
         execution_count = session.active_plan_execution_count()
         if execution_count <= 0:
-            return "No active planning artifact for /plan execution."
+            return f"No active planning artifact for {command_name} execution."
         selected_index = int(parsed_execution["selected_index"])
         if selected_index >= execution_count:
-            return _PLAN_EXECUTION_USAGE
+            return execution_usage
         file_index = parsed_execution["file_index"]
         if file_index is not None:
             payload = session.active_plan_execution_file_context_payload(selected_index=selected_index)
             file_count = int(payload.get("file_context_file_count") or 0) if isinstance(payload, dict) else 0
             if file_count <= 0 or file_index >= file_count:
-                return _PLAN_EXECUTION_USAGE
+                return execution_usage
             session.remember_plan_context_focus_payload(payload, file_index=int(file_index))
         else:
             session.remember_plan_context_focus_payload(
@@ -356,14 +426,14 @@ def handle_plan_command(session: "Session", args: str) -> str:
     if raw.startswith("file "):
         value = raw.split(" ", 1)[1].strip()
         if not value.isdigit() or int(value) <= 0:
-            return "Usage: /plan file <n>"
+            return file_usage
         payload = session.active_plan_file_context_payload()
         if payload is None:
             return session.describe_active_plan()
         file_count = int(payload.get("file_context_file_count") or 0)
         selected_index = int(value) - 1
         if file_count <= 0 or selected_index >= file_count:
-            return "Usage: /plan file <n>"
+            return file_usage
         session.remember_plan_context_focus_payload(payload, file_index=selected_index)
         return session.describe_active_plan(file_index=selected_index, preserve_current_focus=False)
     if raw.startswith("audit "):
@@ -412,9 +482,7 @@ def handle_plan_command(session: "Session", args: str) -> str:
         return session.revert_to_planning_artifact(remainder or "latest")
     if action == "derive":
         return session.prepare_plan_derivation(remainder)
-    return (
-        "Usage: /plan [list|show [id|latest]|file <n>|scouts [<n> [file <m>]]|execution [<n> [file <m>]]|advisor|audit [artifact=<id|active|previous>]|timeline [all|plan|scout|execution|advisor|drift] [delta=none|before-drift|after-drift|since-derived] [phase=none|plan-setup|scout-research|execution-loop|advisor-drift] [focus=scout|execution|task:<id>] [compare=after-drift-vs-all|execution-vs-scout|active-vs-previous] [artifact=<id|active|previous>]|replay [latest|at=<n>] [all|plan|scout|execution|advisor|drift] [delta=none|before-drift|after-drift|since-derived] [phase=none|plan-setup|scout-research|execution-loop|advisor-drift] [focus=scout|execution|task:<id>] [compare=after-drift-vs-all|execution-vs-scout|active-vs-previous] [artifact=<id|active|previous>]|lineage|use <id>|revert <id>|clear|derive [goal]]"
-    )
+    return _PLANNING_COMMAND_USAGE.replace("/planning", command_name)
 
 
 def _parse_plan_child_selector(tokens: list[str], *, usage: str) -> dict[str, int | None] | str:

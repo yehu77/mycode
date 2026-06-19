@@ -1409,6 +1409,78 @@ class StdioServiceTests(unittest.TestCase):
             if cwd.exists():
                 shutil.rmtree(cwd, ignore_errors=True)
 
+    def test_session_describe_and_list_open_expose_plan_workflow_status_metadata(self) -> None:
+        cwd = Path(__file__).resolve().parent / "_tmp_stdio_service_plan_workflow_status"
+        if cwd.exists():
+            shutil.rmtree(cwd)
+        cwd.mkdir(parents=True)
+
+        dispatcher = ServiceDispatcher(SessionConfig(cwd=cwd, interactive=False))
+        try:
+            created = dispatcher.handle(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "session.create",
+                    "params": {},
+                }
+            )
+            session_id = created["result"]["session_id"]
+            session = dispatcher._sessions[session_id].session
+            session.enter_plan_mode()
+            assembly = session.build_provider_prompt_assembly(
+                messages=[{"role": "user", "content": [{"type": "text", "text": "plan"}]}]
+            )
+            session.record_prompt_prefix_assembly(
+                assembly,
+                source="test",
+                cache_plan=None,
+            )
+
+            described = dispatcher.handle(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "method": "session.describe",
+                    "params": {"session_id": session_id},
+                }
+            )
+            listed = dispatcher.handle(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 3,
+                    "method": "session.list_open",
+                    "params": {},
+                }
+            )
+
+            described_payload = described["result"]
+            listed_payload = listed["result"]["sessions"][0]
+
+            self.assertEqual(described_payload["status_plan_workflow_mode"], "five_phase")
+            self.assertEqual(described_payload["status_plan_workflow_phase_family"], "five_phase")
+            self.assertEqual(
+                described_payload["status_plan_workflow_branch_identity"],
+                "five_phase_branch",
+            )
+            self.assertEqual(described_payload["status_plan_workflow_agent_count"], 1)
+            self.assertEqual(described_payload["status_plan_workflow_explore_agent_count"], 3)
+            self.assertEqual(described_payload["status_prompt_prefix_attachment_summary"], "plan_mode")
+            self.assertEqual(described_payload["status_prompt_prefix_attachment_mode"], "full")
+            self.assertEqual(described_payload["status_plan_instruction_state"], "plan_mode_active")
+            self.assertEqual(described_payload["status_plan_instruction_attachment_mode"], "full")
+            self.assertFalse(described_payload["status_plan_instruction_reentry_active"])
+            self.assertFalse(described_payload["status_plan_instruction_exit_active"])
+
+            self.assertEqual(listed_payload["status_plan_workflow_mode"], "five_phase")
+            self.assertEqual(listed_payload["status_plan_workflow_phase_family"], "five_phase")
+            self.assertEqual(listed_payload["status_prompt_prefix_attachment_mode"], "full")
+            self.assertEqual(listed_payload["status_plan_instruction_attachment_mode"], "full")
+        finally:
+            dispatcher.close()
+            if cwd.exists():
+                shutil.rmtree(cwd, ignore_errors=True)
+
     def test_session_view_agents_returns_lightweight_definitions(self) -> None:
         cwd = Path(__file__).resolve().parent / "_tmp_stdio_service_agents_view"
         if cwd.exists():
@@ -1437,7 +1509,9 @@ class StdioServiceTests(unittest.TestCase):
             text = viewed["result"]["text"]
             self.assertIn("agent definitions:", text)
             self.assertIn("source summary:", text)
-            self.assertIn("- builtin: definitions=4 effective=4 shadowed=0 root=builtin", text)
+            self.assertIn("- builtin: definitions=6 effective=6 shadowed=0 root=builtin", text)
+            self.assertIn("- Explore: source=builtin effective=yes override_state=base based_on=read_only_planning", text)
+            self.assertIn("- Plan: source=builtin effective=yes override_state=base based_on=read_only_planning", text)
             self.assertIn("- default: source=builtin effective=yes override_state=base based_on=none", text)
             self.assertIn("- background: source=builtin effective=yes override_state=base based_on=none", text)
             self.assertIn("- read_only_planning: source=builtin effective=yes override_state=base based_on=none", text)

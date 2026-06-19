@@ -40,6 +40,15 @@ class TranscriptSummary:
     workspace_unavailable: bool
     workspace_unavailable_reason: str | None
     workspace_fallback_cwd: str | None
+    session_runtime_mode: str | None
+    pre_plan_mode: str | None
+    has_exited_plan_mode: bool
+    needs_plan_mode_exit_attachment: bool
+    needs_plan_mode_reentry_attachment: bool
+    plan_mode_attachment_count: int
+    plan_mode_exit_approved_plan: str | None
+    plan_mode_exit_restored_mode: str | None
+    plan_slug: str | None
     session_execution_mode: str | None
     session_command_policy_name: str | None
     session_command_policy_source: str | None
@@ -92,6 +101,15 @@ def save_transcript(config: SessionConfig, state: SessionState) -> Path:
         "session_id": state.session_id,
         "created_at": state.created_at,
         "updated_at": state.updated_at,
+        "session_runtime_mode": state.session_runtime_mode,
+        "pre_plan_mode": state.pre_plan_mode,
+        "has_exited_plan_mode": state.has_exited_plan_mode,
+        "needs_plan_mode_exit_attachment": state.needs_plan_mode_exit_attachment,
+        "needs_plan_mode_reentry_attachment": state.needs_plan_mode_reentry_attachment,
+        "plan_mode_attachment_count": state.plan_mode_attachment_count,
+        "plan_mode_exit_approved_plan": state.plan_mode_exit_approved_plan,
+        "plan_mode_exit_restored_mode": state.plan_mode_exit_restored_mode,
+        "plan_slug": state.plan_slug,
         "session_execution_mode": state.session_execution_mode,
         "session_command_policy_name": state.session_command_policy_name,
         "session_command_policy_source": state.session_command_policy_source,
@@ -177,6 +195,36 @@ def load_transcript(path: Path) -> SessionState:
         session_id=payload["session_id"],
         created_at=payload.get("created_at", utc_now_iso()),
         updated_at=payload.get("updated_at"),
+        session_runtime_mode=str(payload.get("session_runtime_mode", "default") or "default"),
+        pre_plan_mode=(
+            str(payload.get("pre_plan_mode"))
+            if payload.get("pre_plan_mode") is not None
+            else None
+        ),
+        has_exited_plan_mode=bool(payload.get("has_exited_plan_mode", False)),
+        needs_plan_mode_exit_attachment=bool(payload.get("needs_plan_mode_exit_attachment", False)),
+        needs_plan_mode_reentry_attachment=bool(
+            payload.get("needs_plan_mode_reentry_attachment", False)
+        ),
+        plan_mode_attachment_count=max(
+            int(payload.get("plan_mode_attachment_count", 0) or 0),
+            0,
+        ),
+        plan_mode_exit_approved_plan=(
+            str(payload.get("plan_mode_exit_approved_plan"))
+            if payload.get("plan_mode_exit_approved_plan") is not None
+            else None
+        ),
+        plan_mode_exit_restored_mode=(
+            str(payload.get("plan_mode_exit_restored_mode"))
+            if payload.get("plan_mode_exit_restored_mode") is not None
+            else None
+        ),
+        plan_slug=(
+            str(payload.get("plan_slug"))
+            if payload.get("plan_slug") is not None
+            else None
+        ),
         session_execution_mode=str(payload.get("session_execution_mode", "main") or "main"),
         session_command_policy_name=(
             str(payload.get("session_command_policy_name"))
@@ -518,6 +566,22 @@ def list_transcripts(cwd: Path, *, limit: int | None = None) -> list[TranscriptS
                 workspace_unavailable=bool(payload.get("workspace_unavailable", False)),
                 workspace_unavailable_reason=payload.get("workspace_unavailable_reason"),
                 workspace_fallback_cwd=payload.get("workspace_fallback_cwd"),
+                session_runtime_mode=payload.get("session_runtime_mode"),
+                pre_plan_mode=payload.get("pre_plan_mode"),
+                has_exited_plan_mode=bool(payload.get("has_exited_plan_mode", False)),
+                needs_plan_mode_exit_attachment=bool(
+                    payload.get("needs_plan_mode_exit_attachment", False)
+                ),
+                needs_plan_mode_reentry_attachment=bool(
+                    payload.get("needs_plan_mode_reentry_attachment", False)
+                ),
+                plan_mode_attachment_count=max(
+                    int(payload.get("plan_mode_attachment_count", 0) or 0),
+                    0,
+                ),
+                plan_mode_exit_approved_plan=payload.get("plan_mode_exit_approved_plan"),
+                plan_mode_exit_restored_mode=payload.get("plan_mode_exit_restored_mode"),
+                plan_slug=payload.get("plan_slug"),
                 session_execution_mode=payload.get("session_execution_mode"),
                 session_command_policy_name=payload.get("session_command_policy_name"),
                 session_command_policy_source=payload.get("session_command_policy_source"),

@@ -93,13 +93,13 @@ Use this flow when you want to understand what is in scope, what changed, and wh
 
 ```bash
 pyclaude repl
-/ultraplan add retry logic to the provider path
-/plan
-/plan scouts
-/plan execution
+/plan add retry logic to the provider path
+/plan open
+/planning
+/planning timeline
 ```
 
-Use `/ultraplan` to build a larger plan, then use `/plan` to inspect and reuse it while implementing.
+Use `/plan` to enter plan mode, write or refine the current session plan file, and exit through plan approval. Use `/planning` for artifact-oriented inspection such as active plan detail, timeline, replay, audit, and lineage.
 
 ### 3. Review changes
 
@@ -144,6 +144,7 @@ Most useful REPL commands:
 - `/changes`
 - `/tasks`
 - `/plan`
+- `/planning`
 - `/ultraplan`
 - `/advisor`
 - `/project-context`
@@ -170,8 +171,9 @@ This is one of the strongest parts of the current Python implementation.
 
 The Python version already supports a serious planning workflow:
 
+- `/plan` for mode-centric planning with a real session plan file, plan-mode restrictions, and approval-driven exit
+- `/planning` for active plan inspection, replay, timeline, lineage, and reuse
 - `/ultraplan` for larger read-only multi-scout planning
-- `/plan` for active plan inspection, replay, timeline, lineage, and reuse
 - `/tasks` and `/task` for checklist-style task tracking
 - `/advisor` for final-review and interactive-review flows
 - `/review` and `/security-review` for code review workflows

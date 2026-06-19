@@ -565,6 +565,28 @@ class _FakeBridgeClient:
                 "status_prompt_prefix_segment_count": 7,
                 "status_prompt_prefix_stable_chars": 1200,
                 "status_prompt_prefix_dynamic_tail_chars": 240,
+                "status_prompt_prefix_attachment_count": 1,
+                "status_prompt_prefix_attachment_kinds": ["plan_mode"],
+                "status_prompt_prefix_attachment_summaries": ["plan_mode:five_phase:full"],
+                "status_prompt_prefix_attachment_summary": "plan_mode",
+                "status_prompt_prefix_attachment_mode": "full",
+                "status_prompt_prefix_attachment_change_reason": "none",
+                "status_plan_workflow_mode": "five_phase",
+                "status_plan_workflow_phase_family": "five_phase",
+                "status_plan_workflow_branch_identity": "five_phase_branch",
+                "status_plan_workflow_branch_summary": "Five-phase staged planning branch",
+                "status_plan_workflow_agent_count": 1,
+                "status_plan_workflow_explore_agent_count": 3,
+                "status_plan_workflow_allowed_agent_names": ["Explore", "Plan"],
+                "status_plan_workflow_invocation_boundary_summary": (
+                    "five_phase boundary: use Explore for reconnaissance and Plan for design."
+                ),
+                "status_plan_workflow_invocation_delegation_default": "phase_split",
+                "status_plan_instruction_state": "plan_mode_active",
+                "status_plan_instruction_attachment_mode": "full",
+                "status_plan_instruction_attachment_summary": "plan_mode",
+                "status_plan_instruction_reentry_active": False,
+                "status_plan_instruction_exit_active": False,
                 "status_prompt_prefix_cache_mode": "provider_hinted",
                 "status_prompt_prefix_cache_supported": True,
                 "status_prompt_prefix_cache_provider": "anthropic",
@@ -1264,6 +1286,43 @@ class RemoteSessionProxyTests(unittest.TestCase):
         self.assertEqual(proxy.status_surface_payload()["status_focused_file_path"], "demo.py")
         self.assertEqual(proxy.status_surface_payload()["status_prompt_prefix_segment_count"], 7)
         self.assertEqual(proxy.status_surface_payload()["status_prompt_prefix_stable_chars"], 1200)
+        self.assertEqual(
+            proxy.status_surface_payload()["status_prompt_prefix_attachment_mode"],
+            "full",
+        )
+        self.assertEqual(
+            proxy.status_surface_payload()["status_prompt_prefix_attachment_change_reason"],
+            "none",
+        )
+        self.assertEqual(proxy.status_surface_payload()["status_plan_workflow_mode"], "five_phase")
+        self.assertEqual(
+            proxy.status_surface_payload()["status_plan_workflow_phase_family"],
+            "five_phase",
+        )
+        self.assertEqual(
+            proxy.status_surface_payload()["status_plan_workflow_branch_identity"],
+            "five_phase_branch",
+        )
+        self.assertEqual(
+            proxy.status_surface_payload()["status_plan_workflow_agent_count"],
+            1,
+        )
+        self.assertEqual(
+            proxy.status_surface_payload()["status_plan_workflow_explore_agent_count"],
+            3,
+        )
+        self.assertEqual(
+            proxy.status_surface_payload()["status_plan_workflow_allowed_agent_names"],
+            ["Explore", "Plan"],
+        )
+        self.assertEqual(
+            proxy.status_surface_payload()["status_plan_workflow_invocation_delegation_default"],
+            "phase_split",
+        )
+        self.assertEqual(
+            proxy.status_surface_payload()["status_plan_instruction_attachment_mode"],
+            "full",
+        )
         self.assertEqual(
             proxy.status_surface_payload()["status_prompt_prefix_reduction_tier"],
             "artifact_indirection",

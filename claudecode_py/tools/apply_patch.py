@@ -150,6 +150,9 @@ class ApplyPatchTool(BaseTool):
         return request
 
     def execute(self, tool_input: dict, ctx):
+        validator = getattr(ctx.session, "validate_plan_mode_tool_policy", None)
+        if validator is not None:
+            validator(self.name, tool_input)
         actions = self._parse_patch(tool_input["patch"])
         summaries: list[str] = []
         recorded_changes: list[WorkspaceFileChange] = []

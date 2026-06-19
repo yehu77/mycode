@@ -53,6 +53,9 @@ class WriteFileTool(BaseTool):
         return request
 
     def execute(self, tool_input: dict, ctx):
+        validator = getattr(ctx.session, "validate_plan_mode_tool_policy", None)
+        if validator is not None:
+            validator(self.name, tool_input)
         path = resolve_workspace_path(ctx.cwd, tool_input["path"])
         make_parents = bool(tool_input.get("make_parents", True))
         if make_parents:

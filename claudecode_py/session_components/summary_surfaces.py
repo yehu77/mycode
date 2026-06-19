@@ -166,6 +166,7 @@ def _status_active_workflow_lines(
     )
     runtime_narrative = session._runtime_narrative_payload()
     tool_schema_surface = session.tool_schema_surface_payload()
+    prompt_prefix_surface = session.prompt_prefix_surface_payload()
     lines = [
         f"active plan: {artifact.goal if artifact is not None else 'none'}",
         f"active task: {active_task_total}",
@@ -188,6 +189,25 @@ def _status_active_workflow_lines(
         lines.extend(
             [
                 *session._prompt_prefix_narrative_lines(narrative=runtime_narrative),
+                "planning-agent boundary: "
+                + str(
+                    prompt_prefix_surface.get("plan_workflow_invocation_boundary_summary")
+                    or "none"
+                ),
+                "verification-agent scope: "
+                + str(
+                    prompt_prefix_surface.get("plan_workflow_verification_agent_scope")
+                    or "post_milestone_b_followup"
+                ),
+                "planning-agent allowed: "
+                + (
+                    ",".join(
+                        str(item)
+                        for item in prompt_prefix_surface.get("plan_workflow_allowed_agent_names")
+                        or []
+                    )
+                    or "none"
+                ),
                 "tool schema cache: "
                 + (
                     f"cached={tool_schema_surface.get('tool_schema_cached_count', 0)} "
@@ -216,6 +236,27 @@ def _status_active_workflow_lines(
                 + str(
                     session.runtime_progress_surface_payload().get(
                         "runtime_tool_result_microcompact_summary"
+                    )
+                    or "none"
+                ),
+                "skill-tool fork: "
+                + str(
+                    session.runtime_progress_surface_payload().get(
+                        "runtime_skill_tool_fork_summary"
+                    )
+                    or "none"
+                ),
+                "skill-tool inline: "
+                + str(
+                    session.runtime_progress_surface_payload().get(
+                        "runtime_skill_tool_inline_summary"
+                    )
+                    or "none"
+                ),
+                "skill-tool context: "
+                + str(
+                    session.runtime_progress_surface_payload().get(
+                        "runtime_skill_tool_context_summary"
                     )
                     or "none"
                 ),

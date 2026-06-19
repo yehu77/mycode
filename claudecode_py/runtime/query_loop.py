@@ -2,9 +2,11 @@ from __future__ import annotations
 
 from contextlib import nullcontext
 import json
+from pathlib import Path
 from time import sleep
 
 from ..models import Message
+from ..permissions import PermissionDeniedError
 from ..providers.errors import (
     ProviderCapabilityError,
     ProviderContextLimitError,
@@ -13,6 +15,7 @@ from ..providers.errors import (
     ProviderTimeoutError,
 )
 from .events import EventSink, RuntimeEvent, summarize_tool_input
+from .orchestrator import normalize_tool_batch_execution_result
 from .reduction_orchestration import (
     ProviderViewReductionOrchestrationResult,
     build_provider_view_reduction_orchestration,
@@ -50,10 +53,24 @@ def run_query_loop(
     start_constraint_trigger_count = session.state.constraint_trigger_count
     start_tool_result_replacement_records = list(session.state.tool_result_replacement_records)
     start_tool_result_artifact_records = list(session.state.tool_result_artifact_records)
+    start_transient_tool_context_policy = session.transient_tool_context_policy()
+    start_transient_runtime_override = session.transient_runtime_override()
+    start_session_runtime_mode = session.state.session_runtime_mode
+    start_pre_plan_mode = session.state.pre_plan_mode
+    start_has_exited_plan_mode = session.state.has_exited_plan_mode
+    start_needs_plan_mode_exit_attachment = session.state.needs_plan_mode_exit_attachment
+    start_needs_plan_mode_reentry_attachment = session.state.needs_plan_mode_reentry_attachment
+    start_plan_mode_attachment_count = session.state.plan_mode_attachment_count
+    start_plan_mode_exit_approved_plan = session.state.plan_mode_exit_approved_plan
+    start_plan_mode_exit_restored_mode = session.state.plan_mode_exit_restored_mode
+    start_plan_slug = session.state.plan_slug
     execution_task_id: str | None = None
     plan_drifted = False
+    approved_plan_mode_exit_state: dict[str, object] | None = None
 
     try:
+        session.clear_transient_tool_context_overlay()
+        session.clear_transient_runtime_override()
         session.clear_execution_constraint()
         session.state.messages.append(
             {
@@ -316,9 +333,19 @@ def run_query_loop(
                 )
 
             with _turn_execution_scope(session, write_constraints_active=write_constraints_active):
-                tool_result_blocks = session.execute_tool_calls(
-                    response.tool_calls,
-                    session.tool_context(),
+                tool_batch_result = normalize_tool_batch_execution_result(
+                    session.execute_tool_calls(
+                        response.tool_calls,
+                        session.tool_context(),
+                        sink=sink,
+                    )
+                )
+            tool_result_blocks = tool_batch_result.tool_result_blocks
+            if tool_batch_result.session_mutations:
+                approved_plan_mode_exit_state = _apply_session_tool_mutations(
+                    session,
+                    tool_result_blocks=tool_result_blocks,
+                    session_mutations=tool_batch_result.session_mutations,
                     sink=sink,
                 )
             _emit_estimated_tool_result_usage_event(
@@ -328,6 +355,15 @@ def run_query_loop(
                 sink=sink,
             )
             session.state.messages.append({"role": "user", "content": tool_result_blocks})
+            if tool_batch_result.new_messages:
+                session.state.messages.extend(tool_batch_result.new_messages)
+                _emit_skill_tool_message_events(
+                    tool_batch_result.new_messages,
+                    sink=sink,
+                )
+            if tool_batch_result.context_updates:
+                session.apply_transient_tool_context_updates(tool_batch_result.context_updates)
+                _emit_skill_tool_context_events(tool_batch_result.context_updates, sink=sink)
             _enforce_message_budget(session, sink)
             for block in tool_result_blocks:
                 status = "error" if block.get("is_error") else "ok"
@@ -376,15 +412,185 @@ def run_query_loop(
         session.state.constraint_trigger_count = start_constraint_trigger_count
         session.state.tool_result_replacement_records = list(start_tool_result_replacement_records)
         session.state.tool_result_artifact_records = list(start_tool_result_artifact_records)
+        session.restore_transient_tool_context_overlay(start_transient_tool_context_policy)
+        session.restore_transient_runtime_override(start_transient_runtime_override)
+        session.state.session_runtime_mode = start_session_runtime_mode
+        session.state.pre_plan_mode = start_pre_plan_mode
+        session.state.has_exited_plan_mode = start_has_exited_plan_mode
+        session.state.needs_plan_mode_exit_attachment = start_needs_plan_mode_exit_attachment
+        session.state.needs_plan_mode_reentry_attachment = start_needs_plan_mode_reentry_attachment
+        session.state.plan_mode_attachment_count = start_plan_mode_attachment_count
+        session._plan_mode_attachment_count = start_plan_mode_attachment_count
+        session.state.plan_mode_exit_approved_plan = start_plan_mode_exit_approved_plan
+        session.state.plan_mode_exit_restored_mode = start_plan_mode_exit_restored_mode
+        session.state.plan_slug = start_plan_slug
+        if approved_plan_mode_exit_state is not None:
+            session.state.session_runtime_mode = str(
+                approved_plan_mode_exit_state["session_runtime_mode"]
+            )
+            session.state.pre_plan_mode = approved_plan_mode_exit_state["pre_plan_mode"]  # type: ignore[assignment]
+            session.state.has_exited_plan_mode = bool(
+                approved_plan_mode_exit_state["has_exited_plan_mode"]
+            )
+            session.state.needs_plan_mode_exit_attachment = bool(
+                approved_plan_mode_exit_state["needs_plan_mode_exit_attachment"]
+            )
+            session.state.needs_plan_mode_reentry_attachment = bool(
+                approved_plan_mode_exit_state["needs_plan_mode_reentry_attachment"]
+            )
+            session.state.plan_mode_attachment_count = int(
+                approved_plan_mode_exit_state["plan_mode_attachment_count"]
+            )
+            session._plan_mode_attachment_count = session.state.plan_mode_attachment_count
+            session.state.plan_mode_exit_approved_plan = approved_plan_mode_exit_state[
+                "plan_mode_exit_approved_plan"
+            ]  # type: ignore[assignment]
+            session.state.plan_mode_exit_restored_mode = approved_plan_mode_exit_state[
+                "plan_mode_exit_restored_mode"
+            ]  # type: ignore[assignment]
+            session.state.plan_slug = approved_plan_mode_exit_state["plan_slug"]  # type: ignore[assignment]
         session.reconstruct_tool_result_replacement_state()
         if session.persist_transcript:
             session.persist_state()
         raise
     finally:
+        session.restore_transient_tool_context_overlay(start_transient_tool_context_policy)
+        session.restore_transient_runtime_override(start_transient_runtime_override)
         session.clear_plan_execution()
         session.clear_execution_constraint()
 
     raise RuntimeError("Max turn count reached.")
+
+
+def _apply_session_tool_mutations(
+    session: "Session",
+    *,
+    tool_result_blocks: list[dict[str, object]],
+    session_mutations,
+    sink: EventSink,
+) -> dict[str, object] | None:
+    approved_exit_state: dict[str, object] | None = None
+    for mutation in session_mutations:
+        if mutation.kind != "plan_mode_exit_requested":
+            continue
+        approved_exit_state = _handle_plan_mode_exit_request(
+            session,
+            tool_result_blocks=tool_result_blocks,
+            mutation=mutation,
+            sink=sink,
+        )
+    return approved_exit_state
+
+
+def _handle_plan_mode_exit_request(
+    session: "Session",
+    *,
+    tool_result_blocks: list[dict[str, object]],
+    mutation,
+    sink: EventSink,
+) -> dict[str, object] | None:
+    tool_call_id = mutation.source_tool_call_id
+    if tool_call_id is None:
+        return None
+    plan_file_path = Path(str(mutation.plan_file_path or "")).resolve(strict=False)
+    plan_content = str(mutation.plan_content or "").strip()
+    block = next(
+        (
+            item
+            for item in tool_result_blocks
+            if str(item.get("type")) == "tool_result" and item.get("tool_use_id") == tool_call_id
+        ),
+        None,
+    )
+    if block is None:
+        return None
+    if not plan_content:
+        block["is_error"] = True
+        block["content"] = "Current session plan file is empty."
+        return None
+    try:
+        session.request_plan_mode_exit_approval(
+            plan_file_path=plan_file_path,
+            plan_content=plan_content,
+        )
+    except PermissionDeniedError:
+        block["is_error"] = True
+        block["content"] = (
+            "The user rejected the current plan and chose to stay in plan mode.\n"
+            f"plan_file: {plan_file_path}\n\n"
+            "Rejected plan:\n"
+            f"{plan_content}"
+        )
+        return None
+    session.exit_plan_mode(approved_plan=plan_content)
+    block["is_error"] = False
+    block["content"] = (
+        "Plan mode exit approved.\n"
+        f"plan_file: {plan_file_path}\n\n"
+        "## Approved Plan:\n"
+        f"{plan_content}"
+    )
+    return {
+        "session_runtime_mode": session.state.session_runtime_mode,
+        "pre_plan_mode": session.state.pre_plan_mode,
+        "has_exited_plan_mode": session.state.has_exited_plan_mode,
+        "needs_plan_mode_exit_attachment": session.state.needs_plan_mode_exit_attachment,
+        "needs_plan_mode_reentry_attachment": session.state.needs_plan_mode_reentry_attachment,
+        "plan_mode_attachment_count": session.state.plan_mode_attachment_count,
+        "plan_mode_exit_approved_plan": session.state.plan_mode_exit_approved_plan,
+        "plan_mode_exit_restored_mode": session.state.plan_mode_exit_restored_mode,
+        "plan_slug": session.state.plan_slug,
+    }
+
+
+def _emit_skill_tool_message_events(
+    new_messages: list[dict[str, object]],
+    *,
+    sink: EventSink,
+) -> None:
+    message_counts: dict[tuple[str, str], int] = {}
+    for message in new_messages:
+        source_kind = str(message.get("source_kind") or "").strip()
+        if source_kind not in {"skill_tool_inline", "skill_tool_fork"}:
+            continue
+        skill_name = str(message.get("skill_name") or "").strip()
+        if not skill_name:
+            continue
+        key = (source_kind, skill_name)
+        message_counts[key] = message_counts.get(key, 0) + 1
+    event_kinds = {
+        "skill_tool_inline": ("skill_tool_inline_messages_applied", "skill-tool inline"),
+        "skill_tool_fork": ("skill_tool_fork_messages_applied", "skill-tool fork"),
+    }
+    for (source_kind, skill_name), count in message_counts.items():
+        event_kind, label = event_kinds[source_kind]
+        sink(
+            RuntimeEvent(
+                kind=event_kind,  # type: ignore[arg-type]
+                message=f"{label}: {skill_name} injected_messages={count}",
+                tool_name="skill",
+                result_count=count,
+            )
+        )
+
+
+def _emit_skill_tool_context_events(context_updates, *, sink: EventSink) -> None:
+    for update in context_updates:
+        skill_name = str(getattr(update, "skill_name", "") or "").strip()
+        if str(getattr(update, "source", "") or "").strip() not in {
+            "skill_tool_inline",
+            "skill_tool_fork",
+        } or not skill_name:
+            continue
+        allowed_tools = getattr(update, "allowed_tool_names", None)
+        allowed_summary = ",".join(allowed_tools or ()) or "inherit"
+        sink(
+            RuntimeEvent(
+                kind="skill_tool_context_applied",
+                message=f"skill-tool context: {skill_name} allowed_tools={allowed_summary}",
+                tool_name="skill",
+            )
+        )
 
 
 def _emit_response_usage_event(session: "Session", response, sink: EventSink) -> None:
@@ -527,6 +733,7 @@ def _create_message_with_retries(
             assembly_override,
             previous_payload=session._last_prompt_prefix_assembly_payload,
         )
+        runtime_override = session.current_runtime_override()
         session.mark_tool_result_ids_seen_from_messages(assembly_override.messages)
         response, streamed_text = _create_provider_message_with_retries(
             session.provider,
@@ -535,6 +742,8 @@ def _create_message_with_retries(
             tools=assembly_override.tools,
             system_prompt=assembly_override.system_prompt,
             cache_plan=cache_plan,
+            model_override=runtime_override.model_override if runtime_override is not None else None,
+            effort_override=runtime_override.effort_override if runtime_override is not None else None,
             sink=sink,
             allow_streaming=not session.has_advisor_model(),
         )
@@ -543,6 +752,14 @@ def _create_message_with_retries(
             source="runtime",
             cache_plan=cache_plan,
         )
+        session.record_plan_mode_attachment_cycle(assembly_override.prompt_attachments)
+        consumed_attachment_kinds = tuple(
+            attachment.kind
+            for attachment in assembly_override.prompt_attachments
+            if attachment.one_shot
+        )
+        if consumed_attachment_kinds:
+            session.mark_plan_mode_attachments_consumed(consumed_attachment_kinds)
         if cache_plan.provider_cache_fallback_reason not in {None, "", "none"}:
             sink(
                 RuntimeEvent(
@@ -570,6 +787,7 @@ def _create_message_with_retries(
         session,
         turn_user_prompt=turn_user_prompt,
     )
+    runtime_override = session.current_runtime_override()
     session.mark_tool_result_ids_seen_from_messages(messages)
     return _create_provider_message_with_retries(
         session.provider,
@@ -577,6 +795,8 @@ def _create_message_with_retries(
         messages=messages,
         tools=session.tool_specs(),
         system_prompt=session.build_system_prompt(),
+        model_override=runtime_override.model_override if runtime_override is not None else None,
+        effort_override=runtime_override.effort_override if runtime_override is not None else None,
         sink=sink,
         allow_streaming=not session.has_advisor_model(),
     )
@@ -720,6 +940,8 @@ def _create_provider_message_with_retries(
     tools: list[dict],
     system_prompt: str,
     cache_plan=None,
+    model_override: str | None = None,
+    effort_override: str | None = None,
     sink: EventSink,
     allow_streaming: bool,
 ):
@@ -734,6 +956,8 @@ def _create_provider_message_with_retries(
                 tools=tools,
                 system_prompt=system_prompt,
                 cache_plan=cache_plan,
+                model_override=model_override,
+                effort_override=effort_override,
                 sink=sink,
                 allow_streaming=allow_streaming,
             )
@@ -763,6 +987,7 @@ def _create_message_once(session: "Session", sink: EventSink):
     )
     assembly = orchestration.final_assembly
     cache_plan = orchestration.final_cache_plan
+    runtime_override = session.current_runtime_override()
     session.mark_tool_result_ids_seen_from_messages(assembly.messages)
     response, streamed_text = _create_provider_message_once(
         session.provider,
@@ -770,10 +995,18 @@ def _create_message_once(session: "Session", sink: EventSink):
         tools=assembly.tools,
         system_prompt=assembly.system_prompt,
         cache_plan=cache_plan,
+        model_override=runtime_override.model_override if runtime_override is not None else None,
+        effort_override=runtime_override.effort_override if runtime_override is not None else None,
         sink=sink,
         allow_streaming=not session.has_advisor_model(),
     )
     session.record_prompt_prefix_assembly(assembly, source="runtime", cache_plan=cache_plan)
+    session.record_plan_mode_attachment_cycle(assembly.prompt_attachments)
+    consumed_attachment_kinds = tuple(
+        attachment.kind for attachment in assembly.prompt_attachments if attachment.one_shot
+    )
+    if consumed_attachment_kinds:
+        session.mark_plan_mode_attachments_consumed(consumed_attachment_kinds)
     if cache_plan.provider_cache_fallback_reason not in {None, "", "none"}:
         sink(
             RuntimeEvent(
@@ -806,6 +1039,8 @@ def _create_provider_message_once(
     tools: list[dict],
     system_prompt: str,
     cache_plan=None,
+    model_override: str | None = None,
+    effort_override: str | None = None,
     sink: EventSink,
     allow_streaming: bool,
 ):
@@ -825,6 +1060,8 @@ def _create_provider_message_once(
             tools=tools,
             system_prompt=system_prompt,
             cache_plan=cache_plan,
+            model_override=model_override,
+            effort_override=effort_override,
         ):
             if event.kind == "text_delta" and event.text:
                 streamed_text = True
@@ -843,57 +1080,85 @@ def _create_provider_message_once(
             tools=tools,
             system_prompt=system_prompt,
             cache_plan=cache_plan,
+            model_override=model_override,
+            effort_override=effort_override,
         ),
         False,
     )
 
 
-def _create_provider_message(provider, *, messages, tools, system_prompt, cache_plan):
-    if cache_plan is None:
-        return provider.create_message(
-            messages=messages,
-            tools=tools,
-            system_prompt=system_prompt,
-        )
-    try:
-        return provider.create_message(
-            messages=messages,
-            tools=tools,
-            system_prompt=system_prompt,
-            cache_plan=cache_plan,
-        )
-    except TypeError as exc:
-        if "cache_plan" not in str(exc):
-            raise
-        return provider.create_message(
-            messages=messages,
-            tools=tools,
-            system_prompt=system_prompt,
-        )
+def _create_provider_message(
+    provider,
+    *,
+    messages,
+    tools,
+    system_prompt,
+    cache_plan,
+    model_override,
+    effort_override,
+):
+    return _call_provider_with_optional_kwargs(
+        provider,
+        "create_message",
+        messages=messages,
+        tools=tools,
+        system_prompt=system_prompt,
+        cache_plan=cache_plan,
+        model_override=model_override,
+        effort_override=effort_override,
+    )
 
 
-def _stream_provider_message(provider, *, messages, tools, system_prompt, cache_plan):
-    if cache_plan is None:
-        return provider.stream_message(
-            messages=messages,
-            tools=tools,
-            system_prompt=system_prompt,
+def _stream_provider_message(
+    provider,
+    *,
+    messages,
+    tools,
+    system_prompt,
+    cache_plan,
+    model_override,
+    effort_override,
+):
+    return _call_provider_with_optional_kwargs(
+        provider,
+        "stream_message",
+        messages=messages,
+        tools=tools,
+        system_prompt=system_prompt,
+        cache_plan=cache_plan,
+        model_override=model_override,
+        effort_override=effort_override,
+    )
+
+
+def _call_provider_with_optional_kwargs(provider, method_name: str, **kwargs):
+    method = getattr(provider, method_name)
+    base_kwargs = {
+        "messages": kwargs["messages"],
+        "tools": kwargs["tools"],
+        "system_prompt": kwargs["system_prompt"],
+    }
+    optional_kwargs = {
+        name: value
+        for name, value in (
+            ("cache_plan", kwargs.get("cache_plan")),
+            ("model_override", kwargs.get("model_override")),
+            ("effort_override", kwargs.get("effort_override")),
         )
-    try:
-        return provider.stream_message(
-            messages=messages,
-            tools=tools,
-            system_prompt=system_prompt,
-            cache_plan=cache_plan,
-        )
-    except TypeError as exc:
-        if "cache_plan" not in str(exc):
-            raise
-        return provider.stream_message(
-            messages=messages,
-            tools=tools,
-            system_prompt=system_prompt,
-        )
+        if value is not None
+    }
+    while True:
+        try:
+            return method(**base_kwargs, **optional_kwargs)
+        except TypeError as exc:
+            message = str(exc)
+            unsupported_name = next(
+                (name for name in tuple(optional_kwargs) if name in message),
+                None,
+            )
+            if unsupported_name is None:
+                raise
+            optional_kwargs.pop(unsupported_name, None)
 
 
 def _review_final_text_with_advisor(

@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Literal
 
-from .skills import LoadedSkill, ProjectContext
+from .skills import LoadedSkill, ProjectContext, is_model_invocable_skill
 
 
 SYSTEM_PROMPT_TEMPLATE = """You are PyClaudeCode, a coding agent running in a local repository.
@@ -37,12 +37,23 @@ class SystemPromptBlock:
     kind: Literal["prefix", "static", "dynamic", "context_summary", "planning", "skills", "metadata"]
 
 
+@dataclass(slots=True, frozen=True)
+class PromptAttachment:
+    kind: Literal["plan_mode", "plan_mode_reentry", "plan_mode_exit"]
+    text: str
+    cache_scope: Literal["dynamic", "none"]
+    summary: str
+    one_shot: bool = False
+
+
 def compose_system_prompt_blocks(
     *,
     base_prompt: str,
     project_context: ProjectContext,
     auto_enabled_skills: list[LoadedSkill],
     manually_enabled_skills: list[LoadedSkill],
+    user_invocable_skills: list[LoadedSkill] | None = None,
+    skill_tool_available: bool = False,
     context_summary: str | None,
     planning_context: str | None = None,
 ) -> list[SystemPromptBlock]:
@@ -87,6 +98,30 @@ def compose_system_prompt_blocks(
                 kind="skills",
             )
         )
+    if skill_tool_available and user_invocable_skills:
+        model_invocable_skills = [skill for skill in user_invocable_skills if is_model_invocable_skill(skill)]
+        skill_lines = []
+        for skill in model_invocable_skills:
+            description = skill.description or skill.when_to_use or "No description provided."
+            argument_hint = f" args={skill.argument_hint}" if skill.argument_hint else ""
+            skill_lines.append(f"- /{skill.name}: {description}{argument_hint}")
+        if len(model_invocable_skills) != len(user_invocable_skills):
+            skill_lines.append(
+                "Some slash skills are user-only and unavailable to the model via the skill tool."
+            )
+        skill_lines.extend(
+            [
+                "User-facing invocation uses the slash command form shown above.",
+                "Use the skill tool only for listed skills and do not guess nonexistent skill names.",
+            ]
+        )
+        parts.append(
+            SystemPromptBlock(
+                text="User-invocable skills:\n" + "\n".join(skill_lines),
+                cache_scope="session",
+                kind="skills",
+            )
+        )
     if context_summary:
         parts.append(
             SystemPromptBlock(
@@ -110,12 +145,30 @@ def render_system_prompt_blocks(blocks: list[SystemPromptBlock]) -> str:
     return "\n\n".join(block.text for block in blocks if block.text.strip())
 
 
+def render_prompt_attachments(attachments: list[PromptAttachment]) -> str:
+    return "\n\n".join(attachment.text for attachment in attachments if attachment.text.strip())
+
+
+def render_provider_system_prompt(
+    blocks: list[SystemPromptBlock],
+    attachments: list[PromptAttachment] | None = None,
+) -> str:
+    parts = [render_system_prompt_blocks(blocks)]
+    if attachments:
+        rendered_attachments = render_prompt_attachments(attachments)
+        if rendered_attachments:
+            parts.append(rendered_attachments)
+    return "\n\n".join(part for part in parts if part.strip())
+
+
 def compose_system_prompt(
     *,
     base_prompt: str,
     project_context: ProjectContext,
     auto_enabled_skills: list[LoadedSkill],
     manually_enabled_skills: list[LoadedSkill],
+    user_invocable_skills: list[LoadedSkill] | None = None,
+    skill_tool_available: bool = False,
     context_summary: str | None,
     planning_context: str | None = None,
 ) -> str:
@@ -125,6 +178,8 @@ def compose_system_prompt(
             project_context=project_context,
             auto_enabled_skills=auto_enabled_skills,
             manually_enabled_skills=manually_enabled_skills,
+            user_invocable_skills=user_invocable_skills,
+            skill_tool_available=skill_tool_available,
             context_summary=context_summary,
             planning_context=planning_context,
         )

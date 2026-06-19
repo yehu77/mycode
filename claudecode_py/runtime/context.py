@@ -22,12 +22,16 @@ from ..plugins import PluginRegistry, build_builtin_plugin_registry
 from ..prompts import (
     SYSTEM_PROMPT_TEMPLATE,
     SystemPromptBlock,
-    compose_system_prompt,
     compose_system_prompt_blocks,
     render_system_prompt_blocks,
 )
 from ..providers import build_provider
-from ..skills import LoadedSkill, ProjectContext, load_project_context
+from ..skills import (
+    LoadedSkill,
+    ProjectContext,
+    build_user_invocable_skill_commands,
+    load_project_context,
+)
 from ..state import SessionState
 from ..tasks import TaskManager
 from ..tools import (
@@ -37,6 +41,8 @@ from ..tools import (
     BaseTool,
     BashTool,
     EditFileTool,
+    EnterPlanModeTool,
+    ExitPlanModeTool,
     FindCalleesTool,
     FindCallersTool,
     FindReferencesTool,
@@ -55,6 +61,7 @@ from ..tools import (
     SessionTaskGetTool,
     SessionTaskListTool,
     SessionTaskUpdateTool,
+    SkillTool,
     TaskGetTool,
     TaskListTool,
     TaskStopTool,
@@ -106,6 +113,9 @@ class SessionRuntimeContext:
 
     def build_system_prompt_blocks(self, state: SessionState) -> list[SystemPromptBlock]:
         auto_enabled_skills, manually_enabled_skills = self.active_skills_by_source(state)
+        user_invocable_skills = [
+            skill for skill in self.project_context.skills if skill.user_invocable
+        ]
         planning_context = None
         latest = _active_planning_artifact(state)
         if latest is not None:
@@ -120,6 +130,8 @@ class SessionRuntimeContext:
             project_context=self.project_context,
             auto_enabled_skills=auto_enabled_skills,
             manually_enabled_skills=manually_enabled_skills,
+            user_invocable_skills=user_invocable_skills,
+            skill_tool_available=any(tool.name == "skill" for tool in self.tools),
             context_summary=state.context_summary,
             planning_context=planning_context,
         )
@@ -152,10 +164,15 @@ class SessionRuntimeContext:
         )
 
     def refresh_command_registry(self, state: SessionState) -> None:
-        self.command_registry = self.plugin_registry.build_command_registry(
+        registry = self.plugin_registry.build_command_registry(
             state,
             base_commands=build_core_commands(),
         )
+        for command in build_user_invocable_skill_commands(self.project_context.skills):
+            if registry.has_command(command.name):
+                continue
+            registry.add_command(command)
+        self.command_registry = registry
 
     def describe_plugins(self, state: SessionState) -> str:
         return self.plugin_registry.describe_plugins(state)
@@ -252,14 +269,24 @@ def build_session_runtime_context(
         base_url=config.base_url,
     )
     resolved_plugin_registry = plugin_registry or build_builtin_plugin_registry()
-    resolved_command_registry = command_registry or resolved_plugin_registry.build_command_registry(
-        resolved_state,
-        base_commands=build_core_commands(),
-    )
     tools = _build_tools(mcp_registry)
     default_tools = [tool for tool in tools if not tool.is_deferred()]
     deferred_tools = [tool for tool in tools if tool.is_deferred()]
     base_project_context = load_project_context(config.cwd)
+    resolved_project_context = resolved_plugin_registry.build_project_context(
+        base_project_context,
+        resolved_state,
+        cwd=config.cwd,
+    )
+    resolved_command_registry = command_registry or resolved_plugin_registry.build_command_registry(
+        resolved_state,
+        base_commands=build_core_commands(),
+    )
+    if command_registry is None:
+        for command in build_user_invocable_skill_commands(resolved_project_context.skills):
+            if resolved_command_registry.has_command(command.name):
+                continue
+            resolved_command_registry.add_command(command)
     return SessionRuntimeContext(
         config=config,
         task_manager=resolved_task_manager,
@@ -267,11 +294,7 @@ def build_session_runtime_context(
         plugin_registry=resolved_plugin_registry,
         command_registry=resolved_command_registry,
         mcp_registry=mcp_registry,
-        project_context=resolved_plugin_registry.build_project_context(
-            base_project_context,
-            resolved_state,
-            cwd=config.cwd,
-        ),
+        project_context=resolved_project_context,
         base_system_prompt=SYSTEM_PROMPT_TEMPLATE.format(
             cwd=str(config.cwd),
             workspace_name=config.cwd.name,
@@ -299,6 +322,8 @@ def _build_tools(mcp_registry: McpRegistry | None) -> list[BaseTool]:
         EditFileTool(),
         ApplyPatchTool(),
         BashTool(),
+        EnterPlanModeTool(),
+        ExitPlanModeTool(),
         AgentTool(),
         TodoWriteTool(),
         SessionTaskCreateTool(),
@@ -310,6 +335,7 @@ def _build_tools(mcp_registry: McpRegistry | None) -> list[BaseTool]:
         TaskStopTool(),
         TaskWaitTool(),
         ToolSearchTool(),
+        SkillTool(),
         AskUserQuestionTool(),
         ListMcpResourcesTool(),
         ReadMcpResourceTool(),

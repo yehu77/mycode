@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from difflib import unified_diff
 from pathlib import Path
 from typing import Any, TYPE_CHECKING
@@ -12,6 +12,7 @@ if TYPE_CHECKING:
     from ..tasks import TaskManager
     from ..session import Session
 
+from ..models import Message
 from ..permissions import ApprovalRequest
 from ..state import WorkspaceFileChange
 
@@ -34,12 +35,52 @@ def format_tool_output(value: Any) -> str:
     return json.dumps(value, ensure_ascii=True, indent=2)
 
 
+def normalize_tool_execution_payload(value: Any) -> "ToolExecutionPayload":
+    if isinstance(value, ToolExecutionPayload):
+        return ToolExecutionPayload(
+            result=value.result,
+            new_messages=[dict(message) for message in value.new_messages],
+            context_update=value.context_update,
+            session_mutation=value.session_mutation,
+        )
+    return ToolExecutionPayload(result=value)
+
+
 @dataclass(slots=True)
 class ToolContext:
     cwd: Path
     permission_manager: "PermissionManager"
     task_manager: "TaskManager"
     session: "Session"
+    tool_call_id: str | None = None
+
+
+@dataclass(slots=True)
+class ToolContextUpdate:
+    allowed_tool_names: tuple[str, ...] | None = None
+    allowed_bash_command_prefixes: tuple[str, ...] | None = None
+    require_read_only_subagents: bool = False
+    model_override: str | None = None
+    effort_override: str | None = None
+    source: str = ""
+    skill_name: str | None = None
+
+
+@dataclass(slots=True, frozen=True)
+class ToolSessionMutation:
+    kind: str
+    source_tool_name: str
+    source_tool_call_id: str | None = None
+    plan_file_path: str | None = None
+    plan_content: str | None = None
+
+
+@dataclass(slots=True)
+class ToolExecutionPayload:
+    result: Any
+    new_messages: list[Message] = field(default_factory=list)
+    context_update: ToolContextUpdate | None = None
+    session_mutation: ToolSessionMutation | None = None
 
 
 @dataclass(slots=True)

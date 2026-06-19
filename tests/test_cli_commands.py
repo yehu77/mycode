@@ -1,4 +1,4 @@
-from pathlib import Path
+﻿from pathlib import Path
 from io import StringIO
 import json
 import shutil
@@ -993,7 +993,7 @@ class CliCommandTests(unittest.TestCase):
             self.assertIn(f"artifact_id: {artifact.artifact_id}", output_advisor)
             self.assertIn("focused file:", output_advisor)
             self.assertIn("go_to_change: /changes show", output_advisor)
-            self.assertIn("go_to_plan: /plan execution 1 file 1 | /plan execution | /plan advisor", output_advisor)
+            self.assertIn("go_to_plan: /planning execution 1 file 1 | /planning execution | /planning advisor", output_advisor)
             self.assertIn("stay_on_surface: /task show " + task.id + " file 1", output_advisor)
             self.assertIn("/task advisor " + task.id, output_advisor)
             self.assertIn("background_linkage:", output_advisor)
@@ -1004,7 +1004,7 @@ class CliCommandTests(unittest.TestCase):
             self.assertIn("pending_tools: apply_patch", output_drift)
             self.assertIn("focused file:", output_drift)
             self.assertIn("go_to_change: /changes show", output_drift)
-            self.assertIn("go_to_plan: /plan execution 1 file 1 | /plan execution | /plan advisor", output_drift)
+            self.assertIn("go_to_plan: /planning execution 1 file 1 | /planning execution | /planning advisor", output_drift)
             self.assertIn("stay_on_surface: /task show " + task.id + " file 1", output_drift)
             self.assertIn("/task drift " + task.id, output_drift)
             self.assertIn("background_linkage:", output_drift)
@@ -1059,8 +1059,8 @@ class CliCommandTests(unittest.TestCase):
 
         try:
             _handled_change_focus, _output_change_focus = _handle_repl_command(session, "/changes show 1 file 2")
-            handled_plan, output_plan = _handle_repl_command(session, "/plan")
-            handled_advisor, output_advisor = _handle_repl_command(session, "/plan advisor")
+            handled_plan, output_plan = _handle_repl_command(session, "/planning")
+            handled_advisor, output_advisor = _handle_repl_command(session, "/planning advisor")
 
             self.assertTrue(handled_plan)
             self.assertTrue(handled_advisor)
@@ -1068,7 +1068,7 @@ class CliCommandTests(unittest.TestCase):
             assert output_advisor is not None
             self.assertIn("- focused file: b.py", output_plan)
             self.assertIn("- focused file: b.py", output_advisor)
-            self.assertIn("go_to_plan: /plan file 2", output_advisor)
+            self.assertIn("go_to_plan: /planning file 2", output_advisor)
         finally:
             session.close()
             _cleanup_dir(cwd)
@@ -1192,8 +1192,8 @@ class CliCommandTests(unittest.TestCase):
         )
 
         try:
-            handled_focus, output_focus = _handle_repl_command(session, "/plan file 2")
-            handled_invalid, output_invalid = _handle_repl_command(session, "/plan file 9")
+            handled_focus, output_focus = _handle_repl_command(session, "/planning file 2")
+            handled_invalid, output_invalid = _handle_repl_command(session, "/planning file 9")
 
             self.assertTrue(handled_focus)
             self.assertTrue(handled_invalid)
@@ -1202,7 +1202,7 @@ class CliCommandTests(unittest.TestCase):
             self.assertIn("focused file:", output_focus)
             self.assertIn("- focused file: notes.md", output_focus)
             self.assertIn("- context-only: yes", output_focus)
-            self.assertEqual(output_invalid, "Usage: /plan file <n>")
+            self.assertEqual(output_invalid, "Usage: /planning file <n>")
         finally:
             session.close()
             _cleanup_dir(cwd)
@@ -1252,10 +1252,10 @@ class CliCommandTests(unittest.TestCase):
         artifact.task_ids.extend([scout.id, execution.id])
 
         try:
-            handled_scout_focus, output_scout_focus = _handle_repl_command(session, "/plan scouts 1 file 2")
-            handled_scout_invalid, output_scout_invalid = _handle_repl_command(session, "/plan scouts 1 file 9")
-            handled_execution_focus, output_execution_focus = _handle_repl_command(session, "/plan execution 1 file 2")
-            handled_execution_invalid, output_execution_invalid = _handle_repl_command(session, "/plan execution 1 file 9")
+            handled_scout_focus, output_scout_focus = _handle_repl_command(session, "/planning scouts 1 file 2")
+            handled_scout_invalid, output_scout_invalid = _handle_repl_command(session, "/planning scouts 1 file 9")
+            handled_execution_focus, output_execution_focus = _handle_repl_command(session, "/planning execution 1 file 2")
+            handled_execution_invalid, output_execution_invalid = _handle_repl_command(session, "/planning execution 1 file 9")
 
             self.assertTrue(handled_scout_focus)
             self.assertTrue(handled_scout_invalid)
@@ -1268,11 +1268,11 @@ class CliCommandTests(unittest.TestCase):
             self.assertIn("selected scout focused file:", output_scout_focus)
             self.assertIn("- focused file: notes.md", output_scout_focus)
             self.assertIn("- context-only: yes", output_scout_focus)
-            self.assertEqual(output_scout_invalid, "Usage: /plan scouts [<n> [file <m>]]")
+            self.assertEqual(output_scout_invalid, "Usage: /planning scouts [<n> [file <m>]]")
             self.assertIn("selected execution focused file:", output_execution_focus)
             self.assertIn("- focused file: notes.md", output_execution_focus)
             self.assertIn("- context-only: yes", output_execution_focus)
-            self.assertEqual(output_execution_invalid, "Usage: /plan execution [<n> [file <m>]]")
+            self.assertEqual(output_execution_invalid, "Usage: /planning execution [<n> [file <m>]]")
         finally:
             session.close()
             _cleanup_dir(cwd)
@@ -1370,7 +1370,7 @@ class CliCommandTests(unittest.TestCase):
         session.state.last_plan_drift_status = "revise"
         session.state.last_plan_drift_context = "pending_tools: apply_patch"
 
-        handled, output = _handle_repl_command(session, "/plan timeline")
+        handled, output = _handle_repl_command(session, "/planning timeline")
 
         self.assertTrue(handled)
         assert output is not None
@@ -1417,7 +1417,7 @@ class CliCommandTests(unittest.TestCase):
         )
         session.task_manager.set_progress(execution.id, "Inspect runtime flow")
 
-        handled, output = _handle_repl_command(session, "/plan timeline execution")
+        handled, output = _handle_repl_command(session, "/planning timeline execution")
 
         self.assertTrue(handled)
         assert output is not None
@@ -1462,7 +1462,7 @@ class CliCommandTests(unittest.TestCase):
 
         handled, output = _handle_repl_command(
             session,
-            f"/plan timeline execution delta=after-drift focus=task:{execution.id}",
+            f"/planning timeline execution delta=after-drift focus=task:{execution.id}",
         )
 
         self.assertTrue(handled)
@@ -1509,7 +1509,7 @@ class CliCommandTests(unittest.TestCase):
 
         handled, output = _handle_repl_command(
             session,
-            "/plan timeline all compare=active-vs-previous",
+            "/planning timeline all compare=active-vs-previous",
         )
 
         self.assertTrue(handled)
@@ -1546,7 +1546,7 @@ class CliCommandTests(unittest.TestCase):
 
         handled, output = _handle_repl_command(
             session,
-            "/plan timeline all phase=execution-loop",
+            "/planning timeline all phase=execution-loop",
         )
 
         self.assertTrue(handled)
@@ -1634,7 +1634,7 @@ class CliCommandTests(unittest.TestCase):
 
         handled, output = _handle_repl_command(
             session,
-            "/plan timeline all phase=execution-loop compare=active-vs-previous",
+            "/planning timeline all phase=execution-loop compare=active-vs-previous",
         )
 
         self.assertTrue(handled)
@@ -1674,7 +1674,7 @@ class CliCommandTests(unittest.TestCase):
 
         handled, output = _handle_repl_command(
             session,
-            "/plan timeline all phase=execution-loop compare=after-drift-vs-all",
+            "/planning timeline all phase=execution-loop compare=after-drift-vs-all",
         )
 
         self.assertTrue(handled)
@@ -1713,7 +1713,7 @@ class CliCommandTests(unittest.TestCase):
 
         handled, output = _handle_repl_command(
             session,
-            "/plan timeline all phase=execution-loop",
+            "/planning timeline all phase=execution-loop",
         )
 
         self.assertTrue(handled)
@@ -1766,8 +1766,8 @@ class CliCommandTests(unittest.TestCase):
         )
         session.task_manager.complete(execution.id, "Inspect query_loop.py and session.py.")
 
-        handled_latest, output_latest = _handle_repl_command(session, "/plan replay latest")
-        handled_first, output_first = _handle_repl_command(session, "/plan replay at=1")
+        handled_latest, output_latest = _handle_repl_command(session, "/planning replay latest")
+        handled_first, output_first = _handle_repl_command(session, "/planning replay at=1")
 
         self.assertTrue(handled_latest)
         self.assertTrue(handled_first)
@@ -1814,7 +1814,7 @@ class CliCommandTests(unittest.TestCase):
 
         handled, output = _handle_repl_command(
             session,
-            "/plan replay compare=execution-vs-scout",
+            "/planning replay compare=execution-vs-scout",
         )
 
         self.assertTrue(handled)
@@ -1869,7 +1869,7 @@ class CliCommandTests(unittest.TestCase):
 
         handled, output = _handle_repl_command(
             session,
-            "/plan replay compare=active-vs-previous",
+            "/planning replay compare=active-vs-previous",
         )
 
         self.assertTrue(handled)
@@ -1878,12 +1878,12 @@ class CliCommandTests(unittest.TestCase):
         self.assertIn("lineage_replay_compare:", output)
         self.assertIn(f"- current_artifact: {artifact.artifact_id} goal=current plan", output)
         self.assertIn(f"- previous_artifact: {previous.artifact_id} goal=previous plan", output)
-        self.assertIn(f"- compare_current_replay: /plan replay latest all artifact={artifact.artifact_id}", output)
-        self.assertIn(f"- compare_previous_replay: /plan replay latest all artifact={previous.artifact_id}", output)
+        self.assertIn(f"- compare_current_replay: /planning replay latest all artifact={artifact.artifact_id}", output)
+        self.assertIn(f"- compare_previous_replay: /planning replay latest all artifact={previous.artifact_id}", output)
         self.assertIn(f"- added_execution_tasks: {execution.id}", output)
         self.assertIn(f"- removed_scout_tasks: {previous_scout.id}", output)
         self.assertIn("- entry_delta_scout:", output)
-        self.assertIn(f"actions=/task show {previous_scout.id} | /plan scouts", output)
+        self.assertIn(f"actions=/task show {previous_scout.id} | /planning scouts", output)
         self.assertIn("- entry_delta_execution:", output)
         self.assertIn(f"actions=/task show {execution.id} | /task advisor {execution.id}", output)
         self.assertIn("- phase_entry_delta:Scout Research: added=0 removed=1", output)
@@ -1922,7 +1922,7 @@ class CliCommandTests(unittest.TestCase):
 
         handled, output = _handle_repl_command(
             session,
-            "/plan replay latest artifact=previous",
+            "/planning replay latest artifact=previous",
         )
 
         self.assertTrue(handled)
@@ -2138,18 +2138,18 @@ class CliCommandTests(unittest.TestCase):
         older = session.planning_artifacts()[0]
 
         try:
-            handled_show, output_show = _handle_repl_command(session, "/plan")
-            handled_list, output_list = _handle_repl_command(session, "/plan list")
-            handled_scouts, output_scouts = _handle_repl_command(session, "/plan scouts")
-            handled_execution, output_execution = _handle_repl_command(session, "/plan execution")
-            handled_advisor, output_advisor = _handle_repl_command(session, "/plan advisor")
-            handled_lineage, output_lineage = _handle_repl_command(session, "/plan lineage")
-            handled_use, output_use = _handle_repl_command(session, f"/plan use {older.artifact_id[:6]}")
-            handled_detail, output_detail = _handle_repl_command(session, f"/plan show {older.artifact_id[:6]}")
-            handled_latest_detail, output_latest_detail = _handle_repl_command(session, "/plan show latest")
-            handled_derive, output_derive = _handle_repl_command(session, "/plan derive tighten the module boundaries")
-            handled_revert, output_revert = _handle_repl_command(session, f"/plan revert {older.artifact_id[:6]}")
-            handled_clear, output_clear = _handle_repl_command(session, "/plan clear")
+            handled_show, output_show = _handle_repl_command(session, "/planning")
+            handled_list, output_list = _handle_repl_command(session, "/planning list")
+            handled_scouts, output_scouts = _handle_repl_command(session, "/planning scouts")
+            handled_execution, output_execution = _handle_repl_command(session, "/planning execution")
+            handled_advisor, output_advisor = _handle_repl_command(session, "/planning advisor")
+            handled_lineage, output_lineage = _handle_repl_command(session, "/planning lineage")
+            handled_use, output_use = _handle_repl_command(session, f"/planning use {older.artifact_id[:6]}")
+            handled_detail, output_detail = _handle_repl_command(session, f"/planning show {older.artifact_id[:6]}")
+            handled_latest_detail, output_latest_detail = _handle_repl_command(session, "/planning show latest")
+            handled_derive, output_derive = _handle_repl_command(session, "/planning derive tighten the module boundaries")
+            handled_revert, output_revert = _handle_repl_command(session, f"/planning revert {older.artifact_id[:6]}")
+            handled_clear, output_clear = _handle_repl_command(session, "/planning clear")
 
             self.assertTrue(handled_show)
             self.assertTrue(handled_list)
@@ -2173,8 +2173,8 @@ class CliCommandTests(unittest.TestCase):
             self.assertIn("against_next:", output_detail or "")
             self.assertIn("summary_diff:", output_detail or "")
             self.assertIn("next_actions:", output_detail or "")
-            self.assertIn(f"/plan derive {older.goal}", output_detail or "")
-            self.assertIn(f"/plan revert {session.planning_artifacts()[-1].artifact_id}", output_latest_detail or "")
+            self.assertIn(f"/planning derive {older.goal}", output_detail or "")
+            self.assertIn(f"/planning revert {session.planning_artifacts()[-1].artifact_id}", output_latest_detail or "")
             self.assertIn("against_previous:", output_latest_detail or "")
             self.assertIn("derived_from_drift: yes", output_latest_detail or "")
             self.assertIn("derivation_reason: Need a revised runtime sequence.", output_latest_detail or "")
@@ -2186,24 +2186,24 @@ class CliCommandTests(unittest.TestCase):
             self.assertIn("selected_scout_summary:", output_scouts or "")
             self.assertIn("next_actions:", output_scouts or "")
             self.assertIn("go_to_task: /task show", output_scouts or "")
-            self.assertIn("stay_on_surface: /plan scouts", output_scouts or "")
+            self.assertIn("stay_on_surface: /planning scouts", output_scouts or "")
             self.assertIn("execution_tasks:", output_execution or "")
             self.assertIn("selected_execution_summary:", output_execution or "")
             self.assertIn("selected_execution_detail:", output_execution or "")
             self.assertIn("Implement runtime changes", output_execution or "")
             self.assertIn("phase: running", output_execution or "")
             self.assertIn("Inspect runtime flow", output_execution or "")
-            self.assertIn("selected_execution_plan_advisor_action: /plan advisor", output_execution or "")
+            self.assertIn("selected_execution_plan_advisor_action: /planning advisor", output_execution or "")
             self.assertIn("selected_execution_advisor_status_action: /advisor status", output_execution or "")
             self.assertIn("next_actions:", output_execution or "")
             self.assertIn("go_to_task: /task show", output_execution or "")
-            self.assertIn("stay_on_surface: /plan execution | /plan advisor | /advisor status", output_execution or "")
+            self.assertIn("stay_on_surface: /planning execution | /planning advisor | /advisor status", output_execution or "")
             self.assertIn("advisor_review:", output_advisor or "")
             self.assertIn("lineage:", output_lineage or "")
             self.assertIn("current", output_lineage or "")
             self.assertIn("comparisons:", output_lineage or "")
             self.assertIn("next_actions:", output_lineage or "")
-            self.assertIn("selected: /plan derive", output_lineage or "")
+            self.assertIn("selected: /planning derive", output_lineage or "")
             self.assertIn("advisor_review:", output_detail or "")
             self.assertIn("Scout architecture", output_detail or "")
             self.assertIn("Inspect session.py and runtime/context.py.", output_detail or "")
@@ -2221,19 +2221,19 @@ class CliCommandTests(unittest.TestCase):
         session = Session(SessionConfig(cwd=cwd, interactive=False))
 
         try:
-            handled_scouts, output_scouts = _handle_repl_command(session, "/plan scouts")
-            handled_execution, output_execution = _handle_repl_command(session, "/plan execution")
-            handled_advisor, output_advisor = _handle_repl_command(session, "/plan advisor")
-            handled_lineage, output_lineage = _handle_repl_command(session, "/plan lineage")
+            handled_scouts, output_scouts = _handle_repl_command(session, "/planning scouts")
+            handled_execution, output_execution = _handle_repl_command(session, "/planning execution")
+            handled_advisor, output_advisor = _handle_repl_command(session, "/planning advisor")
+            handled_lineage, output_lineage = _handle_repl_command(session, "/planning lineage")
 
             self.assertTrue(handled_scouts)
             self.assertTrue(handled_execution)
             self.assertTrue(handled_advisor)
             self.assertTrue(handled_lineage)
-            self.assertEqual(output_scouts, "No active planning artifact for /plan scouts.")
-            self.assertEqual(output_execution, "No active planning artifact for /plan execution.")
+            self.assertEqual(output_scouts, "No active planning artifact for /planning scouts.")
+            self.assertEqual(output_execution, "No active planning artifact for /planning execution.")
             self.assertEqual(output_advisor, "No active planning artifact for advisor detail.")
-            self.assertEqual(output_lineage, "No active planning artifact for /plan lineage.")
+            self.assertEqual(output_lineage, "No active planning artifact for /planning lineage.")
         finally:
             session.close()
             _cleanup_dir(cwd)
@@ -2577,8 +2577,8 @@ class CliCommandTests(unittest.TestCase):
             self.assertIn("inspect_focused_diff: /changes show ", output_show)
             self.assertIn("inspect_task: /task show " + task.id, output_show)
             self.assertIn("/task show " + execution.id, output_show)
-            self.assertIn("inspect_active_plan: /plan file 1", output_show)
-            self.assertIn("/plan execution 1 file 1", output_show)
+            self.assertIn("inspect_active_plan: /planning file 1", output_show)
+            self.assertIn("/planning execution 1 file 1", output_show)
             self.assertIn("stay_on_surface: /changes show ", output_show)
             self.assertIn("/changes working-set", output_show)
         finally:
@@ -3638,7 +3638,9 @@ class CliCommandTests(unittest.TestCase):
             rendered = stdout.getvalue()
             self.assertIn("agent definitions:", rendered)
             self.assertIn("source summary:", rendered)
-            self.assertIn("- builtin: definitions=4 effective=4 shadowed=0 root=builtin", rendered)
+            self.assertIn("- builtin: definitions=6 effective=6 shadowed=0 root=builtin", rendered)
+            self.assertIn("- Explore: source=builtin effective=yes override_state=base based_on=read_only_planning", rendered)
+            self.assertIn("- Plan: source=builtin effective=yes override_state=base based_on=read_only_planning", rendered)
             self.assertIn("effective definitions:", rendered)
             self.assertIn("- default: source=builtin effective=yes override_state=base based_on=none", rendered)
             self.assertIn("- background: source=builtin effective=yes override_state=base based_on=none", rendered)
@@ -4620,3 +4622,4 @@ class CliCommandTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+

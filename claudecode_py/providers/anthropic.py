@@ -19,6 +19,8 @@ from .errors import (
 
 
 class AnthropicProvider:
+    _EFFORT_BETA_HEADER = "effort-2025-11-24"
+
     def __init__(self, *, model: str, max_tokens: int, api_key: str | None = None) -> None:
         self.model = model
         self.max_tokens = max_tokens
@@ -58,6 +60,8 @@ class AnthropicProvider:
         tools: list[dict[str, Any]],
         system_prompt: str,
         cache_plan: ProviderPromptCachePlan | None = None,
+        model_override: str | None = None,
+        effort_override: str | None = None,
     ) -> AssistantResponse:
         client = self._ensure_client()
         try:
@@ -67,6 +71,8 @@ class AnthropicProvider:
                 tools=tools,
                 system_prompt=system_prompt,
                 cache_plan=cache_plan,
+                model_override=model_override,
+                effort_override=effort_override,
             )
         except Exception as exc:  # noqa: BLE001
             raise self._wrap_error(exc) from exc
@@ -80,6 +86,8 @@ class AnthropicProvider:
         tools: list[dict[str, Any]],
         system_prompt: str,
         cache_plan: ProviderPromptCachePlan | None = None,
+        model_override: str | None = None,
+        effort_override: str | None = None,
     ) -> Iterator[ProviderStreamEvent]:
         client = self._ensure_client()
         try:
@@ -89,6 +97,8 @@ class AnthropicProvider:
                 tools=tools,
                 system_prompt=system_prompt,
                 cache_plan=cache_plan,
+                model_override=model_override,
+                effort_override=effort_override,
             ) as stream:
                 for text in stream.text_stream:
                     if text:
@@ -110,12 +120,16 @@ class AnthropicProvider:
         tools: list[dict[str, Any]],
         system_prompt: str,
         cache_plan: ProviderPromptCachePlan | None,
+        model_override: str | None,
+        effort_override: str | None,
     ):
         hinted_kwargs = self._request_kwargs(
             messages=messages,
             tools=tools,
             system_prompt=system_prompt,
             cache_plan=cache_plan,
+            model_override=model_override,
+            effort_override=effort_override,
         )
         try:
             return client.messages.create(**hinted_kwargs)
@@ -130,6 +144,8 @@ class AnthropicProvider:
                     tools=tools,
                     system_prompt=system_prompt,
                     cache_plan=None,
+                    model_override=model_override,
+                    effort_override=effort_override,
                 )
             )
 
@@ -141,12 +157,16 @@ class AnthropicProvider:
         tools: list[dict[str, Any]],
         system_prompt: str,
         cache_plan: ProviderPromptCachePlan | None,
+        model_override: str | None,
+        effort_override: str | None,
     ):
         hinted_kwargs = self._request_kwargs(
             messages=messages,
             tools=tools,
             system_prompt=system_prompt,
             cache_plan=cache_plan,
+            model_override=model_override,
+            effort_override=effort_override,
         )
         try:
             return client.messages.stream(**hinted_kwargs)
@@ -161,6 +181,8 @@ class AnthropicProvider:
                     tools=tools,
                     system_prompt=system_prompt,
                     cache_plan=None,
+                    model_override=model_override,
+                    effort_override=effort_override,
                 )
             )
 
@@ -171,6 +193,8 @@ class AnthropicProvider:
         tools: list[dict[str, Any]],
         system_prompt: str,
         cache_plan: ProviderPromptCachePlan | None,
+        model_override: str | None,
+        effort_override: str | None,
     ) -> dict[str, Any]:
         request_tools = tools
         request_system: str | list[dict[str, Any]] = system_prompt
@@ -182,13 +206,21 @@ class AnthropicProvider:
             if cache_plan.system_prompt_blocks:
                 request_system = [dict(block) for block in cache_plan.system_prompt_blocks]
             request_tools = [dict(tool) for tool in cache_plan.tools]
-        return {
-            "model": self.model,
+        request_kwargs: dict[str, Any] = {
+            "model": model_override or self.model,
             "max_tokens": self.max_tokens,
             "system": request_system,
             "messages": messages,
             "tools": request_tools,
         }
+        if effort_override:
+            request_kwargs["extra_headers"] = {
+                "anthropic-beta": self._EFFORT_BETA_HEADER,
+            }
+            request_kwargs["extra_body"] = {
+                "output_config": {"effort": effort_override},
+            }
+        return request_kwargs
 
     def _should_fallback_cache_plan(
         self,

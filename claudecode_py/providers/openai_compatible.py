@@ -73,8 +73,10 @@ class OpenAICompatibleProvider:
         tools: list[dict[str, Any]],
         system_prompt: str,
         cache_plan: ProviderPromptCachePlan | None = None,
+        model_override: str | None = None,
+        effort_override: str | None = None,
     ) -> AssistantResponse:
-        del cache_plan
+        del cache_plan, effort_override
         client = self._ensure_client()
         try:
             response = client.chat.completions.create(
@@ -82,6 +84,7 @@ class OpenAICompatibleProvider:
                     messages=messages,
                     tools=tools,
                     system_prompt=system_prompt,
+                    model_override=model_override,
                     stream=False,
                 )
             )
@@ -101,8 +104,10 @@ class OpenAICompatibleProvider:
         tools: list[dict[str, Any]],
         system_prompt: str,
         cache_plan: ProviderPromptCachePlan | None = None,
+        model_override: str | None = None,
+        effort_override: str | None = None,
     ) -> Iterator[ProviderStreamEvent]:
-        del cache_plan
+        del cache_plan, effort_override
         client = self._ensure_client()
         try:
             stream = client.chat.completions.create(
@@ -110,6 +115,7 @@ class OpenAICompatibleProvider:
                     messages=messages,
                     tools=tools,
                     system_prompt=system_prompt,
+                    model_override=model_override,
                     stream=True,
                 )
             )
@@ -205,10 +211,11 @@ class OpenAICompatibleProvider:
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]],
         system_prompt: str,
+        model_override: str | None,
         stream: bool,
     ) -> dict[str, Any]:
         return {
-            "model": self.model,
+            "model": model_override or self.model,
             "max_tokens": self.max_tokens,
             "messages": self._convert_messages(messages, system_prompt),
             "tools": self._convert_tools(tools),

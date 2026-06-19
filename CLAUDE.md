@@ -30,6 +30,7 @@ The current Python implementation already covers the main local runtime shape:
 - Anthropic and OpenAI-compatible provider paths
 - MCP registration, discovery, tool exposure, stdio service, and TCP bridge
 - planning, advisor, task, workspace, symbol, and change-inspection surfaces
+- mode-centric `/plan` runtime with session plan files, Enter/Exit plan-mode tools, provider-view workflow attachments, built-in `Explore` / `Plan` planning agents, and separate `/planning` artifact-inspection surfaces
 - project-local external plugin loading via `.pyclaude/plugins/<name>/plugin.json`
 - shared local plugin workflow vocabulary across `/plugins`, `/plugin show`, `/project-context plugins`, `/config plugins`, `/status`, stdio/remote, and TUI
 - unified `/project-context` inspection for project memory, grouped skill state, plugin contributions, and session-local reload status
@@ -80,6 +81,7 @@ Operationally, this is beyond skeleton status. It is already a usable local codi
 - Implemented: local skills now have shared registry/source/status/reload/prompt-composition inspection across REPL, TUI, stdio, and remote, including conflict diagnostics and dedicated TUI skill-registry depth.
 - Current Boundary: builtin, project-local, and plugin-contributed skills now form one coherent local workflow.
 - Remaining Gap: broader upstream prompt-product breadth and packaging/distribution breadth remain out of local-first scope.
+- Source-Depth Note: detailed upstream-vs-local skill runtime analysis now lives in `SKILL_SOURCE_ALIGNMENT.md`.
 
 ### Background Agents / Local Agent Workflow
 
@@ -98,6 +100,12 @@ Operationally, this is beyond skeleton status. It is already a usable local codi
 - Implemented: provider-view prompt assembly now uses prompt blocks, tool-schema caching, deterministic prefix signatures, explicit reduction tiers, and replacement/artifact/microcompact-aware prompt-prefix summaries across `/context`, `/status`, TUI, stdio, and remote.
 - Current Boundary: local prompt-prefix preservation and diagnostics are implemented without changing provider wire shape or adding hosted cache infrastructure.
 - Remaining Gap: provider-native cache-control wire behavior and broader hosted cache/runtime breadth remain outside the local-first scope.
+
+### Plan Mode / Plan Mode V2 Workflow
+
+- Implemented: `/plan` now follows the upstream mode-centric runtime shape, with true plan-mode write/tool restrictions, session-scoped plan files, `EnterPlanMode` / `ExitPlanMode` tools, provider-view `plan_mode` / `plan_mode_reentry` / `plan_mode_exit` attachments, default `five_phase` plus explicit `interview` workflow families, builtin `Explore` / `Plan` planning agents, and separate `/planning` artifact/timeline/replay/audit surfaces.
+- Current Boundary: the full local-first Plan Mode V2 workflow line is closed, including workflow instructions, planning-agent binding, interview-branch continuity, and workflow-state observability across `/context`, `/status workflow`, TUI, stdio, and remote.
+- Remaining Gap: broader upstream approval UI, CCR/ultraplan remote execution, teammate/leader mailbox flows, and other hosted product breadth remain out of scope rather than active local plan-runtime deficits.
 
 ### Session Architecture Ownership Cleanup
 
@@ -131,6 +139,12 @@ Operationally, this is beyond skeleton status. It is already a usable local codi
 - Current Boundary: the remaining gap is refinement rather than missing mechanism, with heuristic local costing, conservative candidate search, and narrower orchestration coverage outside the main turn.
 - Remaining Work: if this line is reopened, prioritize deeper candidate sequencing, tighter preserved-prefix accounting, and better workflow consumption in `/context`, `/status workflow`, TUI, stdio, and remote before widening provider breadth.
 
+### Plan Runtime Follow-Up
+
+- Current Shape: the local plan line is now centered on real plan mode runtime and Plan Mode V2 workflow rather than artifact browsing, with plan-mode constraints, attachments, builtin planning agents, and workflow-family observability all aligned.
+- Current Boundary: the remaining work is no longer core `/plan` reproduction, but optional polish around docs, TUI/workflow ergonomics, and selective local extensions on top of the completed runtime.
+- Remaining Work: if reopened, treat future work as post-closure follow-up such as additive planning UX polish or broader upstream approval/product breadth experiments, not as unfinished core plan-mode mechanics.
+
 ## Current Repo Health
 
 - Full test suite currently passes: `604 passed, 1 skipped`
@@ -139,6 +153,7 @@ Operationally, this is beyond skeleton status. It is already a usable local codi
 - Current documentation reflects the local-tool-first scope instead of implying full product parity
 - Detailed upstream-to-Python parity tracking lives in `PARITY_MATRIX.md`
 - Source-depth alignment to the upstream implementation is tracked separately in `UPSTREAM_SOURCE_ALIGNMENT.md`
+- Skill-specific source-depth alignment is tracked separately in `SKILL_SOURCE_ALIGNMENT.md`
 
 ## Next-Stage Roadmap
 

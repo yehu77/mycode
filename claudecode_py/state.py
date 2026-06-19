@@ -132,6 +132,15 @@ class SessionState:
     session_id: str = field(default_factory=lambda: uuid4().hex)
     created_at: str = field(default_factory=_utc_now_iso)
     updated_at: str | None = None
+    session_runtime_mode: str = "default"
+    pre_plan_mode: str | None = None
+    has_exited_plan_mode: bool = False
+    needs_plan_mode_exit_attachment: bool = False
+    needs_plan_mode_reentry_attachment: bool = False
+    plan_mode_attachment_count: int = 0
+    plan_mode_exit_approved_plan: str | None = None
+    plan_mode_exit_restored_mode: str | None = None
+    plan_slug: str | None = None
     session_execution_mode: str = "main"
     session_command_policy_name: str | None = None
     session_command_policy_source: str | None = None

@@ -1,4 +1,4 @@
-from pathlib import Path
+﻿from pathlib import Path
 from importlib.util import find_spec
 import shutil
 import sys
@@ -98,8 +98,8 @@ class TuiAppTests(unittest.TestCase):
         app._render = lambda: None  # type: ignore[method-assign]
         app._plan_panel_text = lambda: (  # type: ignore[method-assign]
             "selected_audit_artifact_id: plan-123\n"
-            "selected_audit_primary_action: /plan replay latest artifact=plan-123\n"
-            "selected_audit_secondary_action: /plan timeline all artifact=plan-123\n"
+            "selected_audit_primary_action: /planning replay latest artifact=plan-123\n"
+            "selected_audit_secondary_action: /planning timeline all artifact=plan-123\n"
         )
 
         try:
@@ -107,11 +107,11 @@ class TuiAppTests(unittest.TestCase):
             self.assertEqual(app.state.plan_panel_view, "audit")
             with patch("claudecode_py.tui.app._handle_repl_command", return_value=(True, "audit replay")):
                 app.action_execute_lineage_show()
-            self.assertIn("[You]\n/plan replay latest artifact=plan-123", app.state.messages)
+            self.assertIn("[You]\n/planning replay latest artifact=plan-123", app.state.messages)
             self.assertIn("[System]\naudit replay", app.state.messages)
             with patch("claudecode_py.tui.app._handle_repl_command", return_value=(True, "audit timeline")):
                 app.action_execute_lineage_default_action()
-            self.assertIn("[You]\n/plan timeline all artifact=plan-123", app.state.messages)
+            self.assertIn("[You]\n/planning timeline all artifact=plan-123", app.state.messages)
             self.assertIn("[System]\naudit timeline", app.state.messages)
         finally:
             session.close()
@@ -133,7 +133,7 @@ class TuiAppTests(unittest.TestCase):
         def render_text() -> str:
             if app.state.plan_panel_view == "timeline":
                 return (
-                    "selected_timeline_compare_primary_action: /plan advisor\n"
+                    "selected_timeline_compare_primary_action: /planning advisor\n"
                     "selected_timeline_compare_secondary_action: /task drift task-123\n"
                 )
             if app.state.selected_plan_replay_index == 2:
@@ -142,8 +142,8 @@ class TuiAppTests(unittest.TestCase):
                     "selected_replay_secondary_action: /task drift task-123\n"
                 )
             return (
-                "selected_replay_primary_action: /plan advisor\n"
-                "selected_replay_secondary_action: /plan execution\n"
+                "selected_replay_primary_action: /planning advisor\n"
+                "selected_replay_secondary_action: /planning execution\n"
             )
 
         app._plan_panel_text = render_text  # type: ignore[method-assign]
@@ -206,8 +206,8 @@ class TuiAppTests(unittest.TestCase):
         app._render = lambda: None  # type: ignore[method-assign]
         app._plan_panel_text = lambda: (  # type: ignore[method-assign]
             "selected_timeline_compare_label: phase:Execution Loop\n"
-            "selected_timeline_compare_primary_action: /plan timeline all phase=execution-loop artifact=artifact-active\n"
-            "selected_timeline_compare_secondary_action: /plan timeline all phase=execution-loop artifact=artifact-prev\n"
+            "selected_timeline_compare_primary_action: /planning timeline all phase=execution-loop artifact=artifact-active\n"
+            "selected_timeline_compare_secondary_action: /planning timeline all phase=execution-loop artifact=artifact-prev\n"
         )
 
         try:
@@ -255,8 +255,8 @@ class TuiAppTests(unittest.TestCase):
         session.describe_active_plan_audit = (  # type: ignore[method-assign]
             lambda *args, **kwargs: (
                 "selected_audit_artifact_id: plan-1\n"
-                "selected_audit_primary_action: /plan replay latest artifact=plan-1\n"
-                "selected_audit_secondary_action: /plan timeline all artifact=plan-1"
+                "selected_audit_primary_action: /planning replay latest artifact=plan-1\n"
+                "selected_audit_secondary_action: /planning timeline all artifact=plan-1"
             )
         )
         session.active_plan_file_context_payload = lambda identifier=None: {  # type: ignore[method-assign]
@@ -341,14 +341,14 @@ class TuiAppTests(unittest.TestCase):
         app.state.set_plan_panel_view("timeline")
         app._render = lambda: None  # type: ignore[method-assign]
         app._plan_panel_text = lambda: (  # type: ignore[method-assign]
-            "selected_timeline_compare_primary_action: /plan advisor\n"
+            "selected_timeline_compare_primary_action: /planning advisor\n"
             "selected_timeline_compare_secondary_action: /task drift task-123\n"
         )
 
         try:
             with patch("claudecode_py.tui.app._handle_repl_command", return_value=(True, "advisor detail")):
                 app.action_open_execution_plan_advisor()
-            self.assertIn("[You]\n/plan advisor", app.state.messages)
+            self.assertIn("[You]\n/planning advisor", app.state.messages)
             self.assertIn("[System]\nadvisor detail", app.state.messages)
 
             with patch("claudecode_py.tui.app._handle_repl_command", return_value=(True, "drift detail")):
@@ -1979,7 +1979,7 @@ class TuiAppTests(unittest.TestCase):
         app.state.set_plan_panel_view("lineage")
         app._selected_lineage_context = lambda: {  # type: ignore[method-assign]
             "artifact_id": "plan-123",
-            "default_action": "/plan revert plan-123",
+            "default_action": "/planning revert plan-123",
         }
         app._render = lambda: None  # type: ignore[method-assign]
 
@@ -1987,7 +1987,7 @@ class TuiAppTests(unittest.TestCase):
             with patch("claudecode_py.tui.app._handle_repl_command", return_value=(True, "lineage detail")):
                 app.action_execute_lineage_show()
 
-            self.assertIn("[You]\n/plan show plan-123", app.state.messages)
+            self.assertIn("[You]\n/planning show plan-123", app.state.messages)
             self.assertIn("[System]\nlineage detail", app.state.messages)
         finally:
             session.close()
@@ -2004,7 +2004,7 @@ class TuiAppTests(unittest.TestCase):
         app.state.set_plan_panel_view("lineage")
         app._selected_lineage_context = lambda: {  # type: ignore[method-assign]
             "artifact_id": "plan-123",
-            "default_action": "/plan derive map runtime",
+            "default_action": "/planning derive map runtime",
         }
         app._render = lambda: None  # type: ignore[method-assign]
         captured: list[tuple[str, CommandExecution | None]] = []
@@ -2023,7 +2023,7 @@ class TuiAppTests(unittest.TestCase):
             ):
                 app.action_execute_lineage_default_action()
 
-            self.assertIn("[You]\n/plan derive map runtime", app.state.messages)
+            self.assertIn("[You]\n/planning derive map runtime", app.state.messages)
             self.assertTrue(app.state.busy)
             self.assertIn("Running derived plan", app.state.events)
             self.assertEqual(captured[0][0], "expanded prompt")
@@ -2044,7 +2044,7 @@ class TuiAppTests(unittest.TestCase):
         app.state.selected_plan_lineage_index = 3
         app._selected_lineage_context = lambda: {  # type: ignore[method-assign]
             "artifact_id": "plan-older",
-            "default_action": "/plan revert plan-older",
+            "default_action": "/planning revert plan-older",
         }
         app._render = lambda: None  # type: ignore[method-assign]
         session.active_plan_lineage_index = lambda: 1  # type: ignore[method-assign]
@@ -2057,7 +2057,7 @@ class TuiAppTests(unittest.TestCase):
                 app.action_execute_lineage_default_action()
 
             self.assertEqual(app.state.selected_plan_lineage_index, 1)
-            self.assertIn("[You]\n/plan revert plan-older", app.state.messages)
+            self.assertIn("[You]\n/planning revert plan-older", app.state.messages)
             self.assertIn("[System]\nReactivated planning artifact plan-older.", app.state.messages)
         finally:
             session.close()
@@ -2075,7 +2075,7 @@ class TuiAppTests(unittest.TestCase):
         app.state.selected_plan_lineage_index = 0
         app._selected_lineage_context = lambda: {  # type: ignore[method-assign]
             "artifact_id": "plan-active",
-            "default_action": "/plan derive refine runtime",
+            "default_action": "/planning derive refine runtime",
         }
         app._render = lambda: None  # type: ignore[method-assign]
         captured: list[tuple[str, CommandExecution | None]] = []
@@ -2269,3 +2269,4 @@ class TuiAppTests(unittest.TestCase):
             session.close()
             if cwd.exists():
                 shutil.rmtree(cwd)
+

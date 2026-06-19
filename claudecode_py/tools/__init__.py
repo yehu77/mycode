@@ -4,6 +4,8 @@ from .apply_patch import ApplyPatchTool
 from .base import BaseTool, ToolContext
 from .bash import BashTool
 from .edit_file import EditFileTool
+from .enter_plan_mode import EnterPlanModeTool
+from .exit_plan_mode import ExitPlanModeTool
 from .find_callees import FindCalleesTool
 from .find_callers import FindCallersTool
 from .find_references import FindReferencesTool
@@ -24,6 +26,7 @@ from .session_task_tools import (
     SessionTaskUpdateTool,
     TodoWriteTool,
 )
+from .skill import SkillTool
 from .task_tools import TaskGetTool, TaskListTool, TaskStopTool, TaskWaitTool
 from .tool_search import ToolSearchTool
 from .write_file import WriteFileTool
@@ -35,6 +38,8 @@ __all__ = [
     "BaseTool",
     "BashTool",
     "EditFileTool",
+    "EnterPlanModeTool",
+    "ExitPlanModeTool",
     "FindCalleesTool",
     "FindCallersTool",
     "FindReferencesTool",
@@ -53,6 +58,7 @@ __all__ = [
     "SessionTaskGetTool",
     "SessionTaskListTool",
     "SessionTaskUpdateTool",
+    "SkillTool",
     "TaskGetTool",
     "TaskListTool",
     "TaskStopTool",

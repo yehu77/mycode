@@ -33,8 +33,133 @@ class CommandRegistryTests(unittest.TestCase):
         self.assertIn("/insights", help_text)
         self.assertIn("/advisor", help_text)
         self.assertIn("/plan", help_text)
+        self.assertIn("/planning", help_text)
         self.assertIn("/security-review", help_text)
         self.assertIn("/ultraplan", help_text)
+
+    def test_plan_command_enters_plan_mode_and_creates_plan_file(self) -> None:
+        cwd = Path(__file__).resolve().parent / "_tmp_plan_mode_command"
+        if cwd.exists():
+            import shutil
+
+            shutil.rmtree(cwd)
+        cwd.mkdir(parents=True)
+
+        try:
+            session = Session(SessionConfig(cwd=cwd, interactive=False))
+            handled, output = session.handle_repl_command("/plan")
+
+            self.assertTrue(handled)
+            self.assertEqual(session.state.session_runtime_mode, "plan")
+            plan_path = session.get_plan_file_path()
+            self.assertTrue(plan_path.exists())
+            self.assertIn("Enabled plan mode.", str(output))
+            self.assertIn(str(plan_path), str(output))
+        finally:
+            session.close()
+            if cwd.exists():
+                import shutil
+
+                shutil.rmtree(cwd)
+
+    def test_plan_command_with_request_returns_prompt_execution(self) -> None:
+        cwd = Path(__file__).resolve().parent / "_tmp_plan_mode_request"
+        if cwd.exists():
+            import shutil
+
+            shutil.rmtree(cwd)
+        cwd.mkdir(parents=True)
+
+        try:
+            session = Session(SessionConfig(cwd=cwd, interactive=False))
+            handled, output = session.handle_repl_command("/plan map runtime ownership")
+
+            self.assertTrue(handled)
+            self.assertIsInstance(output, CommandExecution)
+            assert isinstance(output, CommandExecution)
+            self.assertEqual(session.state.session_runtime_mode, "plan")
+            self.assertEqual(output.prompt, "map runtime ownership")
+            self.assertEqual(output.metadata["command_policy_source"], "repl:/plan")
+            self.assertTrue(session.get_plan_file_path().exists())
+        finally:
+            session.close()
+            if cwd.exists():
+                import shutil
+
+                shutil.rmtree(cwd)
+
+    def test_plan_command_shows_current_plan_file_when_already_active(self) -> None:
+        cwd = Path(__file__).resolve().parent / "_tmp_plan_mode_show"
+        if cwd.exists():
+            import shutil
+
+            shutil.rmtree(cwd)
+        cwd.mkdir(parents=True)
+
+        try:
+            session = Session(SessionConfig(cwd=cwd, interactive=False))
+            session.enter_plan_mode()
+            session.get_plan_file_path().write_text("# Current plan\n- inspect\n", encoding="utf-8")
+
+            handled, output = session.handle_repl_command("/plan")
+
+            self.assertTrue(handled)
+            self.assertIn("plan_mode: active", str(output))
+            self.assertIn("# Current plan", str(output))
+            self.assertIn("- inspect", str(output))
+        finally:
+            session.close()
+            if cwd.exists():
+                import shutil
+
+                shutil.rmtree(cwd)
+
+    def test_planning_command_keeps_legacy_artifact_surface(self) -> None:
+        session = Session(SessionConfig(cwd=Path(__file__).resolve().parent, interactive=False))
+        try:
+            session.record_planning_artifact(
+                PlanningArtifact(
+                    kind="ultraplan",
+                    goal="map runtime",
+                    summary="Current Architecture\n- runtime",
+                    used_read_only_subagents=True,
+                )
+            )
+
+            handled, output = session.handle_repl_command("/planning timeline")
+
+            self.assertTrue(handled)
+            self.assertIn("timeline_filter: all", str(output))
+        finally:
+            session.close()
+
+    def test_clear_plan_command_clears_mode_and_plan_file(self) -> None:
+        cwd = Path(__file__).resolve().parent / "_tmp_plan_mode_clear"
+        if cwd.exists():
+            import shutil
+
+            shutil.rmtree(cwd)
+        cwd.mkdir(parents=True)
+
+        try:
+            session = Session(SessionConfig(cwd=cwd, interactive=False))
+            session.enter_plan_mode()
+            plan_path = session.get_plan_file_path()
+            plan_path.write_text("draft plan", encoding="utf-8")
+
+            handled, output = session.handle_repl_command("/clear plan")
+
+            self.assertTrue(handled)
+            self.assertEqual(session.state.session_runtime_mode, "default")
+            self.assertIsNone(session.state.plan_slug)
+            self.assertFalse(plan_path.exists())
+            self.assertIn("Cleared session plan file", str(output))
+        finally:
+            session.close()
+            if cwd.exists():
+                import shutil
+
+                shutil.rmtree(cwd)
 
     def test_registry_handles_commands_with_arguments(self) -> None:
         cwd = Path(__file__).resolve().parent / "_tmp_command_registry"
@@ -78,6 +203,94 @@ class CommandRegistryTests(unittest.TestCase):
             self.assertEqual(output.metadata["command_policy_name"], "review")
         finally:
             session.close()
+
+    def test_session_registry_registers_user_invocable_skill_commands(self) -> None:
+        cwd = Path(__file__).resolve().parent / "_tmp_skill_commands"
+        if cwd.exists():
+            import shutil
+
+            shutil.rmtree(cwd)
+        (cwd / ".claude" / "skills" / "ship").mkdir(parents=True)
+        (cwd / ".claude" / "skills" / "ship" / "SKILL.md").write_text(
+            "---\n"
+            "description: Ship release\n"
+            "arguments:\n"
+            "  - version\n"
+            "  - notes\n"
+            "allowed-tools:\n"
+            "  - Read\n"
+            "  - Bash(git status:*, git tag:*)\n"
+            "model: claude-opus-4-6\n"
+            "effort: high\n"
+            "---\n\n"
+            "Release version: $version\n"
+            "Notes: ${notes}\n"
+            "Dir: ${CLAUDE_SKILL_DIR}\n",
+            encoding="utf-8",
+        )
+
+        try:
+            session = Session(SessionConfig(cwd=cwd, interactive=False))
+            handled, output = session.handle_repl_command('/ship "1.2.3" release-notes here')
+
+            self.assertTrue(handled)
+            self.assertIsInstance(output, CommandExecution)
+            assert isinstance(output, CommandExecution)
+            self.assertIn("Release version: 1.2.3", output.prompt)
+            self.assertIn("Notes: release-notes here", output.prompt)
+            self.assertIn(str(cwd / ".claude" / "skills" / "ship"), output.prompt)
+            self.assertEqual(output.allowed_tool_names, ("read_file", "bash"))
+            self.assertEqual(output.allowed_bash_command_prefixes, ("git status", "git tag"))
+            self.assertEqual(output.metadata["command_policy_name"], "skill:ship")
+            self.assertEqual(output.metadata["skill_model_override"], "claude-opus-4-6")
+            self.assertEqual(output.metadata["skill_effort_override"], "high")
+        finally:
+            session.close()
+            if cwd.exists():
+                import shutil
+
+                shutil.rmtree(cwd)
+
+    def test_session_registry_marks_forked_skill_execution(self) -> None:
+        cwd = Path(__file__).resolve().parent / "_tmp_skill_commands_fork"
+        if cwd.exists():
+            import shutil
+
+            shutil.rmtree(cwd)
+        (cwd / ".claude" / "skills" / "ship").mkdir(parents=True)
+        (cwd / ".claude" / "skills" / "ship" / "SKILL.md").write_text(
+            "---\n"
+            "description: Ship release\n"
+            "context: fork\n"
+            "allowed-tools:\n"
+            "  - Read\n"
+            "  - Bash(git status:*)\n"
+            "model: claude-opus-4-6\n"
+            "effort: medium\n"
+            "---\n\n"
+            "Release workflow\n",
+            encoding="utf-8",
+        )
+
+        try:
+            session = Session(SessionConfig(cwd=cwd, interactive=False))
+            handled, output = session.handle_repl_command("/ship")
+
+            self.assertTrue(handled)
+            self.assertIsInstance(output, CommandExecution)
+            assert isinstance(output, CommandExecution)
+            self.assertEqual(output.metadata["command_kind"], "skill-fork")
+            self.assertEqual(output.metadata["skill_execution_context"], "fork")
+            self.assertEqual(output.metadata["skill_model_override"], "claude-opus-4-6")
+            self.assertEqual(output.metadata["skill_effort_override"], "medium")
+            self.assertEqual(output.allowed_tool_names, ("read_file", "bash"))
+            self.assertEqual(output.allowed_bash_command_prefixes, ("git status",))
+        finally:
+            session.close()
+            if cwd.exists():
+                import shutil
+
+                shutil.rmtree(cwd)
 
     def test_registry_returns_prompt_execution_for_commit(self) -> None:
         session = Session(SessionConfig(cwd=Path(__file__).resolve().parent, interactive=False))
@@ -366,6 +579,149 @@ class CommandRegistryTests(unittest.TestCase):
                 run_ultraplan.call_args.kwargs["scout_categories"],
                 ("architecture-boundaries", "risks-unknowns"),
             )
+        finally:
+            session.close()
+
+    def test_session_run_command_routes_forked_skill_through_child_session(self) -> None:
+        session = Session(
+            SessionConfig(cwd=Path(__file__).resolve().parent, interactive=False),
+            persist_transcript=False,
+        )
+        execution = CommandExecution(
+            prompt="Run the release workflow",
+            allowed_tool_names=("read_file", "bash"),
+            allowed_bash_command_prefixes=("git status", "git tag"),
+            metadata={
+                "command_kind": "skill-fork",
+                "command_policy_name": "skill:ship",
+                "command_policy_source": "skill:/ship",
+                "skill_name": "ship",
+                "skill_execution_context": "fork",
+            },
+        )
+
+        class FakeChildSession:
+            def __init__(self) -> None:
+                self.contract_kwargs = None
+                self.ask_kwargs = None
+                self.closed = False
+
+            def set_session_execution_contract(self, **kwargs):
+                self.contract_kwargs = kwargs
+
+            def ask(self, prompt: str, sink=None, **kwargs):
+                del sink
+                self.ask_kwargs = {"prompt": prompt, **kwargs}
+                return "forked-result"
+
+            def close(self) -> None:
+                self.closed = True
+
+        child = FakeChildSession()
+
+        try:
+            with patch.object(session, "create_child_session", return_value=child):
+                result = session.run_command(execution)
+
+            self.assertEqual(result, "forked-result")
+            self.assertTrue(child.closed)
+            assert child.contract_kwargs is not None
+            assert child.ask_kwargs is not None
+            self.assertEqual(child.contract_kwargs["execution_mode"], "skill-fork")
+            policy = child.contract_kwargs["command_policy"]
+            self.assertIsNotNone(policy)
+            assert policy is not None
+            self.assertEqual(policy.name, "skill:ship")
+            self.assertEqual(policy.source, "skill:/ship")
+            self.assertEqual(policy.allowed_tool_names, frozenset({"read_file", "bash"}))
+            self.assertEqual(policy.allowed_bash_command_prefixes, ("git status", "git tag"))
+            self.assertEqual(child.ask_kwargs["prompt"], "Run the release workflow")
+            self.assertEqual(child.ask_kwargs["allowed_tool_names"], ("read_file", "bash"))
+            self.assertEqual(
+                child.ask_kwargs["allowed_bash_command_prefixes"],
+                ("git status", "git tag"),
+            )
+            self.assertEqual(child.ask_kwargs["command_policy_name"], "skill:ship")
+            self.assertEqual(child.ask_kwargs["command_policy_source"], "skill:/ship")
+        finally:
+            session.close()
+
+    def test_session_run_forked_skill_mutation_returns_child_delta(self) -> None:
+        session = Session(
+            SessionConfig(cwd=Path(__file__).resolve().parent, interactive=False),
+            persist_transcript=False,
+        )
+        execution = CommandExecution(
+            prompt="Run the release workflow",
+            allowed_tool_names=("read_file", "bash"),
+            allowed_bash_command_prefixes=("git status", "git tag"),
+            metadata={
+                "command_kind": "skill-fork",
+                "command_policy_name": "skill:ship",
+                "command_policy_source": "skill:/ship",
+                "skill_name": "ship",
+                "skill_execution_context": "fork",
+            },
+        )
+
+        class FakeChildState:
+            def __init__(self) -> None:
+                self.messages = [
+                    {"role": "user", "content": [{"type": "text", "text": "existing"}]},
+                ]
+
+        class FakeChildSession:
+            def __init__(self) -> None:
+                self.state = FakeChildState()
+                self.contract_kwargs = None
+                self.ask_kwargs = None
+                self.closed = False
+
+            def set_session_execution_contract(self, **kwargs):
+                self.contract_kwargs = kwargs
+
+            def ask(self, prompt: str, sink=None, **kwargs):
+                del sink
+                self.ask_kwargs = {"prompt": prompt, **kwargs}
+                self.state.messages.extend(
+                    [
+                        {"role": "user", "content": [{"type": "text", "text": "child prompt"}]},
+                        {
+                            "role": "assistant",
+                            "content": [{"type": "text", "text": "child answer"}],
+                        },
+                    ]
+                )
+                return "forked-result"
+
+            def close(self) -> None:
+                self.closed = True
+
+        child = FakeChildSession()
+
+        try:
+            with patch.object(session, "create_child_session", return_value=child):
+                result = session.run_forked_skill_mutation(
+                    execution,
+                    tool_name="skill",
+                    tool_use_id="tool-1",
+                )
+
+            self.assertEqual(result.result_text, "forked-result")
+            self.assertEqual(result.injected_message_count, 2)
+            self.assertEqual(result.new_messages[0]["source_kind"], "skill_tool_fork")
+            self.assertEqual(result.new_messages[0]["source_tool_use_id"], "tool-1")
+            self.assertEqual(result.new_messages[0]["skill_name"], "ship")
+            self.assertEqual(result.new_messages[1]["content"][0]["text"], "child answer")
+            self.assertEqual(result.context_update.skill_name, "ship")
+            self.assertEqual(result.context_update.allowed_tool_names, ("read_file", "bash"))
+            self.assertEqual(
+                result.context_update.allowed_bash_command_prefixes,
+                ("git status", "git tag"),
+            )
+            self.assertTrue(child.closed)
+            assert child.ask_kwargs is not None
+            self.assertEqual(child.ask_kwargs["prompt"], "Run the release workflow")
         finally:
             session.close()
 

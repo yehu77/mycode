@@ -688,7 +688,7 @@ class TaskDetailSessionComponent:
             )
             if execution_action:
                 plan_actions.append(execution_action)
-            plan_actions.extend(["/plan execution", "/plan advisor"])
+            plan_actions.extend(["/planning execution", "/planning advisor"])
         if (
             str(metadata.get("task_role") or "").strip() == "scout"
             or surface_kind == "child_execution"
@@ -699,7 +699,7 @@ class TaskDetailSessionComponent:
             )
             if scout_action:
                 plan_actions.append(scout_action)
-            plan_actions.append("/plan scouts")
+            plan_actions.append("/planning scouts")
         return (
             self._session._dedupe_action_commands(stay_actions),  # noqa: SLF001
             self._session._dedupe_action_commands(plan_actions),  # noqa: SLF001
@@ -1145,8 +1145,8 @@ class TaskDetailSessionComponent:
                 {
                     "open_task_detail": focus_preserving_task_show,
                     "open_task_advisor": f"/task advisor {task_id}",
-                    "open_active_plan_execution": active_plan_execution_command or "/plan execution",
-                    "open_active_plan_advisor": "/plan advisor",
+                    "open_active_plan_execution": active_plan_execution_command or "/planning execution",
+                    "open_active_plan_advisor": "/planning advisor",
                 }
             )
         )
@@ -1215,8 +1215,8 @@ class TaskDetailSessionComponent:
                 {
                     "open_task_detail": focus_preserving_task_show,
                     "open_task_drift": f"/task drift {task.id}",
-                    "open_active_plan_advisor": "/plan advisor",
-                    "open_active_plan_execution": active_plan_execution_command or "/plan execution",
+                    "open_active_plan_advisor": "/planning advisor",
+                    "open_active_plan_execution": active_plan_execution_command or "/planning execution",
                 }
             )
         )
@@ -1683,7 +1683,7 @@ class TaskDetailSessionComponent:
             lines.extend(f"  {line}" for line in drift_lines)
         lines.append(f"- active_plan_advisor_action: /task advisor {task.id}")
         lines.append(f"- drift_detail_action: /task drift {task.id}")
-        lines.append("- active_plan_execution_action: /plan execution")
+        lines.append("- active_plan_execution_action: /planning execution")
         return lines
 
     def _task_execution_planning_artifact(self, metadata: dict[str, Any]) -> Any | None:

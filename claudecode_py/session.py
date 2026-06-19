@@ -11,7 +11,13 @@ from typing import Any
 import re
 
 from .commands import CommandExecution, render_repl_command_help
-from .agents import AgentDefinition, AgentDefinitionDiagnostic
+from .agents import (
+    AgentDefinition,
+    AgentDefinitionDiagnostic,
+    build_builtin_planning_agent_prompt,
+    builtin_planning_agent_names,
+    is_builtin_planning_agent_name,
+)
 from .background_metadata import (
     background_handoff_payload,
     background_live_session_payload,
@@ -87,10 +93,36 @@ from .runtime.provider_cache import (
     planner_downgraded,
     prompt_prefix_cache_payload_from_plan,
 )
+from .runtime.plan_files import (
+    clear_plan_slug as clear_cached_plan_slug,
+    copy_plan_for_fork as copy_plan_file_for_fork,
+    copy_plan_for_resume as copy_plan_file_for_resume,
+    ensure_plan_file,
+    get_plan as read_plan_file,
+    get_plan_file_path as resolve_plan_file_path,
+    get_plan_storage_dir,
+    get_plan_slug as resolve_plan_slug,
+    set_plan_slug as cache_plan_slug,
+)
+from .runtime.plan_mode_v2 import (
+    FULL_REMINDER_EVERY_N_ATTACHMENTS,
+    PlanAgentInvocationBoundary,
+    PlanWorkflowBranchProfile,
+    PlanWorkflowMode,
+    build_plan_agent_invocation_boundary,
+    build_plan_mode_exit_attachment,
+    build_plan_mode_full_attachment,
+    build_plan_mode_reentry_attachment,
+    build_plan_mode_sparse_attachment,
+    build_plan_workflow_branch_profile,
+    get_plan_mode_v2_agent_count,
+    get_plan_mode_v2_explore_agent_count,
+    plan_workflow_mode as resolve_plan_workflow_mode,
+)
 from .runtime.tool_schema_cache import ToolSchemaCache, canonical_json
 from .runtime.tool_result_replacement import build_missing_artifact_replacement_preview
 from .runtime.query_loop import _create_provider_message_with_retries, _request_advisor_review, run_query_loop
-from .prompts import SystemPromptBlock, render_system_prompt_blocks
+from .prompts import PromptAttachment, SystemPromptBlock, render_provider_system_prompt, render_system_prompt_blocks
 from .session_components import (
     AdvisorSessionComponent,
     BackgroundRuntimeSessionComponent,
@@ -212,6 +244,7 @@ from .tools.base import (
     render_change_detail,
     render_change_summary,
     resolve_workspace_path,
+    ToolContextUpdate,
     workspace_change_metadata_lines,
 )
 from .tools.mcp import make_mcp_tool_name
@@ -262,6 +295,34 @@ READ_ONLY_SUBAGENT_BASH_PREFIXES = (
     "dir",
 )
 
+PLAN_MODE_ALLOWED_TOOL_NAMES = frozenset(
+    {
+        "list_dir",
+        "read_file",
+        "outline_file",
+        "outline_project",
+        "find_symbol",
+        "find_symbol_graph",
+        "find_callers",
+        "find_callees",
+        "find_references",
+        "glob_search",
+        "grep_search",
+        "bash",
+        "agent",
+        "ask_user_question",
+        "list_mcp_resources",
+        "read_mcp_resource",
+        "write_file",
+        "edit_file",
+        "apply_patch",
+        "ExitPlanMode",
+    }
+)
+PLAN_MODE_TRANSITION_TOOL_NAMES = frozenset({"EnterPlanMode", "ExitPlanMode"})
+PLAN_MODE_ALLOWED_AGENT_TYPE_SEQUENCE = builtin_planning_agent_names()
+PLAN_MODE_ALLOWED_AGENT_TYPES = frozenset(PLAN_MODE_ALLOWED_AGENT_TYPE_SEQUENCE)
+
 ADVISOR_MODES = ("off", "final-review", "interactive-review")
 WRITE_TOOL_NAMES = frozenset({"write_file", "edit_file", "apply_patch"})
 MAX_ADVISOR_HISTORY = 20
@@ -286,6 +347,12 @@ class TurnCommandPolicy:
 
 
 @dataclass(slots=True, frozen=True)
+class TurnRuntimeOverride:
+    model_override: str | None = None
+    effort_override: str | None = None
+
+
+@dataclass(slots=True, frozen=True)
 class BashCommandPolicyResult:
     allowed: bool
     policy_name: str = ""
@@ -296,6 +363,14 @@ class BashCommandPolicyResult:
     violating_features: tuple[str, ...] = ()
     violation_kind: str = ""
     reason: str = ""
+
+
+@dataclass(slots=True)
+class ForkedSkillMutationResult:
+    result_text: str
+    new_messages: list[dict[str, Any]]
+    context_update: ToolContextUpdate
+    injected_message_count: int
 
 
 READ_ONLY_COMMAND_POLICY_NAMES = frozenset(
@@ -551,6 +626,9 @@ class Session:
         self._seen_tool_result_ids: set[str] = set()
         self._tool_result_replacements: dict[str, str] = {}
         self._tool_result_artifacts: dict[str, ToolResultArtifactRecord] = {}
+        self._plan_mode_attachment_count = int(
+            getattr(self.state, "plan_mode_attachment_count", 0) or 0
+        )
         self._last_runtime_turn_token_count: int | None = None
         self._last_runtime_turn_token_source: str | None = None
         self._runtime_provider_usage_seen = False
@@ -558,6 +636,7 @@ class Session:
         self._last_project_context_reload: dict[str, Any] | None = None
         self._background_session_id: str | None = None
         self._normalize_advisor_state()
+        self._normalize_plan_mode_state()
         self._normalize_execution_contract_state()
         self._normalize_workspace_state()
         self.persist_transcript = depth == 0 if persist_transcript is None else persist_transcript
@@ -572,6 +651,9 @@ class Session:
         self._active_bash_command_prefixes: tuple[str, ...] | None = None
         self._require_read_only_subagents = False
         self._active_command_policy: TurnCommandPolicy | None = None
+        self._active_runtime_override: TurnRuntimeOverride | None = None
+        self._transient_tool_context_policy: TurnCommandPolicy | None = None
+        self._transient_runtime_override: TurnRuntimeOverride | None = None
         self._turn_read_only_constraints_active = False
         self._live_event_sink = None
         self._question_handler = None
@@ -583,6 +665,7 @@ class Session:
         self._reconcile_skill_state(initial_load=True)
         self._refresh_command_registry()
         self.reconstruct_tool_result_replacement_state()
+        self.copy_plan_for_resume()
 
     @property
     def config(self) -> SessionConfig:
@@ -645,19 +728,40 @@ class Session:
         specs = [deepcopy(spec) for spec in self.tool_specs_cached()]
         specs_by_name = {spec["name"]: spec for spec in specs}
         ordered: list[dict[str, Any]] = []
+        plan_file_path = self.current_plan_file_path() if self.in_plan_mode() else None
         for tool in self._sorted_available_tools():
             spec = specs_by_name.get(tool.name) or tool.to_model_tool()
-            policy = self._active_command_policy
+            description = str(spec["description"])
+            if self.in_plan_mode():
+                if tool.name in WRITE_TOOL_NAMES and plan_file_path is not None:
+                    description = (
+                        f"{description} Plan mode restriction: only the current session plan file may "
+                        f'be modified ({self._display_path_for_tool_surface(plan_file_path)}).'
+                    )
+                elif tool.name == "bash":
+                    description = (
+                        f"{description} Plan mode restriction: only read-only shell commands are allowed."
+                    )
+                elif tool.name == "agent":
+                    planning_agents_label = " and ".join(self.plan_mode_allowed_agent_type_sequence())
+                    boundary = self.plan_agent_invocation_boundary()
+                    branch_profile = self.plan_workflow_branch_profile()
+                    description = (
+                        f"{description} Plan mode restriction: only the {planning_agents_label} agent types may be "
+                        "launched, and they always run as foreground read-only planning agents. "
+                        f"Invocation boundary: {boundary.boundary_summary}. "
+                        f"Agent usage: {branch_profile.planning_agent_usage_summary}."
+                    )
+            policy = self._effective_command_policy()
             if tool.name == "bash" and policy and policy.allowed_bash_command_prefixes:
                 allowed = ", ".join(policy.allowed_bash_command_prefixes)
                 mode = policy.name
-                spec = {
-                    **spec,
-                    "description": (
-                        f'{spec["description"]} Current command mode: {mode}. '
-                        f"Allowed commands in this turn must start with: {allowed}."
-                    ),
-                }
+                description = (
+                    f'{description} Current command mode: {mode}. '
+                    f"Allowed commands in this turn must start with: {allowed}."
+                )
+            if description != spec["description"]:
+                spec = {**spec, "description": description}
             ordered.append(spec)
         return ordered
 
@@ -960,6 +1064,19 @@ class Session:
 
     def system_prompt_blocks(self) -> list[SystemPromptBlock]:
         blocks = list(self._runtime_context.build_system_prompt_blocks(self.state))
+        if self.is_main_execution_session() and not self.in_plan_mode():
+            blocks.append(
+                SystemPromptBlock(
+                    text=(
+                        "Plan mode is available for complex implementation tasks that need explicit "
+                        "planning before repo edits.\n"
+                        "- Use EnterPlanMode to switch into read-only exploration plus session plan-file drafting.\n"
+                        "- After the plan is ready, use ExitPlanMode to request approval and resume implementation."
+                    ),
+                    cache_scope="session",
+                    kind="static",
+                )
+            )
         checklist_guidance = (
             "Session checklist guidance:\n"
             "- If a session checklist exists, treat it as the canonical short task list for the current work.\n"
@@ -1028,6 +1145,7 @@ class Session:
             session=self,
             messages=messages,
             system_prompt_blocks=self.system_prompt_blocks(),
+            prompt_attachments=self.plan_mode_prompt_attachments(),
             tools=self.tool_specs(),
             replacement_result=replacement_result,
             active_replacement_count=int(replacement_surface["replacement_active_count"] or 0),
@@ -1100,12 +1218,127 @@ class Session:
             source=source,
         )
         payload.update(prompt_prefix_cache_payload_from_plan(cache_plan))
+        payload.update(self.plan_workflow_surface_payload())
+        payload.update(self.plan_instruction_surface_payload(payload))
         self._last_prompt_prefix_assembly_payload = dict(payload)
         return dict(payload)
 
+    def plan_workflow_surface_payload(self) -> dict[str, Any]:
+        workflow_mode = self.plan_workflow_mode()
+        branch_profile = self.plan_workflow_branch_profile()
+        boundary = self.plan_agent_invocation_boundary()
+        return {
+            "plan_workflow_mode": workflow_mode,
+            "plan_workflow_phase_family": workflow_mode,
+            "plan_workflow_branch_identity": branch_profile.branch_identity,
+            "plan_workflow_branch_summary": branch_profile.branch_summary,
+            "plan_workflow_planning_cadence": branch_profile.planning_cadence,
+            "plan_workflow_first_turn_contract": branch_profile.first_turn_contract,
+            "plan_workflow_first_turn_summary": branch_profile.first_turn_summary,
+            "plan_workflow_first_turn_scan_scope": branch_profile.first_turn_scan_scope,
+            "plan_workflow_first_turn_plan_expectation": (
+                branch_profile.first_turn_plan_expectation
+            ),
+            "plan_workflow_first_turn_question_timing": (
+                branch_profile.first_turn_question_timing
+            ),
+            "plan_workflow_first_turn_regression_guard": (
+                branch_profile.first_turn_regression_guard
+            ),
+            "plan_workflow_plan_update_contract": branch_profile.plan_update_contract,
+            "plan_workflow_plan_update_summary": branch_profile.plan_update_summary,
+            "plan_workflow_plan_update_trigger": branch_profile.plan_update_trigger,
+            "plan_workflow_plan_update_capture_scope": (
+                branch_profile.plan_update_capture_scope
+            ),
+            "plan_workflow_plan_update_deferral_guard": (
+                branch_profile.plan_update_deferral_guard
+            ),
+            "plan_workflow_question_loop_contract": branch_profile.question_loop_contract,
+            "plan_workflow_turn_exit_contract": branch_profile.turn_exit_contract,
+            "plan_workflow_turn_exit_summary": branch_profile.turn_exit_summary,
+            "plan_workflow_clarification_channel": (
+                branch_profile.clarification_channel
+            ),
+            "plan_workflow_approval_channel": branch_profile.approval_channel,
+            "plan_workflow_turn_exit_forbidden_patterns": (
+                branch_profile.turn_exit_forbidden_patterns
+            ),
+            "plan_workflow_planning_agent_usage_summary": (
+                branch_profile.planning_agent_usage_summary
+            ),
+            "plan_workflow_explore_agent_usage_rule": (
+                branch_profile.explore_agent_usage_rule
+            ),
+            "plan_workflow_plan_agent_delegation_rule": (
+                branch_profile.plan_agent_delegation_rule
+            ),
+            "plan_workflow_main_thread_design_owner": (
+                branch_profile.main_thread_design_owner
+            ),
+            "plan_workflow_followup_continuity_contract": (
+                branch_profile.followup_continuity_contract
+            ),
+            "plan_workflow_followup_continuity_summary": (
+                branch_profile.followup_continuity_summary
+            ),
+            "plan_workflow_branch_preservation_rule": (
+                branch_profile.branch_preservation_rule
+            ),
+            "plan_workflow_agent_count": self.plan_workflow_agent_count(),
+            "plan_workflow_explore_agent_count": self.plan_workflow_explore_agent_count(),
+            "plan_workflow_allowed_agent_names": list(boundary.allowed_agent_names),
+            "plan_workflow_invocation_boundary_summary": boundary.boundary_summary,
+            "plan_workflow_invocation_delegation_default": boundary.delegation_default,
+            "plan_workflow_explore_scope": boundary.explore_scope,
+            "plan_workflow_plan_scope": boundary.plan_scope,
+            "plan_workflow_main_thread_scope": boundary.main_thread_scope,
+            "plan_workflow_verification_agent_required": False,
+            "plan_workflow_verification_agent_scope": "post_milestone_b_followup",
+            "plan_workflow_verification_agent_summary": (
+                "Verification agent is not required for Milestone B completion; "
+                "reopen it later as post-planning implementation-gate depth."
+            ),
+        }
+
+    def plan_instruction_surface_payload(
+        self,
+        prompt_prefix_surface: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        surface = dict(prompt_prefix_surface or {})
+        attachment_kinds = [
+            str(item)
+            for item in (surface.get("prompt_prefix_attachment_kinds") or [])
+            if str(item)
+        ]
+        plan_mode_active = bool(surface.get("prompt_prefix_plan_mode_attachment_active"))
+        reentry_active = bool(surface.get("prompt_prefix_plan_mode_reentry_attachment_active"))
+        exit_active = bool(surface.get("prompt_prefix_plan_mode_exit_attachment_active"))
+        if exit_active:
+            state = "exit_followup"
+        elif plan_mode_active and reentry_active:
+            state = "plan_mode_reentry_active"
+        elif plan_mode_active:
+            state = "plan_mode_active"
+        else:
+            state = "inactive"
+        attachment_mode = str(surface.get("prompt_prefix_attachment_mode") or "none")
+        return {
+            "plan_instruction_state": state,
+            "plan_instruction_attachment_mode": attachment_mode,
+            "plan_instruction_attachment_kinds": list(attachment_kinds),
+            "plan_instruction_attachment_summary": (
+                ",".join(attachment_kinds) if attachment_kinds else "none"
+            ),
+            "plan_instruction_reentry_active": reentry_active,
+            "plan_instruction_exit_active": exit_active,
+        }
+
     def prompt_prefix_surface_payload(self) -> dict[str, Any]:
         if self._last_prompt_prefix_assembly_payload is not None:
-            return dict(self._last_prompt_prefix_assembly_payload)
+            payload = dict(self._last_prompt_prefix_assembly_payload)
+            payload.update(self.plan_instruction_surface_payload(payload))
+            return payload
         inspection_messages = self.apply_tool_result_replacements_to_messages(self.state.messages)
         assembly = self.build_provider_prompt_assembly(messages=inspection_messages)
         cache_plan = self.build_provider_prompt_cache_plan(assembly, previous_payload=None)
@@ -1115,9 +1348,11 @@ class Session:
             source="inspection",
         )
         payload.update(prompt_prefix_cache_payload_from_plan(cache_plan))
+        payload.update(self.plan_workflow_surface_payload())
+        payload.update(self.plan_instruction_surface_payload(payload))
         return payload
 
-    def execute_tool_calls(self, tool_calls, ctx: ToolContext, *, sink=None) -> list[dict[str, Any]]:
+    def execute_tool_calls(self, tool_calls, ctx: ToolContext, *, sink=None):
         return self._build_active_orchestrator().execute_tool_calls(tool_calls, ctx, sink=sink)
 
     def tool_context(self) -> ToolContext:
@@ -1138,6 +1373,8 @@ class Session:
         require_read_only_subagents: bool = False,
         command_policy_name: str | None = None,
         command_policy_source: str | None = None,
+        model_override: str | None = None,
+        effort_override: str | None = None,
     ) -> str:
         with self._command_execution_scope(
             allowed_tool_names=allowed_tool_names,
@@ -1145,6 +1382,8 @@ class Session:
             require_read_only_subagents=require_read_only_subagents,
             command_policy_name=command_policy_name,
             command_policy_source=command_policy_source,
+            model_override=model_override,
+            effort_override=effort_override,
         ):
             result = run_query_loop(self, prompt, sink=sink)
         self.persist_state()
@@ -1152,6 +1391,8 @@ class Session:
 
     def run_command(self, execution: CommandExecution, sink=None) -> str:
         metadata = execution.metadata or {}
+        if metadata.get("command_kind") == "skill-fork":
+            return self.run_forked_skill(execution, sink=sink)
         if metadata.get("command_kind") == "ultraplan":
             goal = str(metadata.get("goal") or execution.prompt).strip()
             scout_categories = tuple(str(item) for item in metadata.get("scout_categories", []))
@@ -1188,6 +1429,157 @@ class Session:
             command_policy_source=(
                 str(metadata.get("command_policy_source"))
                 if metadata.get("command_policy_source") is not None
+                else None
+            ),
+        )
+
+    def run_forked_skill(self, execution: CommandExecution, sink=None) -> str:
+        if self.depth >= self.config.max_agent_depth:
+            raise RuntimeError("Max agent depth reached.")
+        policy_name, policy_source, command_policy = self._forked_skill_command_policy(execution)
+        child = self.create_child_session(
+            interactive=False,
+            isolated_workspace=False,
+        )
+        try:
+            self._apply_forked_skill_execution_contract(
+                child,
+                execution=execution,
+                command_policy=command_policy,
+            )
+            return child.ask(
+                execution.prompt,
+                sink=sink,
+                allowed_tool_names=execution.allowed_tool_names,
+                allowed_bash_command_prefixes=execution.allowed_bash_command_prefixes,
+                require_read_only_subagents=execution.require_read_only_subagents,
+                command_policy_name=policy_name,
+                command_policy_source=policy_source,
+            )
+        finally:
+            child.close()
+
+    def run_forked_skill_mutation(
+        self,
+        execution: CommandExecution,
+        *,
+        tool_name: str = "skill",
+        tool_use_id: str | None = None,
+        sink=None,
+    ) -> ForkedSkillMutationResult:
+        if self.depth >= self.config.max_agent_depth:
+            raise RuntimeError("Max agent depth reached.")
+        metadata = execution.metadata or {}
+        skill_name = str(metadata.get("skill_name") or "").strip() or None
+        policy_name, policy_source, command_policy = self._forked_skill_command_policy(execution)
+        child = self.create_child_session(
+            interactive=False,
+            isolated_workspace=False,
+        )
+        try:
+            self._apply_forked_skill_execution_contract(
+                child,
+                execution=execution,
+                command_policy=command_policy,
+            )
+            start_message_count = len(child.state.messages)
+            result_text = child.ask(
+                execution.prompt,
+                sink=sink,
+                allowed_tool_names=execution.allowed_tool_names,
+                allowed_bash_command_prefixes=execution.allowed_bash_command_prefixes,
+                require_read_only_subagents=execution.require_read_only_subagents,
+                command_policy_name=policy_name,
+                command_policy_source=policy_source,
+                model_override=(
+                    str(metadata.get("skill_model_override")).strip()
+                    if str(metadata.get("skill_model_override") or "").strip()
+                    else None
+                ),
+                effort_override=(
+                    str(metadata.get("skill_effort_override")).strip()
+                    if str(metadata.get("skill_effort_override") or "").strip()
+                    else None
+                ),
+            )
+            new_messages: list[dict[str, Any]] = []
+            for message in child.state.messages[start_message_count:]:
+                injected = deepcopy(message)
+                injected["source_kind"] = "skill_tool_fork"
+                injected["source_tool_name"] = tool_name
+                injected["source_tool_use_id"] = tool_use_id
+                if skill_name is not None:
+                    injected["skill_name"] = skill_name
+                injected["skill_execution_context"] = "fork"
+                new_messages.append(injected)
+            return ForkedSkillMutationResult(
+                result_text=result_text,
+                new_messages=new_messages,
+                context_update=ToolContextUpdate(
+                    allowed_tool_names=execution.allowed_tool_names,
+                    allowed_bash_command_prefixes=execution.allowed_bash_command_prefixes,
+                    require_read_only_subagents=execution.require_read_only_subagents,
+                    source="skill_tool_fork",
+                    skill_name=skill_name,
+                ),
+                injected_message_count=len(new_messages),
+            )
+        finally:
+            child.close()
+
+    def _forked_skill_command_policy(
+        self,
+        execution: CommandExecution,
+    ) -> tuple[str, str, TurnCommandPolicy | None]:
+        metadata = execution.metadata or {}
+        policy_name = (
+            str(metadata.get("command_policy_name"))
+            if metadata.get("command_policy_name") is not None
+            else (
+                f"skill:{metadata.get('skill_name')}"
+                if metadata.get("skill_name") is not None
+                else "skill-fork"
+            )
+        )
+        policy_source = (
+            str(metadata.get("command_policy_source"))
+            if metadata.get("command_policy_source") is not None
+            else "skill-fork"
+        )
+        command_policy = self._compile_turn_command_policy(
+            allowed_tool_names=execution.allowed_tool_names,
+            allowed_bash_command_prefixes=execution.allowed_bash_command_prefixes,
+            require_read_only_subagents=execution.require_read_only_subagents,
+            command_policy_name=policy_name,
+            command_policy_source=policy_source,
+        )
+        return policy_name, policy_source, command_policy
+
+    def _apply_forked_skill_execution_contract(
+        self,
+        child,
+        *,
+        execution: CommandExecution,
+        command_policy: TurnCommandPolicy | None,
+    ) -> None:
+        child.set_session_execution_contract(
+            execution_mode=(
+                "read-only-subagent"
+                if execution.require_read_only_subagents
+                else "skill-fork"
+            ),
+            command_policy=command_policy,
+            active_execution_constraint=(
+                "read-only" if execution.require_read_only_subagents else "normal"
+            ),
+            constraint_source=(
+                "session_execution_contract"
+                if execution.require_read_only_subagents
+                else None
+            ),
+            constraint_reason=(
+                "forked skill read-only contract"
+                if execution.require_read_only_subagents
                 else None
             ),
         )
@@ -2228,6 +2620,101 @@ class Session:
     def build_system_prompt(self) -> str:
         return render_system_prompt_blocks(self.system_prompt_blocks())
 
+    def plan_workflow_mode(self) -> PlanWorkflowMode:
+        return resolve_plan_workflow_mode(self.config)
+
+    def plan_workflow_agent_count(self) -> int:
+        return get_plan_mode_v2_agent_count(self.config)
+
+    def plan_workflow_explore_agent_count(self) -> int:
+        return get_plan_mode_v2_explore_agent_count(self.config)
+
+    def plan_workflow_branch_profile(self) -> PlanWorkflowBranchProfile:
+        return build_plan_workflow_branch_profile(self.plan_workflow_mode())
+
+    def plan_agent_invocation_boundary(self) -> PlanAgentInvocationBoundary:
+        return build_plan_agent_invocation_boundary(self.plan_workflow_mode())
+
+    def plan_mode_allowed_agent_type_sequence(self) -> tuple[str, ...]:
+        if not self.in_plan_mode():
+            return PLAN_MODE_ALLOWED_AGENT_TYPE_SEQUENCE
+        return self.plan_agent_invocation_boundary().allowed_agent_names
+
+    def _plan_mode_should_use_sparse_attachment(self) -> bool:
+        return self._plan_mode_attachment_count > 0 and (
+            self._plan_mode_attachment_count % FULL_REMINDER_EVERY_N_ATTACHMENTS
+        ) != 0
+
+    def plan_mode_prompt_attachments(self) -> list[PromptAttachment]:
+        attachments: list[PromptAttachment] = []
+        workflow_mode = self.plan_workflow_mode()
+        if self.in_plan_mode():
+            plan_path = self.current_plan_file_path()
+            if self.state.needs_plan_mode_reentry_attachment:
+                attachments.append(
+                    build_plan_mode_reentry_attachment(
+                        workflow_mode=workflow_mode,
+                        plan_file_path=plan_path,
+                    )
+                )
+            main_attachment_builder = (
+                build_plan_mode_sparse_attachment
+                if self._plan_mode_should_use_sparse_attachment()
+                else build_plan_mode_full_attachment
+            )
+            attachments.append(
+                main_attachment_builder(
+                    workflow_mode=workflow_mode,
+                    plan_file_path=plan_path,
+                    plan_exists=plan_path.exists(),
+                    config=self.config,
+                )
+                if main_attachment_builder is build_plan_mode_full_attachment
+                else main_attachment_builder(
+                    workflow_mode=workflow_mode,
+                    plan_file_path=plan_path,
+                )
+            )
+        if self.state.needs_plan_mode_exit_attachment:
+            plan_path = self.current_plan_file_path()
+            approved_plan = (
+                str(self.state.plan_mode_exit_approved_plan).strip()
+                if self.state.plan_mode_exit_approved_plan is not None
+                else self.get_plan().strip()
+            )
+            previous_mode = (
+                str(self.state.plan_mode_exit_restored_mode).strip()
+                if self.state.plan_mode_exit_restored_mode is not None
+                and str(self.state.plan_mode_exit_restored_mode).strip()
+                else self.session_runtime_mode()
+            )
+            attachments.append(
+                build_plan_mode_exit_attachment(
+                    workflow_mode=workflow_mode,
+                    plan_file_path=plan_path,
+                    approved_plan=approved_plan,
+                    restored_mode=previous_mode,
+                )
+            )
+        return attachments
+
+    def record_plan_mode_attachment_cycle(self, attachments: tuple[PromptAttachment, ...]) -> None:
+        if any(attachment.kind == "plan_mode" for attachment in attachments):
+            self._plan_mode_attachment_count += 1
+            self.state.plan_mode_attachment_count = self._plan_mode_attachment_count
+
+    def mark_plan_mode_attachment_consumed(self, kind: str) -> None:
+        if kind == "plan_mode_reentry":
+            self.state.needs_plan_mode_reentry_attachment = False
+        elif kind == "plan_mode_exit":
+            self.state.needs_plan_mode_exit_attachment = False
+            self.state.plan_mode_exit_approved_plan = None
+            self.state.plan_mode_exit_restored_mode = None
+
+    def mark_plan_mode_attachments_consumed(self, kinds: tuple[str, ...]) -> None:
+        for kind in kinds:
+            self.mark_plan_mode_attachment_consumed(kind)
+
     def latest_planning_artifact(self) -> PlanningArtifact | None:
         return self._plan_component.latest_planning_artifact()
 
@@ -2444,10 +2931,69 @@ class Session:
         )
 
     def requires_read_only_subagents(self) -> bool:
-        return self._require_read_only_subagents
+        policy = self._effective_command_policy()
+        return bool(policy.require_read_only_subagents) if policy is not None else False
 
     def active_command_policy(self) -> TurnCommandPolicy | None:
         return self._active_command_policy
+
+    def transient_tool_context_policy(self) -> TurnCommandPolicy | None:
+        return self._transient_tool_context_policy
+
+    def transient_runtime_override(self) -> TurnRuntimeOverride | None:
+        return self._transient_runtime_override
+
+    def clear_transient_tool_context_overlay(self) -> None:
+        self._transient_tool_context_policy = None
+
+    def clear_transient_runtime_override(self) -> None:
+        self._transient_runtime_override = None
+
+    def restore_transient_tool_context_overlay(self, policy: TurnCommandPolicy | None) -> None:
+        self._transient_tool_context_policy = policy
+
+    def restore_transient_runtime_override(self, override: TurnRuntimeOverride | None) -> None:
+        self._transient_runtime_override = override
+
+    def apply_transient_tool_context_updates(
+        self,
+        updates: list[ToolContextUpdate] | tuple[ToolContextUpdate, ...],
+    ) -> TurnCommandPolicy | None:
+        overlay = self._transient_tool_context_policy
+        runtime_override = self._transient_runtime_override
+        for update in updates:
+            policy = self._compile_turn_command_policy(
+                allowed_tool_names=update.allowed_tool_names,
+                allowed_bash_command_prefixes=update.allowed_bash_command_prefixes,
+                require_read_only_subagents=bool(update.require_read_only_subagents),
+                command_policy_name=(
+                    f"skill:{update.skill_name}"
+                    if str(update.skill_name or "").strip()
+                    else (str(update.source or "").strip() or None)
+                ),
+                command_policy_source=(str(update.source or "").strip() or None),
+            )
+            overlay = self._merge_command_policies(
+                overlay,
+                policy,
+                identity_preference="overlay",
+            )
+            runtime_override = self._merge_runtime_overrides(
+                runtime_override,
+                self._compile_turn_runtime_override(
+                    model_override=update.model_override,
+                    effort_override=update.effort_override,
+                ),
+            )
+        self._transient_tool_context_policy = overlay
+        self._transient_runtime_override = runtime_override
+        return overlay
+
+    def current_runtime_override(self) -> TurnRuntimeOverride | None:
+        return self._merge_runtime_overrides(
+            self._active_runtime_override,
+            self._transient_runtime_override,
+        )
 
     def session_command_policy(self) -> TurnCommandPolicy | None:
         has_constraints = (
@@ -2539,16 +3085,196 @@ class Session:
     def analyze_bash_command(self, command: str) -> ShellCommandAnalysis:
         return BashTool().analyze_command(self.runtime_cwd(), command)
 
+    def plan_mode_allowed_tool_names(self) -> frozenset[str]:
+        if self.is_main_execution_session():
+            return PLAN_MODE_ALLOWED_TOOL_NAMES
+        return frozenset(name for name in PLAN_MODE_ALLOWED_TOOL_NAMES if name != "agent")
+
+    def is_main_execution_session(self) -> bool:
+        return self.state.session_execution_mode == "main"
+
+    def plan_mode_transition_tool_names(self) -> frozenset[str]:
+        if not self.is_main_execution_session():
+            return frozenset()
+        if self.in_plan_mode():
+            return frozenset({"ExitPlanMode"})
+        return frozenset({"EnterPlanMode"})
+
+    def current_plan_file_path(self) -> Path:
+        return self.get_plan_file_path()
+
+    def _display_path_for_tool_surface(self, path: Path) -> str:
+        try:
+            return path.relative_to(self.runtime_cwd()).as_posix()
+        except ValueError:
+            return str(path)
+
+    def _normalized_path(self, path: Path) -> Path:
+        return path.resolve(strict=False)
+
+    def _resolve_plan_mode_single_write_target(self, tool_input: dict[str, Any]) -> Path:
+        raw_path = str(tool_input.get("path") or "").strip()
+        if not raw_path:
+            raise PermissionDeniedError("Plan mode write tools require a target path.")
+        return self._normalized_path(resolve_workspace_path(self.runtime_cwd(), raw_path))
+
+    def resolve_plan_mode_write_targets(
+        self,
+        tool_name: str,
+        tool_input: dict[str, Any],
+    ) -> tuple[Path, ...]:
+        if tool_name == "write_file" or tool_name == "edit_file":
+            return (self._resolve_plan_mode_single_write_target(tool_input),)
+        if tool_name != "apply_patch":
+            return ()
+        patch_text = str(tool_input.get("patch") or "").strip()
+        if not patch_text:
+            raise PermissionDeniedError("Plan mode apply_patch requires patch content.")
+        from .tools.apply_patch import AddAction, ApplyPatchTool, DeleteAction, UpdateAction
+
+        try:
+            actions = ApplyPatchTool()._parse_patch(patch_text)
+        except Exception as exc:  # noqa: BLE001
+            raise PermissionDeniedError(
+                "Plan mode only allows apply_patch when every affected path is the current plan file, "
+                "and the patch targets could not be parsed."
+            ) from exc
+        targets: list[Path] = []
+        for action in actions:
+            if isinstance(action, AddAction):
+                targets.append(self._normalized_path(resolve_workspace_path(self.runtime_cwd(), action.path)))
+            elif isinstance(action, DeleteAction):
+                targets.append(self._normalized_path(resolve_workspace_path(self.runtime_cwd(), action.path)))
+            elif isinstance(action, UpdateAction):
+                targets.append(self._normalized_path(resolve_workspace_path(self.runtime_cwd(), action.path)))
+                if action.move_to is not None:
+                    targets.append(
+                        self._normalized_path(resolve_workspace_path(self.runtime_cwd(), action.move_to))
+                    )
+        deduped: list[Path] = []
+        seen: set[str] = set()
+        for target in targets:
+            marker = str(target)
+            if marker in seen:
+                continue
+            seen.add(marker)
+            deduped.append(target)
+        return tuple(deduped)
+
+    def _plan_mode_tool_denial_message(self, tool_name: str) -> str:
+        return (
+            f'Tool "{tool_name}" is not available in plan mode. '
+            "Plan mode only allows read-only exploration tools, read-only planning agents, "
+            "ask_user_question, read-only bash, and write_file/edit_file/apply_patch for the "
+            "current session plan file."
+        )
+
+    def _plan_mode_write_denial_message(self, tool_name: str, plan_path: Path) -> str:
+        return (
+            f'Tool "{tool_name}" is only allowed in plan mode when every affected path is the current '
+            f'session plan file ({self._display_path_for_tool_surface(plan_path)}).'
+        )
+
+    def validate_plan_mode_tool_policy(self, tool_name: str, tool_input: dict[str, Any]) -> None:
+        if not self.in_plan_mode():
+            return
+        if tool_name not in self.plan_mode_allowed_tool_names():
+            raise PermissionDeniedError(self._plan_mode_tool_denial_message(tool_name))
+        if tool_name == "agent":
+            self._validate_plan_mode_agent_tool(tool_input)
+            return
+        if tool_name == "bash":
+            command = str(tool_input.get("command") or "")
+            result = self.evaluate_bash_command_policy(command)
+            if not result.allowed:
+                raise PermissionDeniedError(result.reason)
+            return
+        if tool_name not in WRITE_TOOL_NAMES:
+            return
+        plan_path = self._normalized_path(self.current_plan_file_path())
+        targets = self.resolve_plan_mode_write_targets(tool_name, tool_input)
+        if not targets or any(target != plan_path for target in targets):
+            raise PermissionDeniedError(self._plan_mode_write_denial_message(tool_name, plan_path))
+
+    def _validate_plan_mode_agent_tool(self, tool_input: dict[str, Any]) -> None:
+        agent_type = str(tool_input.get("agent_type") or "").strip()
+        allowed_agent_types = self.plan_mode_allowed_agent_type_sequence()
+        if agent_type not in allowed_agent_types:
+            allowed = ", ".join(allowed_agent_types)
+            raise PermissionDeniedError(
+                f'Plan mode only allows the agent tool for planning agent types in the current workflow: {allowed}.'
+            )
+        if bool(tool_input.get("run_in_background", False)):
+            raise PermissionDeniedError(
+                "Plan mode planning agents must run in the foreground."
+            )
+        profile = self.resolve_agent_runtime_profile(agent_type)
+        if bool(profile.get("run_in_background")):
+            raise PermissionDeniedError(
+                f'Planning agent "{agent_type}" resolves to a background execution mode, which is not allowed in plan mode.'
+            )
+        if not bool(profile.get("read_only")):
+            raise PermissionDeniedError(
+                f'Planning agent "{agent_type}" must run with read-only restrictions in plan mode.'
+            )
+
+    def _format_plan_mode_bash_violation(
+        self,
+        segment: ShellCommandSegment,
+        *,
+        reason_kind: str,
+    ) -> str:
+        segment_label = f'segment {segment.index} "{segment.raw_command}"'
+        if reason_kind == "uncertain":
+            detail = segment.uncertainty_reason or "complex shell feature detected"
+            return (
+                f"Bash command is not allowed in plan mode: {segment_label} uses syntax that cannot "
+                f"be safely validated ({detail}). Plan mode only allows read-only shell commands."
+            )
+        return (
+            f"Bash command is not allowed in plan mode: {segment_label} performs a "
+            f'{segment.risk_level} action. Plan mode only allows read-only shell commands.'
+        )
+
     def evaluate_bash_command_policy(
         self,
         command: str,
         *,
         analysis: ShellCommandAnalysis | None = None,
     ) -> BashCommandPolicyResult:
-        policy = self._active_command_policy
+        command_analysis = analysis
+        if self.in_plan_mode():
+            command_analysis = command_analysis or self.analyze_bash_command(command)
+            for segment in command_analysis.segments:
+                if segment.uncertain:
+                    return BashCommandPolicyResult(
+                        allowed=False,
+                        policy_name="plan",
+                        policy_source="session_runtime_mode",
+                        violating_segment_index=segment.index,
+                        violating_segment=segment.raw_command,
+                        violating_features=segment.features,
+                        violation_kind="uncertain",
+                        reason=self._format_plan_mode_bash_violation(segment, reason_kind="uncertain"),
+                    )
+                if segment.risk_level != "shell_read":
+                    return BashCommandPolicyResult(
+                        allowed=False,
+                        policy_name="plan",
+                        policy_source="session_runtime_mode",
+                        violating_segment_index=segment.index,
+                        violating_segment=segment.raw_command,
+                        violating_features=segment.features,
+                        violation_kind="plan_mode_read_only",
+                        reason=self._format_plan_mode_bash_violation(
+                            segment,
+                            reason_kind="read_only_risk",
+                        ),
+                    )
+        policy = self._effective_command_policy()
         if policy is None or not policy.allowed_bash_command_prefixes:
             return BashCommandPolicyResult(allowed=True)
-        command_analysis = analysis or self.analyze_bash_command(command)
+        command_analysis = command_analysis or self.analyze_bash_command(command)
         allowed_prefixes = tuple(policy.allowed_bash_command_prefixes)
         normalized_prefixes = tuple(prefix.casefold() for prefix in allowed_prefixes)
         for segment in command_analysis.segments:
@@ -2633,7 +3359,8 @@ class Session:
 
     def validate_tool_call_policy(self, tool_name: str, tool_input: dict[str, Any]) -> None:
         self._validate_workspace_runtime(tool_name, tool_input)
-        policy = self._active_command_policy
+        self.validate_plan_mode_tool_policy(tool_name, tool_input)
+        policy = self._effective_command_policy()
         if policy is None:
             return
         if policy.allowed_tool_names is not None and tool_name not in policy.allowed_tool_names:
@@ -2643,6 +3370,8 @@ class Session:
                 f"Allowed tools: {allowed}"
             )
         if tool_name != "bash":
+            return
+        if self.in_plan_mode():
             return
         command = str(tool_input.get("command") or "")
         result = self.evaluate_bash_command_policy(command)
@@ -2700,9 +3429,17 @@ class Session:
         prompt: str,
         isolated_workspace: bool = False,
         read_only: bool = False,
+        model_override: str | None = None,
+        agent_type: str | None = None,
     ) -> str:
         if self.depth >= self.config.max_agent_depth:
             raise RuntimeError("Max agent depth reached.")
+        if agent_type is not None and is_builtin_planning_agent_name(agent_type):
+            if isolated_workspace:
+                raise ValueError(
+                    f'Builtin planning agent "{agent_type}" is foreground-only and cannot run in an isolated workspace.'
+                )
+            read_only = True
         read_only_policy = (
             self._compile_turn_command_policy(
                 allowed_tool_names=READ_ONLY_SUBAGENT_TOOL_NAMES,
@@ -2727,7 +3464,11 @@ class Session:
         )
         child_prompt = f"{description}\n\n{prompt}"
         if read_only:
-            child_prompt = _build_read_only_subagent_prompt(description=description, prompt=prompt)
+            child_prompt = _build_read_only_subagent_prompt(
+                description=description,
+                prompt=prompt,
+                agent_type=agent_type,
+            )
         return child.ask(
             child_prompt,
             allowed_tool_names=READ_ONLY_SUBAGENT_TOOL_NAMES if read_only else None,
@@ -2735,6 +3476,7 @@ class Session:
             require_read_only_subagents=read_only,
             command_policy_name="read-only-subagent" if read_only else None,
             command_policy_source="subagent" if read_only else None,
+            model_override=model_override,
         )
 
     def launch_background_agent(
@@ -2744,9 +3486,15 @@ class Session:
         prompt: str,
         isolated_workspace: bool = False,
         read_only: bool = False,
+        model_override: str | None = None,
+        agent_type: str | None = None,
     ) -> str:
         if self.depth >= self.config.max_agent_depth:
             raise RuntimeError("Max agent depth reached.")
+        if agent_type is not None and is_builtin_planning_agent_name(agent_type):
+            raise ValueError(
+                f'Builtin planning agent "{agent_type}" is foreground-only and cannot run in the background.'
+            )
         active_plan = self.active_planning_artifact()
         task = self.task_manager.create(
             "agent",
@@ -2801,7 +3549,11 @@ class Session:
                     plan_execution_phase="running" if active_plan is not None else None,
                 )
                 output = child.ask(
-                    _build_read_only_subagent_prompt(description=description, prompt=prompt)
+                    _build_read_only_subagent_prompt(
+                        description=description,
+                        prompt=prompt,
+                        agent_type=agent_type,
+                    )
                     if read_only
                     else f"{description}\n\n{prompt}",
                     sink=self._build_background_task_sink(task.id),
@@ -2810,6 +3562,7 @@ class Session:
                     require_read_only_subagents=read_only,
                     command_policy_name="read-only-subagent" if read_only else None,
                     command_policy_source="background-subagent" if read_only else None,
+                    model_override=model_override,
                 )
             except Exception as exc:  # noqa: BLE001
                 error = exc
@@ -3528,6 +4281,18 @@ class Session:
             str(runtime_progress.get("runtime_tool_result_replacement_summary") or "").strip()
             or None
         )
+        skill_tool_fork_summary = (
+            str(runtime_progress.get("runtime_skill_tool_fork_summary") or "").strip()
+            or None
+        )
+        skill_tool_inline_summary = (
+            str(runtime_progress.get("runtime_skill_tool_inline_summary") or "").strip()
+            or None
+        )
+        skill_tool_context_summary = (
+            str(runtime_progress.get("runtime_skill_tool_context_summary") or "").strip()
+            or None
+        )
         runtime_progress_summary = (
             str(runtime_progress.get("runtime_recent_progress_summary") or "").strip() or None
         )
@@ -3595,6 +4360,12 @@ class Session:
                     str(runtime_progress.get("runtime_tool_result_microcompact_summary") or "").strip()
                     or "none"
                 ),
+                "skill_tool_fork": skill_tool_fork_summary,
+                "skill_tool_fork_display": skill_tool_fork_summary or "none",
+                "skill_tool_inline": skill_tool_inline_summary,
+                "skill_tool_inline_display": skill_tool_inline_summary or "none",
+                "skill_tool_context": skill_tool_context_summary,
+                "skill_tool_context_display": skill_tool_context_summary or "none",
                 "budget_pressure_detail": budget_pressure_detail,
                 "budget_pressure_detail_display": budget_pressure_detail or "none",
             },
@@ -3610,6 +4381,203 @@ class Session:
                 ),
                 "provider_view_assembly": str(
                     prompt_prefix_surface.get("prompt_prefix_provider_view_summary") or "none"
+                ),
+                "prompt_prefix_attachment_count": int(
+                    prompt_prefix_surface.get("prompt_prefix_attachment_count") or 0
+                ),
+                "prompt_prefix_attachment_kinds": list(
+                    prompt_prefix_surface.get("prompt_prefix_attachment_kinds") or []
+                ),
+                "prompt_prefix_attachment_summaries": list(
+                    prompt_prefix_surface.get("prompt_prefix_attachment_summaries") or []
+                ),
+                "prompt_prefix_attachment_summary": str(
+                    prompt_prefix_surface.get("prompt_prefix_attachment_summary") or "none"
+                ),
+                "prompt_prefix_attachment_mode": str(
+                    prompt_prefix_surface.get("prompt_prefix_attachment_mode") or "none"
+                ),
+                "prompt_prefix_attachment_change_reason": str(
+                    prompt_prefix_surface.get("prompt_prefix_attachment_change_reason")
+                    or "none"
+                ),
+                "plan_workflow_mode": str(
+                    prompt_prefix_surface.get("plan_workflow_mode") or "five_phase"
+                ),
+                "plan_workflow_phase_family": str(
+                    prompt_prefix_surface.get("plan_workflow_phase_family") or "five_phase"
+                ),
+                "plan_workflow_branch_identity": str(
+                    prompt_prefix_surface.get("plan_workflow_branch_identity") or "none"
+                ),
+                "plan_workflow_branch_summary": str(
+                    prompt_prefix_surface.get("plan_workflow_branch_summary") or "none"
+                ),
+                "plan_workflow_planning_cadence": str(
+                    prompt_prefix_surface.get("plan_workflow_planning_cadence") or "none"
+                ),
+                "plan_workflow_first_turn_contract": str(
+                    prompt_prefix_surface.get("plan_workflow_first_turn_contract") or "none"
+                ),
+                "plan_workflow_first_turn_summary": str(
+                    prompt_prefix_surface.get("plan_workflow_first_turn_summary") or "none"
+                ),
+                "plan_workflow_first_turn_scan_scope": str(
+                    prompt_prefix_surface.get("plan_workflow_first_turn_scan_scope") or "none"
+                ),
+                "plan_workflow_first_turn_plan_expectation": str(
+                    prompt_prefix_surface.get("plan_workflow_first_turn_plan_expectation")
+                    or "none"
+                ),
+                "plan_workflow_first_turn_question_timing": str(
+                    prompt_prefix_surface.get("plan_workflow_first_turn_question_timing")
+                    or "none"
+                ),
+                "plan_workflow_first_turn_regression_guard": str(
+                    prompt_prefix_surface.get("plan_workflow_first_turn_regression_guard")
+                    or "none"
+                ),
+                "plan_workflow_plan_update_contract": str(
+                    prompt_prefix_surface.get("plan_workflow_plan_update_contract") or "none"
+                ),
+                "plan_workflow_plan_update_summary": str(
+                    prompt_prefix_surface.get("plan_workflow_plan_update_summary") or "none"
+                ),
+                "plan_workflow_plan_update_trigger": str(
+                    prompt_prefix_surface.get("plan_workflow_plan_update_trigger") or "none"
+                ),
+                "plan_workflow_plan_update_capture_scope": str(
+                    prompt_prefix_surface.get("plan_workflow_plan_update_capture_scope")
+                    or "none"
+                ),
+                "plan_workflow_plan_update_deferral_guard": str(
+                    prompt_prefix_surface.get("plan_workflow_plan_update_deferral_guard")
+                    or "none"
+                ),
+                "plan_workflow_question_loop_contract": str(
+                    prompt_prefix_surface.get("plan_workflow_question_loop_contract") or "none"
+                ),
+                "plan_workflow_turn_exit_contract": str(
+                    prompt_prefix_surface.get("plan_workflow_turn_exit_contract") or "none"
+                ),
+                "plan_workflow_turn_exit_summary": str(
+                    prompt_prefix_surface.get("plan_workflow_turn_exit_summary") or "none"
+                ),
+                "plan_workflow_clarification_channel": str(
+                    prompt_prefix_surface.get("plan_workflow_clarification_channel")
+                    or "none"
+                ),
+                "plan_workflow_approval_channel": str(
+                    prompt_prefix_surface.get("plan_workflow_approval_channel") or "none"
+                ),
+                "plan_workflow_turn_exit_forbidden_patterns": str(
+                    prompt_prefix_surface.get("plan_workflow_turn_exit_forbidden_patterns")
+                    or "none"
+                ),
+                "plan_workflow_planning_agent_usage_summary": str(
+                    prompt_prefix_surface.get("plan_workflow_planning_agent_usage_summary")
+                    or "none"
+                ),
+                "plan_workflow_explore_agent_usage_rule": str(
+                    prompt_prefix_surface.get("plan_workflow_explore_agent_usage_rule")
+                    or "none"
+                ),
+                "plan_workflow_plan_agent_delegation_rule": str(
+                    prompt_prefix_surface.get("plan_workflow_plan_agent_delegation_rule")
+                    or "none"
+                ),
+                "plan_workflow_main_thread_design_owner": str(
+                    prompt_prefix_surface.get("plan_workflow_main_thread_design_owner")
+                    or "none"
+                ),
+                "plan_workflow_followup_continuity_contract": str(
+                    prompt_prefix_surface.get("plan_workflow_followup_continuity_contract")
+                    or "none"
+                ),
+                "plan_workflow_followup_continuity_summary": str(
+                    prompt_prefix_surface.get("plan_workflow_followup_continuity_summary")
+                    or "none"
+                ),
+                "plan_workflow_branch_preservation_rule": str(
+                    prompt_prefix_surface.get("plan_workflow_branch_preservation_rule")
+                    or "none"
+                ),
+                "plan_workflow_agent_count": int(
+                    prompt_prefix_surface.get("plan_workflow_agent_count") or 1
+                ),
+                "plan_workflow_explore_agent_count": int(
+                    prompt_prefix_surface.get("plan_workflow_explore_agent_count") or 3
+                ),
+                "plan_workflow_allowed_agent_names": list(
+                    prompt_prefix_surface.get("plan_workflow_allowed_agent_names") or []
+                ),
+                "plan_workflow_invocation_boundary_summary": str(
+                    prompt_prefix_surface.get("plan_workflow_invocation_boundary_summary")
+                    or "none"
+                ),
+                "plan_workflow_invocation_delegation_default": str(
+                    prompt_prefix_surface.get("plan_workflow_invocation_delegation_default")
+                    or "none"
+                ),
+                "plan_workflow_explore_scope": str(
+                    prompt_prefix_surface.get("plan_workflow_explore_scope") or "none"
+                ),
+                "plan_workflow_plan_scope": str(
+                    prompt_prefix_surface.get("plan_workflow_plan_scope") or "none"
+                ),
+                "plan_workflow_main_thread_scope": str(
+                    prompt_prefix_surface.get("plan_workflow_main_thread_scope") or "none"
+                ),
+                "plan_workflow_verification_agent_required": bool(
+                    prompt_prefix_surface.get("plan_workflow_verification_agent_required", False)
+                ),
+                "plan_workflow_verification_agent_scope": str(
+                    prompt_prefix_surface.get("plan_workflow_verification_agent_scope")
+                    or "post_milestone_b_followup"
+                ),
+                "plan_workflow_verification_agent_summary": str(
+                    prompt_prefix_surface.get("plan_workflow_verification_agent_summary")
+                    or "Verification agent is not required for Milestone B completion."
+                ),
+                "prompt_prefix_plan_mode_attachment_active": (
+                    "yes"
+                    if bool(prompt_prefix_surface.get("prompt_prefix_plan_mode_attachment_active"))
+                    else "no"
+                ),
+                "prompt_prefix_plan_mode_reentry_attachment_active": (
+                    "yes"
+                    if bool(
+                        prompt_prefix_surface.get(
+                            "prompt_prefix_plan_mode_reentry_attachment_active"
+                        )
+                    )
+                    else "no"
+                ),
+                "prompt_prefix_plan_mode_exit_attachment_active": (
+                    "yes"
+                    if bool(
+                        prompt_prefix_surface.get(
+                            "prompt_prefix_plan_mode_exit_attachment_active"
+                        )
+                    )
+                    else "no"
+                ),
+                "plan_instruction_state": str(
+                    prompt_prefix_surface.get("plan_instruction_state") or "inactive"
+                ),
+                "plan_instruction_attachment_mode": str(
+                    prompt_prefix_surface.get("plan_instruction_attachment_mode") or "none"
+                ),
+                "plan_instruction_attachment_summary": str(
+                    prompt_prefix_surface.get("plan_instruction_attachment_summary") or "none"
+                ),
+                "plan_instruction_reentry_active": (
+                    "yes"
+                    if bool(prompt_prefix_surface.get("plan_instruction_reentry_active"))
+                    else "no"
+                ),
+                "plan_instruction_exit_active": (
+                    "yes" if bool(prompt_prefix_surface.get("plan_instruction_exit_active")) else "no"
                 ),
                 "prompt_prefix_cache_mode": str(
                     prompt_prefix_surface.get("prompt_prefix_cache_mode") or "disabled"
@@ -3777,6 +4745,8 @@ class Session:
                     + str(progress["tool_result_artifact_display"]),
                     "tool-result microcompact: "
                     + str(progress["tool_result_microcompact_display"]),
+                    "skill-tool inline: " + str(progress["skill_tool_inline_display"]),
+                    "skill-tool context: " + str(progress["skill_tool_context_display"]),
                 ]
             )
         return lines
@@ -3796,6 +4766,91 @@ class Session:
                 f"dynamic_tail_chars={prefix['prompt_prefix_dynamic_tail_chars']}"
             ),
             "provider-view assembly: " + str(prefix["provider_view_assembly"]),
+            "plan attachments: " + str(prefix["prompt_prefix_attachment_summary"]),
+            "plan attachment mode: " + str(prefix["prompt_prefix_attachment_mode"]),
+            "plan attachment kinds: "
+            + ",".join(str(item) for item in prefix["prompt_prefix_attachment_kinds"])
+            if prefix["prompt_prefix_attachment_kinds"]
+            else "plan attachment kinds: none",
+            "plan workflow: "
+            + (
+                f"{prefix.get('plan_workflow_mode', 'five_phase')} "
+                f"agents={prefix.get('plan_workflow_agent_count', 1)} "
+                f"explore_agents={prefix.get('plan_workflow_explore_agent_count', 3)}"
+            ),
+            "plan workflow branch: "
+            + str(prefix.get("plan_workflow_branch_identity") or "none"),
+            "plan workflow branch summary: "
+            + str(prefix.get("plan_workflow_branch_summary") or "none"),
+            "plan workflow contracts: "
+            + (
+                f"cadence={prefix.get('plan_workflow_planning_cadence', 'none')} "
+                f"first_turn={prefix.get('plan_workflow_first_turn_contract', 'none')} "
+                f"plan_updates={prefix.get('plan_workflow_plan_update_contract', 'none')} "
+                f"question_loop={prefix.get('plan_workflow_question_loop_contract', 'none')} "
+                f"turn_exit={prefix.get('plan_workflow_turn_exit_contract', 'none')}"
+            ),
+            "plan workflow first turn: "
+            + str(prefix.get("plan_workflow_first_turn_summary") or "none"),
+            "plan workflow first-turn detail: "
+            + (
+                f"scan={prefix.get('plan_workflow_first_turn_scan_scope', 'none')} "
+                f"plan={prefix.get('plan_workflow_first_turn_plan_expectation', 'none')} "
+                f"question_timing={prefix.get('plan_workflow_first_turn_question_timing', 'none')}"
+            ),
+            "plan workflow anti-drift: "
+            + str(prefix.get("plan_workflow_first_turn_regression_guard") or "none"),
+            "plan workflow plan updates: "
+            + str(prefix.get("plan_workflow_plan_update_summary") or "none"),
+            "plan workflow plan-update detail: "
+            + (
+                f"trigger={prefix.get('plan_workflow_plan_update_trigger', 'none')} "
+                f"capture={prefix.get('plan_workflow_plan_update_capture_scope', 'none')}"
+            ),
+            "plan workflow plan-update anti-drift: "
+            + str(prefix.get("plan_workflow_plan_update_deferral_guard") or "none"),
+            "plan workflow turn exit: "
+            + str(prefix.get("plan_workflow_turn_exit_summary") or "none"),
+            "plan workflow turn-exit detail: "
+            + (
+                f"clarification={prefix.get('plan_workflow_clarification_channel', 'none')} "
+                f"approval={prefix.get('plan_workflow_approval_channel', 'none')}"
+            ),
+            "plan workflow turn-exit anti-drift: "
+            + str(prefix.get("plan_workflow_turn_exit_forbidden_patterns") or "none"),
+            "plan workflow agent usage: "
+            + str(prefix.get("plan_workflow_planning_agent_usage_summary") or "none"),
+            "plan workflow agent detail: "
+            + (
+                f"explore={prefix.get('plan_workflow_explore_agent_usage_rule', 'none')} "
+                f"plan_delegate={prefix.get('plan_workflow_plan_agent_delegation_rule', 'none')} "
+                f"design_owner={prefix.get('plan_workflow_main_thread_design_owner', 'none')}"
+            ),
+            "plan workflow follow-up continuity: "
+            + str(prefix.get("plan_workflow_followup_continuity_summary") or "none"),
+            "plan workflow follow-up detail: "
+            + str(prefix.get("plan_workflow_followup_continuity_contract") or "none"),
+            "plan workflow preservation: "
+            + str(prefix.get("plan_workflow_branch_preservation_rule") or "none"),
+            "verification-agent scope: "
+            + str(prefix.get("plan_workflow_verification_agent_scope") or "none"),
+            "planning-agent boundary: "
+            + str(prefix.get("plan_workflow_invocation_boundary_summary") or "none"),
+            "planning-agent allowed: "
+            + (
+                ",".join(str(item) for item in prefix.get("plan_workflow_allowed_agent_names") or [])
+                if prefix.get("plan_workflow_allowed_agent_names")
+                else "none"
+            ),
+            "plan attachment state: "
+            + (
+                f"{prefix['plan_instruction_state']} "
+                f"mode={prefix['plan_instruction_attachment_mode']} "
+                f"reentry={prefix['plan_instruction_reentry_active']} "
+                f"exit={prefix['plan_instruction_exit_active']}"
+            ),
+            "plan attachment change reason: "
+            + str(prefix["prompt_prefix_attachment_change_reason"]),
             "prompt prefix cache mode: " + str(prefix["prompt_prefix_cache_mode"]),
             "prompt prefix cache supported: " + str(prefix["prompt_prefix_cache_supported"]),
             "prompt prefix cache provider: " + str(prefix["prompt_prefix_cache_provider"]),
@@ -3861,6 +4916,9 @@ class Session:
             "runtime_tool_result_replacement_summary": None,
             "runtime_tool_result_artifact_summary": None,
             "runtime_tool_result_microcompact_summary": None,
+            "runtime_skill_tool_fork_summary": None,
+            "runtime_skill_tool_inline_summary": None,
+            "runtime_skill_tool_context_summary": None,
             "runtime_recent_progress_summary": None,
             "runtime_recent_progress_kind": "none",
         }
@@ -3992,6 +5050,24 @@ class Session:
             updated["runtime_recent_progress_summary"] = microcompact_summary
             updated["runtime_recent_progress_kind"] = "tool_result_replacement"
             return updated
+        if event.kind == "skill_tool_fork_messages_applied":
+            fork_summary = self._compact_runtime_progress_text(event.message)
+            updated["runtime_skill_tool_fork_summary"] = fork_summary
+            updated["runtime_recent_progress_summary"] = fork_summary
+            updated["runtime_recent_progress_kind"] = "tool_result"
+            return updated
+        if event.kind == "skill_tool_inline_messages_applied":
+            inline_summary = self._compact_runtime_progress_text(event.message)
+            updated["runtime_skill_tool_inline_summary"] = inline_summary
+            updated["runtime_recent_progress_summary"] = inline_summary
+            updated["runtime_recent_progress_kind"] = "tool_result"
+            return updated
+        if event.kind == "skill_tool_context_applied":
+            context_summary = self._compact_runtime_progress_text(event.message)
+            updated["runtime_skill_tool_context_summary"] = context_summary
+            updated["runtime_recent_progress_summary"] = context_summary
+            updated["runtime_recent_progress_kind"] = "tool_result"
+            return updated
         if event.kind in {"compact_recovery_started", "compact_recovery_finished"}:
             recovery_summary = self._compact_runtime_progress_text(event.message)
             updated["runtime_compact_recovery_summary"] = recovery_summary
@@ -4067,6 +5143,15 @@ class Session:
                 "runtime_tool_result_microcompact_summary": metadata.get(
                     "background_runtime_tool_result_microcompact_summary"
                 ),
+                "runtime_skill_tool_fork_summary": metadata.get(
+                    "background_runtime_skill_tool_fork_summary"
+                ),
+                "runtime_skill_tool_inline_summary": metadata.get(
+                    "background_runtime_skill_tool_inline_summary"
+                ),
+                "runtime_skill_tool_context_summary": metadata.get(
+                    "background_runtime_skill_tool_context_summary"
+                ),
                 "runtime_recent_progress_summary": metadata.get("background_runtime_recent_progress_summary"),
                 "runtime_recent_progress_kind": metadata.get("background_runtime_recent_progress_kind"),
             }
@@ -4124,6 +5209,15 @@ class Session:
         )
         metadata["background_runtime_tool_result_microcompact_summary"] = snapshot.get(
             "runtime_tool_result_microcompact_summary"
+        )
+        metadata["background_runtime_skill_tool_fork_summary"] = snapshot.get(
+            "runtime_skill_tool_fork_summary"
+        )
+        metadata["background_runtime_skill_tool_inline_summary"] = snapshot.get(
+            "runtime_skill_tool_inline_summary"
+        )
+        metadata["background_runtime_skill_tool_context_summary"] = snapshot.get(
+            "runtime_skill_tool_context_summary"
         )
         metadata["background_runtime_recent_progress_summary"] = snapshot.get(
             "runtime_recent_progress_summary"
@@ -5125,6 +6219,15 @@ class Session:
             "status_runtime_tool_result_microcompact_summary": runtime_progress.get(
                 "runtime_tool_result_microcompact_summary"
             ),
+            "status_runtime_skill_tool_fork_summary": runtime_progress.get(
+                "runtime_skill_tool_fork_summary"
+            ),
+            "status_runtime_skill_tool_inline_summary": runtime_progress.get(
+                "runtime_skill_tool_inline_summary"
+            ),
+            "status_runtime_skill_tool_context_summary": runtime_progress.get(
+                "runtime_skill_tool_context_summary"
+            ),
             "status_prompt_prefix_segment_count": int(
                 prompt_prefix_surface.get("prompt_prefix_segment_count") or 0
             ),
@@ -5133,6 +6236,185 @@ class Session:
             ),
             "status_prompt_prefix_dynamic_tail_chars": int(
                 prompt_prefix_surface.get("prompt_prefix_dynamic_tail_chars") or 0
+            ),
+            "status_prompt_prefix_attachment_count": int(
+                prompt_prefix_surface.get("prompt_prefix_attachment_count") or 0
+            ),
+            "status_prompt_prefix_attachment_kinds": list(
+                prompt_prefix_surface.get("prompt_prefix_attachment_kinds") or []
+            ),
+            "status_prompt_prefix_attachment_summaries": list(
+                prompt_prefix_surface.get("prompt_prefix_attachment_summaries") or []
+            ),
+            "status_prompt_prefix_attachment_summary": str(
+                prompt_prefix_surface.get("prompt_prefix_attachment_summary") or "none"
+            ),
+            "status_prompt_prefix_attachment_mode": str(
+                prompt_prefix_surface.get("prompt_prefix_attachment_mode") or "none"
+            ),
+            "status_prompt_prefix_attachment_change_reason": str(
+                prompt_prefix_surface.get("prompt_prefix_attachment_change_reason")
+                or "none"
+            ),
+            "status_plan_workflow_mode": str(
+                prompt_prefix_surface.get("plan_workflow_mode") or "five_phase"
+            ),
+            "status_plan_workflow_phase_family": str(
+                prompt_prefix_surface.get("plan_workflow_phase_family") or "five_phase"
+            ),
+            "status_plan_workflow_branch_identity": str(
+                prompt_prefix_surface.get("plan_workflow_branch_identity") or "none"
+            ),
+            "status_plan_workflow_branch_summary": str(
+                prompt_prefix_surface.get("plan_workflow_branch_summary") or "none"
+            ),
+            "status_plan_workflow_planning_cadence": str(
+                prompt_prefix_surface.get("plan_workflow_planning_cadence") or "none"
+            ),
+            "status_plan_workflow_first_turn_contract": str(
+                prompt_prefix_surface.get("plan_workflow_first_turn_contract") or "none"
+            ),
+            "status_plan_workflow_first_turn_summary": str(
+                prompt_prefix_surface.get("plan_workflow_first_turn_summary") or "none"
+            ),
+            "status_plan_workflow_first_turn_scan_scope": str(
+                prompt_prefix_surface.get("plan_workflow_first_turn_scan_scope") or "none"
+            ),
+            "status_plan_workflow_first_turn_plan_expectation": str(
+                prompt_prefix_surface.get("plan_workflow_first_turn_plan_expectation")
+                or "none"
+            ),
+            "status_plan_workflow_first_turn_question_timing": str(
+                prompt_prefix_surface.get("plan_workflow_first_turn_question_timing")
+                or "none"
+            ),
+            "status_plan_workflow_first_turn_regression_guard": str(
+                prompt_prefix_surface.get("plan_workflow_first_turn_regression_guard")
+                or "none"
+            ),
+            "status_plan_workflow_plan_update_contract": str(
+                prompt_prefix_surface.get("plan_workflow_plan_update_contract") or "none"
+            ),
+            "status_plan_workflow_plan_update_summary": str(
+                prompt_prefix_surface.get("plan_workflow_plan_update_summary") or "none"
+            ),
+            "status_plan_workflow_plan_update_trigger": str(
+                prompt_prefix_surface.get("plan_workflow_plan_update_trigger") or "none"
+            ),
+            "status_plan_workflow_plan_update_capture_scope": str(
+                prompt_prefix_surface.get("plan_workflow_plan_update_capture_scope")
+                or "none"
+            ),
+            "status_plan_workflow_plan_update_deferral_guard": str(
+                prompt_prefix_surface.get("plan_workflow_plan_update_deferral_guard")
+                or "none"
+            ),
+            "status_plan_workflow_question_loop_contract": str(
+                prompt_prefix_surface.get("plan_workflow_question_loop_contract") or "none"
+            ),
+            "status_plan_workflow_turn_exit_contract": str(
+                prompt_prefix_surface.get("plan_workflow_turn_exit_contract") or "none"
+            ),
+            "status_plan_workflow_turn_exit_summary": str(
+                prompt_prefix_surface.get("plan_workflow_turn_exit_summary") or "none"
+            ),
+            "status_plan_workflow_clarification_channel": str(
+                prompt_prefix_surface.get("plan_workflow_clarification_channel")
+                or "none"
+            ),
+            "status_plan_workflow_approval_channel": str(
+                prompt_prefix_surface.get("plan_workflow_approval_channel") or "none"
+            ),
+            "status_plan_workflow_turn_exit_forbidden_patterns": str(
+                prompt_prefix_surface.get("plan_workflow_turn_exit_forbidden_patterns")
+                or "none"
+            ),
+            "status_plan_workflow_planning_agent_usage_summary": str(
+                prompt_prefix_surface.get("plan_workflow_planning_agent_usage_summary")
+                or "none"
+            ),
+            "status_plan_workflow_explore_agent_usage_rule": str(
+                prompt_prefix_surface.get("plan_workflow_explore_agent_usage_rule")
+                or "none"
+            ),
+            "status_plan_workflow_plan_agent_delegation_rule": str(
+                prompt_prefix_surface.get("plan_workflow_plan_agent_delegation_rule")
+                or "none"
+            ),
+            "status_plan_workflow_main_thread_design_owner": str(
+                prompt_prefix_surface.get("plan_workflow_main_thread_design_owner")
+                or "none"
+            ),
+            "status_plan_workflow_followup_continuity_contract": str(
+                prompt_prefix_surface.get("plan_workflow_followup_continuity_contract")
+                or "none"
+            ),
+            "status_plan_workflow_followup_continuity_summary": str(
+                prompt_prefix_surface.get("plan_workflow_followup_continuity_summary")
+                or "none"
+            ),
+            "status_plan_workflow_branch_preservation_rule": str(
+                prompt_prefix_surface.get("plan_workflow_branch_preservation_rule")
+                or "none"
+            ),
+            "status_plan_workflow_agent_count": int(
+                prompt_prefix_surface.get("plan_workflow_agent_count") or 1
+            ),
+            "status_plan_workflow_explore_agent_count": int(
+                prompt_prefix_surface.get("plan_workflow_explore_agent_count") or 3
+            ),
+            "status_plan_workflow_allowed_agent_names": list(
+                prompt_prefix_surface.get("plan_workflow_allowed_agent_names") or []
+            ),
+            "status_plan_workflow_invocation_boundary_summary": str(
+                prompt_prefix_surface.get("plan_workflow_invocation_boundary_summary") or "none"
+            ),
+            "status_plan_workflow_invocation_delegation_default": str(
+                prompt_prefix_surface.get("plan_workflow_invocation_delegation_default") or "none"
+            ),
+            "status_plan_workflow_explore_scope": str(
+                prompt_prefix_surface.get("plan_workflow_explore_scope") or "none"
+            ),
+            "status_plan_workflow_plan_scope": str(
+                prompt_prefix_surface.get("plan_workflow_plan_scope") or "none"
+            ),
+            "status_plan_workflow_main_thread_scope": str(
+                prompt_prefix_surface.get("plan_workflow_main_thread_scope") or "none"
+            ),
+            "status_plan_workflow_verification_agent_required": bool(
+                prompt_prefix_surface.get("plan_workflow_verification_agent_required", False)
+            ),
+            "status_plan_workflow_verification_agent_scope": str(
+                prompt_prefix_surface.get("plan_workflow_verification_agent_scope")
+                or "post_milestone_b_followup"
+            ),
+            "status_plan_workflow_verification_agent_summary": str(
+                prompt_prefix_surface.get("plan_workflow_verification_agent_summary")
+                or "Verification agent is not required for Milestone B completion."
+            ),
+            "status_prompt_prefix_plan_mode_attachment_active": bool(
+                prompt_prefix_surface.get("prompt_prefix_plan_mode_attachment_active")
+            ),
+            "status_prompt_prefix_plan_mode_reentry_attachment_active": bool(
+                prompt_prefix_surface.get("prompt_prefix_plan_mode_reentry_attachment_active")
+            ),
+            "status_prompt_prefix_plan_mode_exit_attachment_active": bool(
+                prompt_prefix_surface.get("prompt_prefix_plan_mode_exit_attachment_active")
+            ),
+            "status_plan_instruction_state": str(
+                prompt_prefix_surface.get("plan_instruction_state") or "inactive"
+            ),
+            "status_plan_instruction_attachment_mode": str(
+                prompt_prefix_surface.get("plan_instruction_attachment_mode") or "none"
+            ),
+            "status_plan_instruction_attachment_summary": str(
+                prompt_prefix_surface.get("plan_instruction_attachment_summary") or "none"
+            ),
+            "status_plan_instruction_reentry_active": bool(
+                prompt_prefix_surface.get("plan_instruction_reentry_active")
+            ),
+            "status_plan_instruction_exit_active": bool(
+                prompt_prefix_surface.get("plan_instruction_exit_active")
             ),
             "status_prompt_prefix_cache_mode": str(
                 prompt_prefix_surface.get("prompt_prefix_cache_mode") or "disabled"
@@ -7643,7 +8925,7 @@ class Session:
         selected_index = self.active_plan_scout_index_for_task(task_id)
         if selected_index is None:
             return None
-        command = f"/plan scouts {selected_index + 1}"
+        command = f"/planning scouts {selected_index + 1}"
         payload = self.active_plan_scout_file_context_payload(selected_index=selected_index)
         file_count = int((payload or {}).get("file_context_file_count") or 0)
         if file_index is not None and file_count > 0:
@@ -7660,7 +8942,7 @@ class Session:
         selected_index = self.active_plan_execution_index_for_task(task_id)
         if selected_index is None:
             return None
-        command = f"/plan execution {selected_index + 1}"
+        command = f"/planning execution {selected_index + 1}"
         payload = self.active_plan_execution_file_context_payload(selected_index=selected_index)
         file_count = int((payload or {}).get("file_context_file_count") or 0)
         if file_index is not None and file_count > 0:
@@ -7695,7 +8977,7 @@ class Session:
             required_reason="active plan",
         )
         if summary_index is not None:
-            commands.append(f"/plan file {summary_index + 1}")
+            commands.append(f"/planning file {summary_index + 1}")
         for child_index in range(self.active_plan_scout_count()):
             payload = self.active_plan_scout_file_context_payload(selected_index=child_index)
             file_index = self._find_matching_file_context_index(
@@ -7704,7 +8986,7 @@ class Session:
                 required_reason="active task",
             )
             if file_index is not None:
-                commands.append(f"/plan scouts {child_index + 1} file {file_index + 1}")
+                commands.append(f"/planning scouts {child_index + 1} file {file_index + 1}")
         for child_index in range(self.active_plan_execution_count()):
             payload = self.active_plan_execution_file_context_payload(selected_index=child_index)
             file_index = self._find_matching_file_context_index(
@@ -7713,7 +8995,7 @@ class Session:
                 required_reason="active task",
             )
             if file_index is not None:
-                commands.append(f"/plan execution {child_index + 1} file {file_index + 1}")
+                commands.append(f"/planning execution {child_index + 1} file {file_index + 1}")
         return self._dedupe_action_commands(commands)
 
     def _dedupe_action_commands(self, commands: list[str]) -> list[str]:
@@ -8115,15 +9397,45 @@ class Session:
             status = "inactive"
         else:
             status = "enabled"
+        prompt_active = status == "enabled"
+        user_invocable = bool(getattr(skill, "user_invocable", False))
+        model_invocable = user_invocable and not bool(
+            getattr(skill, "disable_model_invocation", False)
+        )
         return {
             "name": skill.name,
             "path": str(skill.path),
+            "skill_root": str(getattr(skill, "skill_root", skill.path.parent)),
             "description": skill.description,
+            "when_to_use": str(getattr(skill, "when_to_use", "") or ""),
+            "user_invocable": user_invocable,
+            "model_invocable": model_invocable,
+            "disable_model_invocation": bool(
+                getattr(skill, "disable_model_invocation", False)
+            ),
+            "slash_command": f"/{skill.name}" if user_invocable else "",
+            "argument_hint": str(getattr(skill, "argument_hint", "") or ""),
+            "arguments": list(getattr(skill, "arguments", ()) or ()),
+            "arguments_summary": ",".join(getattr(skill, "arguments", ()) or ()) or "none",
+            "allowed_tool_names": list(getattr(skill, "allowed_tool_names", ()) or ()),
+            "allowed_tool_names_summary": (
+                ",".join(getattr(skill, "allowed_tool_names", ()) or ()) or "inherit"
+            ),
+            "allowed_bash_command_prefixes": list(
+                getattr(skill, "allowed_bash_command_prefixes", ()) or ()
+            ),
+            "allowed_bash_command_prefixes_summary": (
+                ",".join(getattr(skill, "allowed_bash_command_prefixes", ()) or ()) or "inherit"
+            ),
+            "execution_context": str(getattr(skill, "execution_context", "inline") or "inline"),
+            "model": str(getattr(skill, "model", "") or ""),
+            "effort": str(getattr(skill, "effort", "") or ""),
             "tags": list(skill.tags),
             "tags_summary": ",".join(skill.tags) if skill.tags else "none",
             "content_preview": compact_multiline_text(skill.content, max_lines=2, max_chars=140),
             "status": status,
             "status_parts": list(status_parts),
+            "prompt_active": prompt_active,
             "source": source_payload["source"],
             "source_label": source_payload["source_label"],
             "source_owner": source_payload["source_owner"],
@@ -8142,6 +9454,14 @@ class Session:
         enabled_count = sum(1 for item in entries if item["status"] == "enabled")
         disabled_count = sum(1 for item in entries if item["status"] == "disabled")
         inactive_count = sum(1 for item in entries if item["status"] == "inactive")
+        user_invocable_names = [item["name"] for item in entries if item["user_invocable"]]
+        model_invocable_names = [item["name"] for item in entries if item["model_invocable"]]
+        model_disabled_names = [
+            item["name"]
+            for item in entries
+            if item["user_invocable"] and not item["model_invocable"]
+        ]
+        prompt_active_names = [item["name"] for item in entries if item["prompt_active"]]
         auto_enabled_names = [skill.name for skill in groups["active_auto"]]
         manually_enabled_names = [skill.name for skill in groups["active_manual"]]
         inactive_names = [skill.name for skill in groups["inactive"]]
@@ -8172,9 +9492,17 @@ class Session:
             "skill_project_local_count": project_local_count,
             "skill_plugin_contributed_count": plugin_contributed_count,
             "skill_builtin_count": builtin_count,
+            "skill_user_invocable_count": len(user_invocable_names),
+            "skill_model_invocable_count": len(model_invocable_names),
+            "skill_model_disabled_count": len(model_disabled_names),
+            "skill_prompt_active_count": len(prompt_active_names),
             "skill_auto_enabled_names": auto_enabled_names,
             "skill_manual_enabled_names": manually_enabled_names,
             "skill_inactive_names": inactive_names,
+            "skill_user_invocable_names": user_invocable_names,
+            "skill_model_invocable_names": model_invocable_names,
+            "skill_model_disabled_names": model_disabled_names,
+            "skill_prompt_active_names": prompt_active_names,
             "skill_entries": entries,
             "skill_diagnostics": [
                 {
@@ -8210,6 +9538,13 @@ class Session:
                 f"disabled={payload['skill_manual_disabled_count']}"
             ),
             f"skill prompt composition: {payload['skill_prompt_composition_summary']}",
+            "user-invocable skills: "
+            + (
+                f"count={payload['skill_user_invocable_count']} "
+                f"model_invocable={payload['skill_model_invocable_count']} "
+                f"model_disabled={payload['skill_model_disabled_count']} "
+                f"prompt_active={payload['skill_prompt_active_count']}"
+            ),
             f"skill reload state: {payload['skill_reload_state']}",
             f"skill diagnostics: {payload['skill_diagnostic_count']}",
         ]
@@ -8242,6 +9577,24 @@ class Session:
                     + (
                         ", ".join(payload["skill_inactive_names"])
                         if payload["skill_inactive_names"]
+                        else "none"
+                    ),
+                    "user-invocable skill commands: "
+                    + (
+                        ", ".join(f"/{name}" for name in payload["skill_user_invocable_names"])
+                        if payload["skill_user_invocable_names"]
+                        else "none"
+                    ),
+                    "model-invocable skills: "
+                    + (
+                        ", ".join(payload["skill_model_invocable_names"])
+                        if payload["skill_model_invocable_names"]
+                        else "none"
+                    ),
+                    "model-disabled slash skills: "
+                    + (
+                        ", ".join(payload["skill_model_disabled_names"])
+                        if payload["skill_model_disabled_names"]
                         else "none"
                     ),
                 ]
@@ -8307,6 +9660,8 @@ class Session:
                 "/project-context skills",
                 "/project-context reload-status",
             ]
+            if item.get("user_invocable"):
+                next_actions.insert(0, str(item["slash_command"]))
             if item.get("source") == "plugin":
                 owner = str(item.get("source_owner") or "").strip()
                 if owner:
@@ -8323,9 +9678,13 @@ class Session:
             "skill_manual_enabled_count": payload["skill_manual_enabled_count"],
             "skill_manual_disabled_count": payload["skill_manual_disabled_count"],
             "skill_prompt_composition_summary": payload["skill_prompt_composition_summary"],
+            "skill_user_invocable_count": payload["skill_user_invocable_count"],
+            "skill_prompt_active_count": payload["skill_prompt_active_count"],
             "skill_auto_enabled_names": list(payload["skill_auto_enabled_names"]),
             "skill_manual_enabled_names": list(payload["skill_manual_enabled_names"]),
             "skill_inactive_names": list(payload["skill_inactive_names"]),
+            "skill_user_invocable_names": list(payload["skill_user_invocable_names"]),
+            "skill_prompt_active_names": list(payload["skill_prompt_active_names"]),
             "skill_project_local_count": payload["skill_project_local_count"],
             "skill_plugin_contributed_count": payload["skill_plugin_contributed_count"],
             "skill_builtin_count": payload["skill_builtin_count"],
@@ -8333,7 +9692,11 @@ class Session:
             "skill_diagnostics": list(payload["skill_diagnostics"]),
             "skill_selected_name": selected_skill_name,
             "skill_selected_summary": (
-                f"{selected_skill_name} ({selected_skill.get('source_label')}, {selected_skill.get('auto_enable_state')})"
+                (
+                    f"{selected_skill_name} ({selected_skill.get('source_label')}, "
+                    f"{selected_skill.get('auto_enable_state')}, "
+                    f"invocable={selected_skill.get('user_invocable')})"
+                )
                 if isinstance(selected_skill, dict) and selected_skill_name
                 else "none"
             ),
@@ -8384,19 +9747,35 @@ class Session:
         else:
             toggle_command = f"/skills-disable {skill.name}"
         next_actions = [toggle_command, "/project-context skills", "/context-refresh"]
-        if str(payload["source"]).startswith("plugin:"):
+        if payload["user_invocable"]:
+            next_actions.insert(0, str(payload["slash_command"]))
+        if str(payload["source"]) == "plugin":
             source_owner = str(payload["source_owner"])
             next_actions.insert(1, f"/plugin show {source_owner}")
         return [
-            f"- {payload['name']}: "
-            f"skill_status={payload['status']} "
-            f"skill_source={payload['source_label']} "
-            f"skill_auto_enable_state={payload['auto_enable_state']} "
-            f"manual_override={payload['manual_override_state']} "
-            f"skill_tags={payload['tags_summary']} "
-            f"path={payload['path']} "
-            + (f"description={payload['description']} " if payload["description"] else "")
-            + f"content={payload['content_preview']}",
+            (
+                f"- {payload['name']}: "
+                f"skill_status={payload['status']} "
+                f"prompt_active={'yes' if payload['prompt_active'] else 'no'} "
+                f"user_invocable={'yes' if payload['user_invocable'] else 'no'} "
+                f"model_invocable={'yes' if payload['model_invocable'] else 'no'} "
+                f"disable_model_invocation={'yes' if payload['disable_model_invocation'] else 'no'} "
+                + (f"slash_command={payload['slash_command']} " if payload["user_invocable"] else "")
+                + f"skill_source={payload['source_label']} "
+                + f"skill_auto_enable_state={payload['auto_enable_state']} "
+                + f"manual_override={payload['manual_override_state']} "
+                + f"execution_context={payload['execution_context']} "
+                + f"skill_model={payload['model'] or 'inherit-session'} "
+                + f"skill_effort={payload['effort'] or 'inherit-session'} "
+                + f"skill_arguments={payload['arguments_summary']} "
+                + f"allowed_tools={payload['allowed_tool_names_summary']} "
+                + f"allowed_bash={payload['allowed_bash_command_prefixes_summary']} "
+                + f"skill_tags={payload['tags_summary']} "
+                + f"path={payload['path']} "
+                + (f"description={payload['description']} " if payload["description"] else "")
+                + (f"when_to_use={payload['when_to_use']} " if payload["when_to_use"] else "")
+                + f"content={payload['content_preview']}"
+            ),
             "  next_actions: "
             + " | ".join(next_actions),
         ]
@@ -8438,7 +9817,62 @@ class Session:
         ]
 
     def _builtin_agent_definition(self, name: str) -> AgentDefinition | None:
-        return self._session_factory.agent_registry.get_definition(name)
+        definition = self._session_factory.agent_registry.get_definition(name)
+        if definition is None or definition.source != "builtin":
+            return None
+        return definition
+
+    def resolve_agent_runtime_profile(self, agent_type: str | None) -> dict[str, Any]:
+        raw = str(agent_type or "").strip()
+        if not raw:
+            raise ValueError("agent_type must be provided.")
+        definition = self.agent_registry.get_definition(raw)
+        if definition is None:
+            raise ValueError(f'Unknown agent type "{raw}".')
+        base_definition = (
+            self._builtin_agent_definition(definition.based_on)
+            if definition.based_on
+            else None
+        )
+        execution = (
+            definition.execution
+            or (base_definition.execution if base_definition is not None else None)
+            or "foreground"
+        )
+        model_override = definition.model_override or (
+            base_definition.model_override if base_definition is not None else None
+        )
+        tool_policy = definition.tool_policy or (
+            base_definition.tool_policy if base_definition is not None else None
+        )
+        planning_only = is_builtin_planning_agent_name(definition.name)
+        if planning_only:
+            if execution != "child-session":
+                raise ValueError(
+                    f'Builtin planning agent "{definition.name}" resolved to invalid execution '
+                    f'"{execution}". Expected "child-session".'
+                )
+            if tool_policy != "read-only-subagent":
+                raise ValueError(
+                    f'Builtin planning agent "{definition.name}" resolved to invalid tool policy '
+                    f'"{tool_policy}". Expected "read-only-subagent".'
+                )
+        return {
+            "name": definition.name,
+            "execution": "child-session" if planning_only else execution,
+            "tool_policy": "read-only-subagent" if planning_only else tool_policy,
+            "model_override": model_override,
+            "read_only": True if planning_only else tool_policy == "read-only-subagent",
+            "run_in_background": (
+                False
+                if planning_only
+                else execution in {"background-session", "background-session+snapshot"}
+            ),
+            "isolated_workspace": (
+                False if planning_only else execution == "background-session+snapshot"
+            ),
+            "planning_only": planning_only,
+        }
 
     def _resolved_agent_definition_payload(self, definition: AgentDefinition) -> dict[str, str]:
         base_definition = self._builtin_agent_definition(definition.based_on) if definition.based_on else None
@@ -10931,6 +12365,29 @@ class Session:
             ]
         )
 
+    def clear_plan_runtime_state(self) -> str:
+        lines: list[str] = []
+        artifact_result = self.clear_active_plan()
+        if artifact_result != "No active planning artifact.":
+            lines.append(artifact_result)
+        plan_path = self.get_plan_file_path() if self.state.plan_slug is not None else None
+        self.clear_plan_slug(remove_file=True)
+        self.state.session_runtime_mode = "default"
+        self.state.pre_plan_mode = None
+        self.state.has_exited_plan_mode = False
+        self.state.needs_plan_mode_exit_attachment = False
+        self.state.needs_plan_mode_reentry_attachment = False
+        self._plan_mode_attachment_count = 0
+        self.state.plan_mode_attachment_count = 0
+        self.state.plan_mode_exit_approved_plan = None
+        self.state.plan_mode_exit_restored_mode = None
+        self.persist_state()
+        if plan_path is not None:
+            lines.append(f"Cleared session plan file {plan_path.name}.")
+        if not lines:
+            lines.append("Cleared session plan runtime state.")
+        return "\n".join(lines)
+
     def clear_session_reset(self) -> dict[str, Any]:
         self.persist_state()
         previous_state = self.state
@@ -11629,8 +13086,33 @@ class Session:
         return frozenset(names)
 
     def _available_tools(self):
-        allowed_names = self._active_tool_names or self._active_tool_names_for_session()
-        return [tool for tool in self.tools if tool.name in allowed_names]
+        policy = self._effective_command_policy()
+        if self.in_plan_mode():
+            allowed_names = set(self.plan_mode_allowed_tool_names())
+            if policy is not None and policy.allowed_tool_names is not None:
+                allowed_names.intersection_update(policy.allowed_tool_names)
+        else:
+            allowed_names = (
+                policy.allowed_tool_names
+                if policy is not None and policy.allowed_tool_names is not None
+                else self._active_tool_names_for_session()
+            )
+        mode_transition_names = self.plan_mode_transition_tool_names()
+        user_invocable_skill_names = {
+            skill.name for skill in self.project_context.skills if getattr(skill, "user_invocable", False)
+        }
+        available = [
+            tool
+            for tool in self.tools
+            if tool.name in allowed_names
+            and (
+                tool.name not in PLAN_MODE_TRANSITION_TOOL_NAMES
+                or tool.name in mode_transition_names
+            )
+        ]
+        if user_invocable_skill_names:
+            return available
+        return [tool for tool in available if tool.name != "skill"]
 
     def _build_active_orchestrator(self):
         if self._active_tool_names is None and len(self._available_tools()) == len(self.tools):
@@ -11648,11 +13130,14 @@ class Session:
         require_read_only_subagents: bool,
         command_policy_name: str | None = None,
         command_policy_source: str | None = None,
+        model_override: str | None = None,
+        effort_override: str | None = None,
     ):
         previous_tool_names = self._active_tool_names
         previous_bash_prefixes = self._active_bash_command_prefixes
         previous_read_only_subagents = self._require_read_only_subagents
         previous_policy = self._active_command_policy
+        previous_runtime_override = self._active_runtime_override
         policy = self._compile_turn_command_policy(
             allowed_tool_names=allowed_tool_names,
             allowed_bash_command_prefixes=allowed_bash_command_prefixes,
@@ -11666,6 +13151,10 @@ class Session:
             self._active_tool_names = policy.allowed_tool_names
             self._active_bash_command_prefixes = policy.allowed_bash_command_prefixes
             self._require_read_only_subagents = policy.require_read_only_subagents
+        self._active_runtime_override = self._compile_turn_runtime_override(
+            model_override=model_override,
+            effort_override=effort_override,
+        )
         try:
             yield
         finally:
@@ -11673,6 +13162,7 @@ class Session:
             self._active_bash_command_prefixes = previous_bash_prefixes
             self._require_read_only_subagents = previous_read_only_subagents
             self._active_command_policy = previous_policy
+            self._active_runtime_override = previous_runtime_override
 
     def _compile_turn_command_policy(
         self,
@@ -11708,44 +13198,105 @@ class Session:
             enforce_read_only_bash=enforce_read_only_bash,
         )
 
+    def _compile_turn_runtime_override(
+        self,
+        *,
+        model_override: str | None,
+        effort_override: str | None,
+    ) -> TurnRuntimeOverride | None:
+        normalized_model = str(model_override or "").strip() or None
+        normalized_effort = str(effort_override or "").strip() or None
+        if normalized_model is None and normalized_effort is None:
+            return None
+        return TurnRuntimeOverride(
+            model_override=normalized_model,
+            effort_override=normalized_effort,
+        )
+
     def _merge_execution_contract_policy(
         self,
         turn_policy: TurnCommandPolicy | None,
     ) -> TurnCommandPolicy | None:
         session_policy = self.session_command_policy()
-        if session_policy is None:
-            return turn_policy
-        if turn_policy is None:
-            return session_policy
+        return self._merge_command_policies(
+            session_policy,
+            turn_policy,
+            identity_preference="base",
+        )
+
+    def _effective_command_policy(self) -> TurnCommandPolicy | None:
+        return self._merge_command_policies(
+            self._active_command_policy,
+            self._transient_tool_context_policy,
+            identity_preference="overlay",
+        )
+
+    def _effective_runtime_override(self) -> TurnRuntimeOverride | None:
+        return self._merge_runtime_overrides(
+            self._active_runtime_override,
+            self._transient_runtime_override,
+        )
+
+    def _merge_command_policies(
+        self,
+        base_policy: TurnCommandPolicy | None,
+        overlay_policy: TurnCommandPolicy | None,
+        *,
+        identity_preference: str,
+    ) -> TurnCommandPolicy | None:
+        if base_policy is None:
+            return overlay_policy
+        if overlay_policy is None:
+            return base_policy
         merged_tool_names: frozenset[str] | None
-        if session_policy.allowed_tool_names is None:
-            merged_tool_names = turn_policy.allowed_tool_names
-        elif turn_policy.allowed_tool_names is None:
-            merged_tool_names = session_policy.allowed_tool_names
+        if base_policy.allowed_tool_names is None:
+            merged_tool_names = overlay_policy.allowed_tool_names
+        elif overlay_policy.allowed_tool_names is None:
+            merged_tool_names = base_policy.allowed_tool_names
         else:
-            merged_tool_names = session_policy.allowed_tool_names & turn_policy.allowed_tool_names
+            merged_tool_names = base_policy.allowed_tool_names & overlay_policy.allowed_tool_names
         merged_bash_prefixes: tuple[str, ...] | None
-        if session_policy.allowed_bash_command_prefixes is None:
-            merged_bash_prefixes = turn_policy.allowed_bash_command_prefixes
-        elif turn_policy.allowed_bash_command_prefixes is None:
-            merged_bash_prefixes = session_policy.allowed_bash_command_prefixes
+        if base_policy.allowed_bash_command_prefixes is None:
+            merged_bash_prefixes = overlay_policy.allowed_bash_command_prefixes
+        elif overlay_policy.allowed_bash_command_prefixes is None:
+            merged_bash_prefixes = base_policy.allowed_bash_command_prefixes
         else:
             merged_bash_prefixes = tuple(
                 prefix
-                for prefix in turn_policy.allowed_bash_command_prefixes
-                if prefix in session_policy.allowed_bash_command_prefixes
+                for prefix in overlay_policy.allowed_bash_command_prefixes
+                if prefix in base_policy.allowed_bash_command_prefixes
             )
+        identity = overlay_policy if identity_preference == "overlay" else base_policy
         return TurnCommandPolicy(
-            name=session_policy.name,
-            source=session_policy.source,
+            name=identity.name,
+            source=identity.source,
             allowed_tool_names=merged_tool_names,
             allowed_bash_command_prefixes=merged_bash_prefixes,
             require_read_only_subagents=(
-                session_policy.require_read_only_subagents or turn_policy.require_read_only_subagents
+                base_policy.require_read_only_subagents
+                or overlay_policy.require_read_only_subagents
             ),
             enforce_read_only_bash=(
-                session_policy.enforce_read_only_bash or turn_policy.enforce_read_only_bash
+                base_policy.enforce_read_only_bash or overlay_policy.enforce_read_only_bash
             ),
+        )
+
+    def _merge_runtime_overrides(
+        self,
+        base_override: TurnRuntimeOverride | None,
+        overlay_override: TurnRuntimeOverride | None,
+    ) -> TurnRuntimeOverride | None:
+        if base_override is None:
+            return overlay_override
+        if overlay_override is None:
+            return base_override
+        model_override = overlay_override.model_override or base_override.model_override
+        effort_override = overlay_override.effort_override or base_override.effort_override
+        if model_override is None and effort_override is None:
+            return None
+        return TurnRuntimeOverride(
+            model_override=model_override,
+            effort_override=effort_override,
         )
 
     def _format_bash_command_policy_violation(
@@ -12032,6 +13583,197 @@ class Session:
         ):
             if self.state.session_execution_mode not in {"main", "background-session", "child-session"}:
                 self.state.session_execution_mode = "main"
+
+    def _normalize_plan_mode_state(self) -> None:
+        if self.state.session_runtime_mode not in {"default", "plan"}:
+            self.state.session_runtime_mode = "default"
+        if self.state.pre_plan_mode not in {None, "default"}:
+            self.state.pre_plan_mode = "default"
+        self.state.has_exited_plan_mode = bool(self.state.has_exited_plan_mode)
+        self.state.needs_plan_mode_exit_attachment = bool(self.state.needs_plan_mode_exit_attachment)
+        self.state.needs_plan_mode_reentry_attachment = bool(
+            self.state.needs_plan_mode_reentry_attachment
+        )
+        self.state.plan_mode_attachment_count = max(
+            int(getattr(self.state, "plan_mode_attachment_count", 0) or 0),
+            0,
+        )
+        self._plan_mode_attachment_count = self.state.plan_mode_attachment_count
+        self.state.plan_mode_exit_approved_plan = (
+            str(self.state.plan_mode_exit_approved_plan)
+            if self.state.plan_mode_exit_approved_plan is not None
+            else None
+        )
+        self.state.plan_mode_exit_restored_mode = (
+            str(self.state.plan_mode_exit_restored_mode).strip()
+            if self.state.plan_mode_exit_restored_mode is not None
+            and str(self.state.plan_mode_exit_restored_mode).strip()
+            else None
+        )
+        self.state.plan_slug = (
+            str(self.state.plan_slug).strip()
+            if self.state.plan_slug is not None and str(self.state.plan_slug).strip()
+            else None
+        )
+
+    def session_runtime_mode(self) -> str:
+        return self.state.session_runtime_mode or "default"
+
+    def in_plan_mode(self) -> bool:
+        return self.session_runtime_mode() == "plan"
+
+    def plan_storage_dir(self) -> Path:
+        return get_plan_storage_dir(self.config.transcript_cwd or self.config.cwd)
+
+    def plan_slug(self) -> str:
+        slug = resolve_plan_slug(
+            self.state.session_id,
+            existing_slug=self.state.plan_slug,
+        )
+        self.state.plan_slug = slug
+        return slug
+
+    def set_plan_slug(self, slug: str) -> str:
+        normalized = cache_plan_slug(self.state.session_id, slug)
+        self.state.plan_slug = normalized
+        return normalized
+
+    def clear_plan_slug(self, *, remove_file: bool = False) -> None:
+        path = self.get_plan_file_path() if remove_file else None
+        clear_cached_plan_slug(self.state.session_id)
+        self.state.plan_slug = None
+        if path is not None and path.exists():
+            path.unlink()
+
+    def get_plan_file_path(self, *, agent_id: str | None = None, ensure_exists: bool = False) -> Path:
+        if ensure_exists:
+            path = ensure_plan_file(
+                self.config.transcript_cwd or self.config.cwd,
+                self.state.session_id,
+                agent_id=agent_id,
+                existing_slug=self.plan_slug(),
+            )
+        else:
+            path = resolve_plan_file_path(
+                self.config.transcript_cwd or self.config.cwd,
+                self.state.session_id,
+                agent_id=agent_id,
+                existing_slug=self.plan_slug(),
+            )
+        return path
+
+    def get_plan(self, *, agent_id: str | None = None) -> str:
+        return read_plan_file(
+            self.config.transcript_cwd or self.config.cwd,
+            self.state.session_id,
+            agent_id=agent_id,
+            existing_slug=self.plan_slug(),
+        )
+
+    def copy_plan_for_resume(self) -> Path | None:
+        path = copy_plan_file_for_resume(
+            self.config.transcript_cwd or self.config.cwd,
+            self.state.session_id,
+            existing_slug=self.state.plan_slug,
+        )
+        if path is not None:
+            self.state.plan_slug = resolve_plan_slug(
+                self.state.session_id,
+                existing_slug=self.state.plan_slug or path.stem,
+            )
+        return path
+
+    def copy_plan_for_fork(self, child_session: "Session") -> Path | None:
+        target = copy_plan_file_for_fork(
+            self.config.transcript_cwd or self.config.cwd,
+            self.state.session_id,
+            child_session.state.session_id,
+            parent_slug=self.state.plan_slug,
+            child_slug=child_session.state.plan_slug,
+        )
+        if target is not None:
+            child_session.state.plan_slug = resolve_plan_slug(
+                child_session.state.session_id,
+                existing_slug=child_session.state.plan_slug,
+            )
+        return target
+
+    def enter_plan_mode(self) -> Path:
+        current_mode = self.session_runtime_mode()
+        if current_mode != "plan":
+            self.state.pre_plan_mode = current_mode
+        elif self.state.pre_plan_mode is None:
+            self.state.pre_plan_mode = "default"
+        self.state.session_runtime_mode = "plan"
+        self.state.has_exited_plan_mode = False
+        self.state.needs_plan_mode_exit_attachment = False
+        self.state.needs_plan_mode_reentry_attachment = False
+        self._plan_mode_attachment_count = 0
+        self.state.plan_mode_attachment_count = 0
+        self.state.plan_mode_exit_approved_plan = None
+        self.state.plan_mode_exit_restored_mode = None
+        path = self.get_plan_file_path(ensure_exists=True)
+        self.persist_state()
+        return path
+
+    def exit_plan_mode(self, *, approved_plan: str | None = None) -> None:
+        previous_mode = self.state.pre_plan_mode or "default"
+        self.state.session_runtime_mode = previous_mode
+        self.state.pre_plan_mode = None
+        self.state.has_exited_plan_mode = True
+        self.state.needs_plan_mode_exit_attachment = True
+        self.state.needs_plan_mode_reentry_attachment = False
+        self._plan_mode_attachment_count = 0
+        self.state.plan_mode_attachment_count = 0
+        normalized_plan = str(approved_plan or "").strip()
+        self.state.plan_mode_exit_approved_plan = normalized_plan or None
+        self.state.plan_mode_exit_restored_mode = previous_mode
+        self.persist_state()
+
+    def request_plan_mode_exit_approval(
+        self,
+        *,
+        plan_file_path: Path,
+        plan_content: str,
+    ) -> None:
+        normalized_plan = plan_content.strip()
+        if not normalized_plan:
+            raise ValueError("Current session plan file is empty.")
+        previous_mode = self.state.pre_plan_mode or "default"
+        plan_hash = sha256(normalized_plan.encode("utf-8")).hexdigest()
+        self.permission_manager.require_approval(
+            ApprovalRequest(
+                tool_name="ExitPlanMode",
+                reason="Claude wants to exit plan mode and submit the current session plan for approval.",
+                risk_level="plan_mode_exit",
+                approval_key=f"exit_plan_mode:{plan_hash}",
+                details=(
+                    f"plan_file: {plan_file_path}\n"
+                    f"restore_mode: {previous_mode}\n"
+                    "plan:\n"
+                    f"{normalized_plan}"
+                ),
+            )
+        )
+
+    def describe_current_plan_mode(self) -> str:
+        path = self.get_plan_file_path(ensure_exists=True)
+        content = self.get_plan().strip()
+        lines = [
+            "plan_mode: active",
+            f"plan_file: {path}",
+        ]
+        if not content:
+            lines.append("plan_status: empty")
+            lines.append('Use "/plan open" to edit the current session plan file.')
+            return "\n".join(lines)
+        lines.extend(["plan_status: populated", "", content])
+        return "\n".join(lines)
+
+    def open_plan_file(self) -> str:
+        path = self.get_plan_file_path(ensure_exists=True)
+        self.persist_state()
+        return f"plan_file: {path}"
 
     def _recent_plan_drift_summary(self) -> str | None:
         return self._advisor_component._recent_plan_drift_summary()
@@ -12939,7 +14681,19 @@ def _render_mcp_content(content: list[dict[str, Any]]) -> str:
     return rendered or "(empty MCP result)"
 
 
-def _build_read_only_subagent_prompt(*, description: str, prompt: str) -> str:
+def _build_read_only_subagent_prompt(
+    *,
+    description: str,
+    prompt: str,
+    agent_type: str | None = None,
+) -> str:
+    builtin_prompt = build_builtin_planning_agent_prompt(
+        agent_type,
+        description=description,
+        prompt=prompt,
+    )
+    if builtin_prompt is not None:
+        return builtin_prompt
     return (
         "You are a read-only planning sub-agent.\n"
         "Do not modify files, do not create commits, and do not run commands with side effects.\n"
@@ -13062,3 +14816,4 @@ def _prepend_advisor_review_to_plan(text: str, review: AdvisorReviewSummary) -> 
         lines.append("- suggested_changes:")
         lines.extend(f"  - {item}" for item in review.suggested_changes)
     return "\n".join(lines) + "\n\n" + text.strip()
+

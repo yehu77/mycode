@@ -19,8 +19,10 @@ from claudecode_py.providers.errors import (
 )
 from claudecode_py.runtime.events import RuntimeEvent
 from claudecode_py.runtime.query_loop import run_query_loop
-from claudecode_py.session import Session
+from claudecode_py.permissions import ApprovalResult, PermissionManager
+from claudecode_py.session import ForkedSkillMutationResult, Session
 from claudecode_py.state import PlanningArtifact
+from claudecode_py.tools.base import ToolContextUpdate
 
 
 class QueryLoopTests(unittest.TestCase):
@@ -280,6 +282,1108 @@ class QueryLoopTests(unittest.TestCase):
         self.assertIn("Use session_task_get", provider.user_text)
         self.assertIn("do not create another checklist task", provider.user_text)
 
+    def test_query_loop_enter_plan_mode_switches_tool_surface_next_call(self) -> None:
+        cwd = Path(__file__).resolve().parent / "_tmp_query_loop_enter_plan_mode"
+        if cwd.exists():
+            import shutil
+
+            shutil.rmtree(cwd)
+        cwd.mkdir(parents=True)
+        session = Session(SessionConfig(cwd=cwd, interactive=False), persist_transcript=False)
+        session.permission_manager = PermissionManager(
+            interactive=True,
+            approval_handler=lambda _request: ApprovalResult(decision="allow", scope="once"),
+        )
+
+        class FakeProvider:
+            def __init__(self) -> None:
+                self.calls = 0
+                self.first_tools: list[str] = []
+                self.second_tools: list[str] = []
+                self.second_system_prompt = ""
+                self.capabilities = ProviderCapabilities(
+                    provider="fake",
+                    model="fake-model",
+                    supports_tool_calling=True,
+                    supports_streaming=False,
+                    supports_structured_output=False,
+                )
+
+            def create_message(self, *, messages, tools, system_prompt):
+                del messages
+                self.calls += 1
+                tool_names = [str(tool.get("name")) for tool in tools]
+                if self.calls == 1:
+                    self.first_tools = tool_names
+                    return AssistantResponse(
+                        content=[
+                            {
+                                "type": "tool_use",
+                                "id": "plan-1",
+                                "name": "EnterPlanMode",
+                                "input": {},
+                            }
+                        ],
+                        text="",
+                        tool_calls=[ToolCall(id="plan-1", name="EnterPlanMode", input={})],
+                    )
+                self.second_tools = tool_names
+                self.second_system_prompt = system_prompt
+                return AssistantResponse(
+                    content=[{"type": "text", "text": "plan mode active"}],
+                    text="plan mode active",
+                    tool_calls=[],
+                )
+
+        provider = FakeProvider()
+        session.provider = provider
+
+        try:
+            result = run_query_loop(session, "plan the work")
+
+            self.assertEqual(result, "plan mode active")
+            self.assertIn("EnterPlanMode", provider.first_tools)
+            self.assertNotIn("ExitPlanMode", provider.first_tools)
+            self.assertIn("ExitPlanMode", provider.second_tools)
+            self.assertNotIn("EnterPlanMode", provider.second_tools)
+            self.assertIn("agent", provider.second_tools)
+            self.assertTrue(session.in_plan_mode())
+            self.assertTrue(session.get_plan_file_path().exists())
+            self.assertIn("## Plan Workflow", provider.second_system_prompt)
+            self.assertIn("### Phase 1: Initial Understanding", provider.second_system_prompt)
+            self.assertIn("IN PARALLEL (single message, multiple tool calls)", provider.second_system_prompt)
+            self.assertIn("launch at least 1 Plan agent for most tasks", provider.second_system_prompt)
+            self.assertIn("your turn should only end with either using ask_user_question or calling ExitPlanMode", provider.second_system_prompt)
+            prefix_payload = session.prompt_prefix_surface_payload()
+            self.assertEqual(prefix_payload["plan_workflow_mode"], "five_phase")
+            tool_result_text = str(session.state.messages[-2]["content"][0]["content"])
+            self.assertIn("Plan mode enabled.", tool_result_text)
+        finally:
+            session.close()
+            if cwd.exists():
+                import shutil
+
+                shutil.rmtree(cwd)
+
+    def test_query_loop_enter_plan_mode_uses_interview_full_attachment(self) -> None:
+        cwd = Path(__file__).resolve().parent / "_tmp_query_loop_enter_plan_mode_interview"
+        if cwd.exists():
+            import shutil
+
+            shutil.rmtree(cwd)
+        cwd.mkdir(parents=True)
+        session = Session(
+            SessionConfig(
+                cwd=cwd,
+                interactive=False,
+                plan_mode_interview_phase=True,
+            ),
+            persist_transcript=False,
+        )
+        session.permission_manager = PermissionManager(
+            interactive=True,
+            approval_handler=lambda _request: ApprovalResult(decision="allow", scope="once"),
+        )
+
+        class FakeProvider:
+            def __init__(self) -> None:
+                self.calls = 0
+                self.second_system_prompt = ""
+                self.capabilities = ProviderCapabilities(
+                    provider="fake",
+                    model="fake-model",
+                    supports_tool_calling=True,
+                    supports_streaming=False,
+                    supports_structured_output=False,
+                )
+
+            def create_message(self, *, messages, tools, system_prompt):
+                del messages, tools
+                self.calls += 1
+                if self.calls == 1:
+                    return AssistantResponse(
+                        content=[
+                            {
+                                "type": "tool_use",
+                                "id": "plan-interview-1",
+                                "name": "EnterPlanMode",
+                                "input": {},
+                            }
+                        ],
+                        text="",
+                        tool_calls=[ToolCall(id="plan-interview-1", name="EnterPlanMode", input={})],
+                    )
+                self.second_system_prompt = system_prompt
+                return AssistantResponse(
+                    content=[{"type": "text", "text": "interview mode active"}],
+                    text="interview mode active",
+                    tool_calls=[],
+                )
+
+        provider = FakeProvider()
+        session.provider = provider
+
+        try:
+            result = run_query_loop(session, "plan the work")
+
+            self.assertEqual(result, "interview mode active")
+            self.assertIn("## Iterative Planning Workflow", provider.second_system_prompt)
+            self.assertIn("### The Loop", provider.second_system_prompt)
+            self.assertIn("Repeat this cycle until the plan is complete", provider.second_system_prompt)
+            self.assertIn(
+                "After each discovery, immediately capture what you learned. Do not wait until the end.",
+                provider.second_system_prompt,
+            )
+            self.assertIn("### First Turn", provider.second_system_prompt)
+            self.assertIn(
+                "Quickly scan a few key files, write a skeleton plan (headers and rough notes), then ask the first round of user questions.",
+                provider.second_system_prompt,
+            )
+            self.assertIn("skeleton plan (headers and rough notes)", provider.second_system_prompt)
+            self.assertIn(
+                "The initial plan should stay at skeleton depth: headers and rough notes only, not a finished final plan.",
+                provider.second_system_prompt,
+            )
+            self.assertIn("### Asking Good Questions", provider.second_system_prompt)
+            self.assertIn("### When to Converge", provider.second_system_prompt)
+            self.assertIn("### Ending Your Turn", provider.second_system_prompt)
+            self.assertIn(
+                "do not try to finish the final plan before asking your first round of questions",
+                provider.second_system_prompt,
+            )
+            self.assertIn(
+                "Do not ask about plan approval via plain text or ask_user_question.",
+                provider.second_system_prompt,
+            )
+            self.assertNotIn("### Phase 1: Initial Understanding", provider.second_system_prompt)
+            prefix_payload = session.prompt_prefix_surface_payload()
+            self.assertEqual(prefix_payload["plan_workflow_mode"], "interview")
+            self.assertEqual(
+                prefix_payload["plan_workflow_first_turn_contract"],
+                "quick_scan_then_skeleton_plan_then_first_question",
+            )
+            self.assertEqual(
+                prefix_payload["plan_workflow_plan_update_trigger"],
+                "update_plan_file_after_each_meaningful_discovery",
+            )
+            self.assertEqual(
+                prefix_payload["plan_workflow_approval_channel"],
+                "ExitPlanMode_only",
+            )
+            self.assertEqual(
+                prefix_payload["plan_workflow_plan_agent_delegation_rule"],
+                "do_not_default_to_Plan_agent_in_interview_mode",
+            )
+        finally:
+            session.close()
+            if cwd.exists():
+                import shutil
+
+                shutil.rmtree(cwd)
+
+    def test_query_loop_exit_plan_mode_rejected_stays_in_interview_branch(self) -> None:
+        cwd = Path(__file__).resolve().parent / "_tmp_query_loop_exit_plan_mode_rejected_interview"
+        if cwd.exists():
+            import shutil
+
+            shutil.rmtree(cwd)
+        cwd.mkdir(parents=True)
+        session = Session(
+            SessionConfig(
+                cwd=cwd,
+                interactive=False,
+                plan_mode_interview_phase=True,
+            ),
+            persist_transcript=False,
+        )
+        session.enter_plan_mode()
+        session.get_plan_file_path().write_text(
+            "## Plan\n- sketch approach\n- ask user\n",
+            encoding="utf-8",
+        )
+
+        def approval_handler(request):
+            del request
+            return ApprovalResult(decision="deny", scope="once")
+
+        session.permission_manager = PermissionManager(
+            interactive=True,
+            approval_handler=approval_handler,
+        )
+
+        class FakeProvider:
+            def __init__(self) -> None:
+                self.calls = 0
+                self.second_system_prompt = ""
+                self.capabilities = ProviderCapabilities(
+                    provider="fake",
+                    model="fake-model",
+                    supports_tool_calling=True,
+                    supports_streaming=False,
+                    supports_structured_output=False,
+                )
+
+            def create_message(self, *, messages, tools, system_prompt):
+                del messages
+                self.calls += 1
+                tool_names = [str(tool.get("name")) for tool in tools]
+                if self.calls == 1:
+                    self.first_tools = tool_names
+                    return AssistantResponse(
+                        content=[
+                            {
+                                "type": "tool_use",
+                                "id": "plan-exit-interview-reject-1",
+                                "name": "ExitPlanMode",
+                                "input": {},
+                            }
+                        ],
+                        text="",
+                        tool_calls=[
+                            ToolCall(
+                                id="plan-exit-interview-reject-1",
+                                name="ExitPlanMode",
+                                input={},
+                            )
+                        ],
+                    )
+                self.second_tools = tool_names
+                self.second_system_prompt = system_prompt
+                return AssistantResponse(
+                    content=[{"type": "text", "text": "revise the interview plan"}],
+                    text="revise the interview plan",
+                    tool_calls=[],
+                )
+
+        provider = FakeProvider()
+        session.provider = provider
+
+        try:
+            result = run_query_loop(session, "continue")
+
+            self.assertEqual(result, "revise the interview plan")
+            self.assertTrue(session.in_plan_mode())
+            self.assertIn("ExitPlanMode", provider.first_tools)
+            self.assertIn("ExitPlanMode", provider.second_tools)
+            self.assertNotIn("EnterPlanMode", provider.second_tools)
+            self.assertIn("Plan mode still active", provider.second_system_prompt)
+            self.assertIn("Follow iterative workflow", provider.second_system_prompt)
+            self.assertIn(
+                "After each meaningful discovery, immediately update the plan file",
+                provider.second_system_prompt,
+            )
+            self.assertIn(
+                "Interview turns may end only by asking the user a clarification question or by calling ExitPlanMode for approval.",
+                provider.second_system_prompt,
+            )
+            self.assertIn("interview boundary", provider.second_system_prompt)
+            self.assertNotIn("Follow 5-phase workflow.", provider.second_system_prompt)
+            prefix_payload = session.prompt_prefix_surface_payload()
+            self.assertEqual(prefix_payload["plan_workflow_mode"], "interview")
+            self.assertEqual(prefix_payload["plan_workflow_branch_identity"], "interview_branch")
+            self.assertEqual(
+                prefix_payload["plan_workflow_branch_preservation_rule"],
+                "preserve_interview_family_across_followup_rejection_and_retry",
+            )
+        finally:
+            session.close()
+            if cwd.exists():
+                import shutil
+
+                shutil.rmtree(cwd)
+
+    def test_query_loop_exit_plan_mode_approved_continues_same_turn(self) -> None:
+        cwd = Path(__file__).resolve().parent / "_tmp_query_loop_exit_plan_mode_approved"
+        if cwd.exists():
+            import shutil
+
+            shutil.rmtree(cwd)
+        cwd.mkdir(parents=True)
+        session = Session(SessionConfig(cwd=cwd, interactive=False), persist_transcript=False)
+        session.enter_plan_mode()
+        session.get_plan_file_path().write_text(
+            "## Plan\n- inspect runtime\n- implement changes\n",
+            encoding="utf-8",
+        )
+        approval_requests = []
+
+        def approval_handler(request):
+            approval_requests.append(request)
+            return ApprovalResult(decision="allow", scope="once")
+
+        session.permission_manager = PermissionManager(
+            interactive=True,
+            approval_handler=approval_handler,
+        )
+
+        class FakeProvider:
+            def __init__(self) -> None:
+                self.calls = 0
+                self.first_tools: list[str] = []
+                self.second_tools: list[str] = []
+                self.second_messages = []
+                self.second_system_prompt = ""
+                self.capabilities = ProviderCapabilities(
+                    provider="fake",
+                    model="fake-model",
+                    supports_tool_calling=True,
+                    supports_streaming=False,
+                    supports_structured_output=False,
+                )
+
+            def create_message(self, *, messages, tools, system_prompt):
+                self.calls += 1
+                tool_names = [str(tool.get("name")) for tool in tools]
+                if self.calls == 1:
+                    self.first_tools = tool_names
+                    return AssistantResponse(
+                        content=[
+                            {
+                                "type": "tool_use",
+                                "id": "plan-exit-1",
+                                "name": "ExitPlanMode",
+                                "input": {},
+                            }
+                        ],
+                        text="",
+                        tool_calls=[ToolCall(id="plan-exit-1", name="ExitPlanMode", input={})],
+                    )
+                self.second_tools = tool_names
+                self.second_messages = list(messages)
+                self.second_system_prompt = system_prompt
+                return AssistantResponse(
+                    content=[{"type": "text", "text": "implementation begins"}],
+                    text="implementation begins",
+                    tool_calls=[],
+                )
+
+        provider = FakeProvider()
+        session.provider = provider
+
+        try:
+            result = run_query_loop(session, "continue")
+
+            self.assertEqual(result, "implementation begins")
+            self.assertIn("ExitPlanMode", provider.first_tools)
+            self.assertNotIn("EnterPlanMode", provider.first_tools)
+            self.assertIn("EnterPlanMode", provider.second_tools)
+            self.assertNotIn("ExitPlanMode", provider.second_tools)
+            self.assertFalse(session.in_plan_mode())
+            self.assertEqual(len(approval_requests), 1)
+            request = approval_requests[0]
+            self.assertEqual(request.tool_name, "ExitPlanMode")
+            self.assertTrue(str(request.approval_key).startswith("exit_plan_mode:"))
+            self.assertIn("restore_mode: default", request.details)
+            self.assertIn("## Plan", request.details)
+            self.assertIn("## Exited Plan Mode", provider.second_system_prompt)
+            self.assertIn("Runtime mode is now restored to `default`", provider.second_system_prompt)
+            self.assertIn("Approved plan:", provider.second_system_prompt)
+            tool_result_block = provider.second_messages[-1]["content"][0]
+            self.assertFalse(tool_result_block["is_error"])
+            self.assertIn("## Approved Plan:", str(tool_result_block["content"]))
+            self.assertIn("inspect runtime", str(tool_result_block["content"]))
+            self.assertFalse(session.state.needs_plan_mode_exit_attachment)
+            self.assertIsNone(session.state.plan_mode_exit_approved_plan)
+            self.assertIsNone(session.state.plan_mode_exit_restored_mode)
+        finally:
+            session.close()
+            if cwd.exists():
+                import shutil
+
+                shutil.rmtree(cwd)
+
+    def test_query_loop_exit_plan_mode_attachment_survives_failed_followup_provider_call(self) -> None:
+        cwd = Path(__file__).resolve().parent / "_tmp_query_loop_exit_plan_mode_retry"
+        if cwd.exists():
+            import shutil
+
+            shutil.rmtree(cwd)
+        cwd.mkdir(parents=True)
+        session = Session(
+            SessionConfig(cwd=cwd, interactive=False, provider_max_retries=0),
+            persist_transcript=False,
+        )
+        session.enter_plan_mode()
+        session.get_plan_file_path().write_text(
+            "## Plan\n- inspect runtime\n- implement changes\n",
+            encoding="utf-8",
+        )
+        session.permission_manager = PermissionManager(
+            interactive=True,
+            approval_handler=lambda request: ApprovalResult(decision="allow", scope="once"),
+        )
+
+        class RetryProvider:
+            def __init__(self) -> None:
+                self.calls = 0
+                self.prompts: list[str] = []
+                self.capabilities = ProviderCapabilities(
+                    provider="fake",
+                    model="fake-model",
+                    supports_tool_calling=True,
+                    supports_streaming=False,
+                    supports_structured_output=False,
+                )
+
+            def create_message(self, *, messages, tools, system_prompt):
+                del messages, tools
+                self.calls += 1
+                self.prompts.append(system_prompt)
+                if self.calls == 1:
+                    return AssistantResponse(
+                        content=[
+                            {
+                                "type": "tool_use",
+                                "id": "plan-exit-retry-1",
+                                "name": "ExitPlanMode",
+                                "input": {},
+                            }
+                        ],
+                        text="",
+                        tool_calls=[
+                            ToolCall(id="plan-exit-retry-1", name="ExitPlanMode", input={})
+                        ],
+                    )
+                raise ProviderNetworkError("network down after exit")
+
+        provider = RetryProvider()
+        session.provider = provider
+
+        class RecoveryProvider:
+            def __init__(self) -> None:
+                self.prompts: list[str] = []
+                self.capabilities = ProviderCapabilities(
+                    provider="fake",
+                    model="fake-model",
+                    supports_tool_calling=True,
+                    supports_streaming=False,
+                    supports_structured_output=False,
+                )
+
+            def create_message(self, *, messages, tools, system_prompt):
+                del messages, tools
+                self.prompts.append(system_prompt)
+                return AssistantResponse(
+                    content=[{"type": "text", "text": "implementation begins"}],
+                    text="implementation begins",
+                    tool_calls=[],
+                )
+
+        try:
+            with self.assertRaises(ProviderNetworkError):
+                run_query_loop(session, "continue")
+
+            self.assertFalse(session.in_plan_mode())
+            self.assertTrue(session.state.needs_plan_mode_exit_attachment)
+            self.assertEqual(session.state.plan_mode_exit_approved_plan, "## Plan\n- inspect runtime\n- implement changes")
+            self.assertEqual(session.state.plan_mode_exit_restored_mode, "default")
+            retry_preview = session.build_provider_prompt_assembly(
+                messages=[{"role": "user", "content": [{"type": "text", "text": "continue"}]}]
+            )
+            session.record_prompt_prefix_assembly(
+                retry_preview,
+                source="test",
+                cache_plan=None,
+            )
+            retry_prefix = session.prompt_prefix_surface_payload()
+            retry_status = session.status_surface_payload()
+            self.assertEqual(retry_prefix["plan_instruction_state"], "exit_followup")
+            self.assertEqual(retry_prefix["prompt_prefix_attachment_mode"], "exit")
+            self.assertEqual(retry_status["status_plan_instruction_state"], "exit_followup")
+            self.assertEqual(
+                retry_status["status_plan_instruction_attachment_mode"],
+                "exit",
+            )
+            self.assertIn("plan attachment mode: exit", session.describe_context())
+            self.assertIn(
+                "plan attachment state: exit_followup mode=exit reentry=no exit=yes",
+                session.describe_status(section="workflow"),
+            )
+
+            session.get_plan_file_path().write_text(
+                "## Plan\n- CHANGED AFTER APPROVAL\n",
+                encoding="utf-8",
+            )
+            recovery = RecoveryProvider()
+            session.provider = recovery
+            result = run_query_loop(session, "continue")
+
+            self.assertEqual(result, "implementation begins")
+            self.assertIn("## Exited Plan Mode", recovery.prompts[0])
+            self.assertIn("## Plan\n- inspect runtime\n- implement changes", recovery.prompts[0])
+            self.assertNotIn("CHANGED AFTER APPROVAL", recovery.prompts[0])
+            self.assertFalse(session.state.needs_plan_mode_exit_attachment)
+            self.assertIsNone(session.state.plan_mode_exit_approved_plan)
+            self.assertIsNone(session.state.plan_mode_exit_restored_mode)
+            self.assertEqual(
+                session.prompt_prefix_surface_payload()["prompt_prefix_attachment_mode"],
+                "none",
+            )
+        finally:
+            session.close()
+            if cwd.exists():
+                import shutil
+
+                shutil.rmtree(cwd)
+
+    def test_query_loop_exit_plan_mode_attachment_does_not_repeat_after_second_success(self) -> None:
+        cwd = Path(__file__).resolve().parent / "_tmp_query_loop_exit_plan_mode_once"
+        if cwd.exists():
+            import shutil
+
+            shutil.rmtree(cwd)
+        cwd.mkdir(parents=True)
+        session = Session(SessionConfig(cwd=cwd, interactive=False), persist_transcript=False)
+        session.enter_plan_mode()
+        session.get_plan_file_path().write_text(
+            "## Plan\n- inspect runtime\n- implement changes\n",
+            encoding="utf-8",
+        )
+        session.permission_manager = PermissionManager(
+            interactive=True,
+            approval_handler=lambda request: ApprovalResult(decision="allow", scope="once"),
+        )
+
+        class TwoTurnProvider:
+            def __init__(self) -> None:
+                self.calls = 0
+                self.prompts: list[str] = []
+                self.capabilities = ProviderCapabilities(
+                    provider="fake",
+                    model="fake-model",
+                    supports_tool_calling=True,
+                    supports_streaming=False,
+                    supports_structured_output=False,
+                )
+
+            def create_message(self, *, messages, tools, system_prompt):
+                del messages, tools
+                self.calls += 1
+                self.prompts.append(system_prompt)
+                if self.calls == 1:
+                    return AssistantResponse(
+                        content=[
+                            {
+                                "type": "tool_use",
+                                "id": "plan-exit-once-1",
+                                "name": "ExitPlanMode",
+                                "input": {},
+                            }
+                        ],
+                        text="",
+                        tool_calls=[
+                            ToolCall(id="plan-exit-once-1", name="ExitPlanMode", input={})
+                        ],
+                    )
+                return AssistantResponse(
+                    content=[{"type": "text", "text": "implementation begins"}],
+                    text="implementation begins",
+                    tool_calls=[],
+                )
+
+        provider = TwoTurnProvider()
+        session.provider = provider
+
+        try:
+            first = run_query_loop(session, "continue")
+            second = run_query_loop(session, "continue again")
+
+            self.assertEqual(first, "implementation begins")
+            self.assertEqual(second, "implementation begins")
+            self.assertIn("## Exited Plan Mode", provider.prompts[1])
+            self.assertNotIn("## Exited Plan Mode", provider.prompts[2])
+            self.assertFalse(session.state.needs_plan_mode_exit_attachment)
+        finally:
+            session.close()
+            if cwd.exists():
+                import shutil
+
+                shutil.rmtree(cwd)
+
+    def test_query_loop_exit_plan_mode_rejected_stays_in_plan_mode(self) -> None:
+        cwd = Path(__file__).resolve().parent / "_tmp_query_loop_exit_plan_mode_rejected"
+        if cwd.exists():
+            import shutil
+
+            shutil.rmtree(cwd)
+        cwd.mkdir(parents=True)
+        session = Session(SessionConfig(cwd=cwd, interactive=False), persist_transcript=False)
+        session.enter_plan_mode()
+        session.get_plan_file_path().write_text(
+            "## Plan\n- inspect runtime\n- refine plan\n",
+            encoding="utf-8",
+        )
+        approval_requests = []
+
+        def approval_handler(request):
+            approval_requests.append(request)
+            return ApprovalResult(decision="deny", scope="once")
+
+        session.permission_manager = PermissionManager(
+            interactive=True,
+            approval_handler=approval_handler,
+        )
+
+        class FakeProvider:
+            def __init__(self) -> None:
+                self.calls = 0
+                self.first_tools: list[str] = []
+                self.second_tools: list[str] = []
+                self.second_messages = []
+                self.second_system_prompt = ""
+                self.capabilities = ProviderCapabilities(
+                    provider="fake",
+                    model="fake-model",
+                    supports_tool_calling=True,
+                    supports_streaming=False,
+                    supports_structured_output=False,
+                )
+
+            def create_message(self, *, messages, tools, system_prompt):
+                self.calls += 1
+                tool_names = [str(tool.get("name")) for tool in tools]
+                if self.calls == 1:
+                    self.first_tools = tool_names
+                    return AssistantResponse(
+                        content=[
+                            {
+                                "type": "tool_use",
+                                "id": "plan-exit-2",
+                                "name": "ExitPlanMode",
+                                "input": {},
+                            }
+                        ],
+                        text="",
+                        tool_calls=[ToolCall(id="plan-exit-2", name="ExitPlanMode", input={})],
+                    )
+                self.second_tools = tool_names
+                self.second_messages = list(messages)
+                self.second_system_prompt = system_prompt
+                return AssistantResponse(
+                    content=[{"type": "text", "text": "revise the plan"}],
+                    text="revise the plan",
+                    tool_calls=[],
+                )
+
+        provider = FakeProvider()
+        session.provider = provider
+
+        try:
+            result = run_query_loop(session, "continue")
+
+            self.assertEqual(result, "revise the plan")
+            self.assertTrue(session.in_plan_mode())
+            self.assertEqual(len(approval_requests), 1)
+            self.assertIn("ExitPlanMode", provider.first_tools)
+            self.assertNotIn("EnterPlanMode", provider.first_tools)
+            self.assertIn("ExitPlanMode", provider.second_tools)
+            self.assertNotIn("EnterPlanMode", provider.second_tools)
+            self.assertIn("Plan mode still active", provider.second_system_prompt)
+            self.assertIn("Follow 5-phase workflow.", provider.second_system_prompt)
+            self.assertEqual(session.state.plan_mode_attachment_count, 2)
+            prefix_payload = session.prompt_prefix_surface_payload()
+            status_payload = session.status_surface_payload()
+            self.assertEqual(prefix_payload["plan_workflow_mode"], "five_phase")
+            self.assertEqual(prefix_payload["plan_instruction_state"], "plan_mode_active")
+            self.assertEqual(prefix_payload["prompt_prefix_attachment_mode"], "sparse")
+            self.assertEqual(status_payload["status_plan_instruction_state"], "plan_mode_active")
+            self.assertEqual(
+                status_payload["status_plan_instruction_attachment_mode"],
+                "sparse",
+            )
+            self.assertIn("plan attachment mode: sparse", session.describe_context())
+            self.assertIn(
+                "plan attachment state: plan_mode_active mode=sparse reentry=no exit=no",
+                session.describe_status(section="workflow"),
+            )
+            next_assembly = session.build_provider_prompt_assembly(
+                messages=[{"role": "user", "content": [{"type": "text", "text": "revise"}]}]
+            )
+            self.assertIn(
+                "Plan mode still active (see full instructions earlier in conversation).",
+                next_assembly.system_prompt,
+            )
+            tool_result_block = provider.second_messages[-1]["content"][0]
+            self.assertTrue(tool_result_block["is_error"])
+            self.assertIn("Rejected plan:", str(tool_result_block["content"]))
+            self.assertIn("refine plan", str(tool_result_block["content"]))
+        finally:
+            session.close()
+            if cwd.exists():
+                import shutil
+
+                shutil.rmtree(cwd)
+
+    def test_restored_plan_mode_session_emits_and_consumes_reentry_attachment(self) -> None:
+        cwd = Path(__file__).resolve().parent / "_tmp_query_loop_plan_mode_reentry"
+        if cwd.exists():
+            import shutil
+
+            shutil.rmtree(cwd)
+        cwd.mkdir(parents=True)
+        original = Session(SessionConfig(cwd=cwd, interactive=False), persist_transcript=False)
+        original.enter_plan_mode()
+        original.get_plan_file_path().write_text("# Restored plan\n- continue\n", encoding="utf-8")
+        from claudecode_py.storage.transcript import save_transcript
+        from claudecode_py.session_factory import SessionFactory
+
+        save_transcript(original.config, original.state)
+        session_id = original.state.session_id
+        original.close()
+
+        factory = SessionFactory(load_mcp_from_config=False)
+        restored, _ = factory.create_or_restore_session(
+            SessionConfig(cwd=cwd, interactive=False),
+            resume_session_id=session_id,
+        )
+
+        class FakeProvider:
+            def __init__(self) -> None:
+                self.system_prompt = ""
+                self.capabilities = ProviderCapabilities(
+                    provider="fake",
+                    model="fake-model",
+                    supports_tool_calling=True,
+                    supports_streaming=False,
+                    supports_structured_output=False,
+                )
+
+            def create_message(self, *, messages, tools, system_prompt):
+                del messages, tools
+                self.system_prompt = system_prompt
+                return AssistantResponse(
+                    content=[{"type": "text", "text": "continue planning"}],
+                    text="continue planning",
+                    tool_calls=[],
+                )
+
+        restored.provider = FakeProvider()
+
+        try:
+            self.assertTrue(restored.state.needs_plan_mode_reentry_attachment)
+            result = run_query_loop(restored, "continue")
+
+            self.assertEqual(result, "continue planning")
+            self.assertIn("## Re-entering Plan Mode", restored.provider.system_prompt)
+            self.assertIn("Read the existing plan file to understand what was previously planned", restored.provider.system_prompt)
+            self.assertIn("always edit the plan file one way or the other before calling ExitPlanMode", restored.provider.system_prompt)
+            self.assertIn("## Plan Workflow", restored.provider.system_prompt)
+            self.assertIn("### Phase 2: Design", restored.provider.system_prompt)
+            self.assertIn("Quality over quantity", restored.provider.system_prompt)
+            self.assertEqual(restored.prompt_prefix_surface_payload()["plan_workflow_mode"], "five_phase")
+            self.assertFalse(restored.state.needs_plan_mode_reentry_attachment)
+        finally:
+            restored.close()
+            if cwd.exists():
+                import shutil
+
+                shutil.rmtree(cwd)
+
+    def test_restored_plan_mode_reentry_attachment_survives_failed_turn_and_retries_once(self) -> None:
+        cwd = Path(__file__).resolve().parent / "_tmp_query_loop_plan_mode_reentry_retry"
+        if cwd.exists():
+            import shutil
+
+            shutil.rmtree(cwd)
+        cwd.mkdir(parents=True)
+        original = Session(SessionConfig(cwd=cwd, interactive=False), persist_transcript=False)
+        original.enter_plan_mode()
+        original.get_plan_file_path().write_text("# Restored plan\n- continue\n", encoding="utf-8")
+        from claudecode_py.storage.transcript import save_transcript
+        from claudecode_py.session_factory import SessionFactory
+
+        save_transcript(original.config, original.state)
+        session_id = original.state.session_id
+        original.close()
+
+        factory = SessionFactory(load_mcp_from_config=False)
+        restored, _ = factory.create_or_restore_session(
+            SessionConfig(cwd=cwd, interactive=False),
+            resume_session_id=session_id,
+        )
+
+        class RetryProvider:
+            def __init__(self) -> None:
+                self.calls = 0
+                self.prompts: list[str] = []
+                self.capabilities = ProviderCapabilities(
+                    provider="fake",
+                    model="fake-model",
+                    supports_tool_calling=True,
+                    supports_streaming=False,
+                    supports_structured_output=False,
+                )
+
+            def create_message(self, *, messages, tools, system_prompt):
+                del messages, tools
+                self.calls += 1
+                self.prompts.append(system_prompt)
+                if self.calls == 1:
+                    return AssistantResponse(
+                        content=[
+                            {
+                                "type": "tool_use",
+                                "id": "reentry-fail-1",
+                                "name": "ask_user_question",
+                                "input": {"question": "Need context?"},
+                            }
+                        ],
+                        text="",
+                        tool_calls=[
+                            ToolCall(
+                                id="reentry-fail-1",
+                                name="ask_user_question",
+                                input={"question": "Need context?"},
+                            )
+                        ],
+                    )
+                return AssistantResponse(
+                    content=[{"type": "text", "text": "continue planning"}],
+                    text="continue planning",
+                    tool_calls=[],
+                )
+
+        def boom(_tool_calls, _ctx, *, sink=None):
+            del sink
+            raise RuntimeError("tool execution failed")
+
+        provider = RetryProvider()
+        restored.provider = provider
+        original_execute = restored.execute_tool_calls
+        try:
+            restored.execute_tool_calls = boom  # type: ignore[method-assign]
+            with self.assertRaisesRegex(RuntimeError, "tool execution failed"):
+                run_query_loop(restored, "continue")
+
+            self.assertTrue(restored.state.needs_plan_mode_reentry_attachment)
+            self.assertIn("## Re-entering Plan Mode", provider.prompts[0])
+
+            restored.execute_tool_calls = original_execute  # type: ignore[method-assign]
+            result = run_query_loop(restored, "continue")
+            self.assertEqual(result, "continue planning")
+            self.assertTrue(any("## Re-entering Plan Mode" in prompt for prompt in provider.prompts[1:]))
+            self.assertFalse(restored.state.needs_plan_mode_reentry_attachment)
+        finally:
+            restored.close()
+            if cwd.exists():
+                import shutil
+
+                shutil.rmtree(cwd)
+
+    def test_restored_interview_plan_mode_session_preserves_reentry_family(self) -> None:
+        cwd = Path(__file__).resolve().parent / "_tmp_query_loop_plan_mode_reentry_interview"
+        if cwd.exists():
+            import shutil
+
+            shutil.rmtree(cwd)
+        cwd.mkdir(parents=True)
+        original = Session(
+            SessionConfig(
+                cwd=cwd,
+                interactive=False,
+                plan_mode_interview_phase=True,
+            ),
+            persist_transcript=False,
+        )
+        original.enter_plan_mode()
+        original.get_plan_file_path().write_text("# Restored interview plan\n- continue\n", encoding="utf-8")
+        from claudecode_py.storage.transcript import save_transcript
+        from claudecode_py.session_factory import SessionFactory
+
+        save_transcript(original.config, original.state)
+        session_id = original.state.session_id
+        original.close()
+
+        factory = SessionFactory(load_mcp_from_config=False)
+        restored, _ = factory.create_or_restore_session(
+            SessionConfig(
+                cwd=cwd,
+                interactive=False,
+                plan_mode_interview_phase=True,
+            ),
+            resume_session_id=session_id,
+        )
+
+        class FakeProvider:
+            def __init__(self) -> None:
+                self.system_prompt = ""
+                self.capabilities = ProviderCapabilities(
+                    provider="fake",
+                    model="fake-model",
+                    supports_tool_calling=True,
+                    supports_streaming=False,
+                    supports_structured_output=False,
+                )
+
+            def create_message(self, *, messages, tools, system_prompt):
+                del messages, tools
+                self.system_prompt = system_prompt
+                return AssistantResponse(
+                    content=[{"type": "text", "text": "continue interview planning"}],
+                    text="continue interview planning",
+                    tool_calls=[],
+                )
+
+        restored.provider = FakeProvider()
+
+        try:
+            self.assertTrue(restored.state.needs_plan_mode_reentry_attachment)
+            result = run_query_loop(restored, "continue")
+
+            self.assertEqual(result, "continue interview planning")
+            self.assertIn("## Re-entering Plan Mode", restored.provider.system_prompt)
+            self.assertIn("## Iterative Planning Workflow", restored.provider.system_prompt)
+            self.assertIn("### The Loop", restored.provider.system_prompt)
+            self.assertIn(
+                "After each discovery, immediately capture what you learned. Do not wait until the end.",
+                restored.provider.system_prompt,
+            )
+            self.assertNotIn("## Plan Workflow", restored.provider.system_prompt)
+            self.assertNotIn("### Phase 2: Design", restored.provider.system_prompt)
+            payload = restored.prompt_prefix_surface_payload()
+            self.assertEqual(payload["plan_workflow_mode"], "interview")
+            self.assertEqual(
+                payload["plan_workflow_followup_continuity_contract"],
+                "sparse_reentry_reject_retry_preserve_interview_family",
+            )
+            self.assertFalse(restored.state.needs_plan_mode_reentry_attachment)
+        finally:
+            restored.close()
+            if cwd.exists():
+                import shutil
+
+                shutil.rmtree(cwd)
+
+    def test_restored_plan_mode_reentry_attachment_does_not_repeat_after_second_success(self) -> None:
+        cwd = Path(__file__).resolve().parent / "_tmp_query_loop_plan_mode_reentry_once"
+        if cwd.exists():
+            import shutil
+
+            shutil.rmtree(cwd)
+        cwd.mkdir(parents=True)
+        original = Session(SessionConfig(cwd=cwd, interactive=False), persist_transcript=False)
+        original.enter_plan_mode()
+        original.get_plan_file_path().write_text("# Restored plan\n- continue\n", encoding="utf-8")
+        from claudecode_py.storage.transcript import save_transcript
+        from claudecode_py.session_factory import SessionFactory
+
+        save_transcript(original.config, original.state)
+        session_id = original.state.session_id
+        original.close()
+
+        factory = SessionFactory(load_mcp_from_config=False)
+        restored, _ = factory.create_or_restore_session(
+            SessionConfig(cwd=cwd, interactive=False),
+            resume_session_id=session_id,
+        )
+
+        class TwoTurnProvider:
+            def __init__(self) -> None:
+                self.prompts: list[str] = []
+                self.capabilities = ProviderCapabilities(
+                    provider="fake",
+                    model="fake-model",
+                    supports_tool_calling=True,
+                    supports_streaming=False,
+                    supports_structured_output=False,
+                )
+
+            def create_message(self, *, messages, tools, system_prompt):
+                del messages, tools
+                self.prompts.append(system_prompt)
+                return AssistantResponse(
+                    content=[{"type": "text", "text": "continue planning"}],
+                    text="continue planning",
+                    tool_calls=[],
+                )
+
+        provider = TwoTurnProvider()
+        restored.provider = provider
+
+        try:
+            first = run_query_loop(restored, "continue")
+            second = run_query_loop(restored, "continue again")
+
+            self.assertEqual(first, "continue planning")
+            self.assertEqual(second, "continue planning")
+            self.assertIn("## Re-entering Plan Mode", provider.prompts[0])
+            self.assertNotIn("## Re-entering Plan Mode", provider.prompts[1])
+            self.assertFalse(restored.state.needs_plan_mode_reentry_attachment)
+        finally:
+            restored.close()
+            if cwd.exists():
+                import shutil
+
+                shutil.rmtree(cwd)
+
+    def test_restored_plan_mode_session_preserves_sparse_cadence(self) -> None:
+        cwd = Path(__file__).resolve().parent / "_tmp_query_loop_plan_mode_reentry_sparse"
+        if cwd.exists():
+            import shutil
+
+            shutil.rmtree(cwd)
+        cwd.mkdir(parents=True)
+        original = Session(SessionConfig(cwd=cwd, interactive=False), persist_transcript=False)
+        original.enter_plan_mode()
+        original.get_plan_file_path().write_text("# Restored plan\n- continue\n", encoding="utf-8")
+        prior_assembly = original.build_provider_prompt_assembly(
+            messages=[{"role": "user", "content": [{"type": "text", "text": "plan"}]}]
+        )
+        original.record_plan_mode_attachment_cycle(prior_assembly.prompt_attachments)
+        from claudecode_py.storage.transcript import save_transcript
+        from claudecode_py.session_factory import SessionFactory
+
+        save_transcript(original.config, original.state)
+        session_id = original.state.session_id
+        original.close()
+
+        factory = SessionFactory(load_mcp_from_config=False)
+        restored, _ = factory.create_or_restore_session(
+            SessionConfig(cwd=cwd, interactive=False),
+            resume_session_id=session_id,
+        )
+
+        class FakeProvider:
+            def __init__(self) -> None:
+                self.system_prompt = ""
+                self.capabilities = ProviderCapabilities(
+                    provider="fake",
+                    model="fake-model",
+                    supports_tool_calling=True,
+                    supports_streaming=False,
+                    supports_structured_output=False,
+                )
+
+            def create_message(self, *, messages, tools, system_prompt):
+                del messages, tools
+                self.system_prompt = system_prompt
+                return AssistantResponse(
+                    content=[{"type": "text", "text": "continue planning"}],
+                    text="continue planning",
+                    tool_calls=[],
+                )
+
+        restored.provider = FakeProvider()
+
+        try:
+            self.assertEqual(restored.state.plan_mode_attachment_count, 1)
+            result = run_query_loop(restored, "continue")
+
+            self.assertEqual(result, "continue planning")
+            self.assertIn("## Re-entering Plan Mode", restored.provider.system_prompt)
+            self.assertIn(
+                "Plan mode still active (see full instructions earlier in conversation).",
+                restored.provider.system_prompt,
+            )
+            self.assertNotIn("## Plan Workflow", restored.provider.system_prompt)
+            self.assertEqual(restored.state.plan_mode_attachment_count, 2)
+        finally:
+            restored.close()
+            if cwd.exists():
+                import shutil
+
+                shutil.rmtree(cwd)
+
     def test_query_loop_rolls_back_failed_turn_state(self) -> None:
         session = Session(
             SessionConfig(
@@ -313,6 +1417,582 @@ class QueryLoopTests(unittest.TestCase):
 
         self.assertEqual(session.state.messages, existing_messages)
         self.assertEqual(session.state.context_summary, "earlier summary")
+
+    def test_query_loop_rolls_back_plan_mode_attachment_cadence(self) -> None:
+        session = Session(
+            SessionConfig(
+                cwd=Path(__file__).resolve().parent,
+                interactive=False,
+                provider_max_retries=0,
+            )
+        )
+        session.enter_plan_mode()
+        prior_assembly = session.build_provider_prompt_assembly(
+            messages=[{"role": "user", "content": [{"type": "text", "text": "before"}]}]
+        )
+        session.record_plan_mode_attachment_cycle(prior_assembly.prompt_attachments)
+
+        class FakeProvider:
+            def __init__(self) -> None:
+                self.capabilities = ProviderCapabilities(
+                    provider="fake",
+                    model="fake-model",
+                    supports_tool_calling=True,
+                    supports_streaming=False,
+                    supports_structured_output=False,
+                )
+
+            def create_message(self, *, messages, tools, system_prompt):
+                del messages, tools, system_prompt
+                return AssistantResponse(
+                    content=[
+                        {
+                            "type": "tool_use",
+                            "id": "fail-1",
+                            "name": "ask_user_question",
+                            "input": {
+                                "question": "Need info?",
+                            },
+                        }
+                    ],
+                    text="",
+                    tool_calls=[ToolCall(id="fail-1", name="ask_user_question", input={"question": "Need info?"})],
+                )
+
+        def boom(_tool_calls, _ctx, *, sink=None):
+            del sink
+            raise RuntimeError("tool execution failed")
+
+        session.provider = FakeProvider()
+        session.execute_tool_calls = boom  # type: ignore[method-assign]
+        try:
+            with self.assertRaisesRegex(RuntimeError, "tool execution failed"):
+                run_query_loop(session, "continue planning")
+
+            self.assertEqual(session.state.plan_mode_attachment_count, 1)
+            self.assertEqual(session._plan_mode_attachment_count, 1)
+            next_assembly = session.build_provider_prompt_assembly(
+                messages=[{"role": "user", "content": [{"type": "text", "text": "retry"}]}]
+            )
+            self.assertIn(
+                "Plan mode still active (see full instructions earlier in conversation).",
+                next_assembly.system_prompt,
+            )
+        finally:
+            session.close()
+
+    def test_query_loop_retry_preserves_interview_branch_identity(self) -> None:
+        session = Session(
+            SessionConfig(
+                cwd=Path(__file__).resolve().parent,
+                interactive=False,
+                provider_max_retries=0,
+                plan_mode_interview_phase=True,
+            )
+        )
+        session.enter_plan_mode()
+        prior_assembly = session.build_provider_prompt_assembly(
+            messages=[{"role": "user", "content": [{"type": "text", "text": "before"}]}]
+        )
+        session.record_plan_mode_attachment_cycle(prior_assembly.prompt_attachments)
+
+        class FakeProvider:
+            def __init__(self) -> None:
+                self.capabilities = ProviderCapabilities(
+                    provider="fake",
+                    model="fake-model",
+                    supports_tool_calling=True,
+                    supports_streaming=False,
+                    supports_structured_output=False,
+                )
+
+            def create_message(self, *, messages, tools, system_prompt):
+                del messages, tools, system_prompt
+                return AssistantResponse(
+                    content=[
+                        {
+                            "type": "tool_use",
+                            "id": "fail-interview-1",
+                            "name": "ask_user_question",
+                            "input": {
+                                "question": "Need info?",
+                            },
+                        }
+                    ],
+                    text="",
+                    tool_calls=[
+                        ToolCall(
+                            id="fail-interview-1",
+                            name="ask_user_question",
+                            input={"question": "Need info?"},
+                        )
+                    ],
+                )
+
+        def boom(_tool_calls, _ctx, *, sink=None):
+            del sink
+            raise RuntimeError("tool execution failed")
+
+        session.provider = FakeProvider()
+        session.execute_tool_calls = boom  # type: ignore[method-assign]
+        try:
+            with self.assertRaisesRegex(RuntimeError, "tool execution failed"):
+                run_query_loop(session, "continue planning")
+
+            self.assertEqual(session.state.plan_mode_attachment_count, 1)
+            next_assembly = session.build_provider_prompt_assembly(
+                messages=[{"role": "user", "content": [{"type": "text", "text": "retry"}]}]
+            )
+            payload = session.record_prompt_prefix_assembly(
+                next_assembly,
+                source="test",
+                cache_plan=None,
+            )
+            self.assertIn(
+                "Plan mode still active (see full instructions earlier in conversation).",
+                next_assembly.system_prompt,
+            )
+            self.assertIn("Follow iterative workflow", next_assembly.system_prompt)
+            self.assertIn(
+                "After each meaningful discovery, immediately update the plan file",
+                next_assembly.system_prompt,
+            )
+            self.assertIn("interview boundary", next_assembly.system_prompt)
+            self.assertNotIn("Follow 5-phase workflow.", next_assembly.system_prompt)
+            self.assertEqual(payload["plan_workflow_mode"], "interview")
+            self.assertEqual(payload["plan_workflow_branch_identity"], "interview_branch")
+        finally:
+            session.close()
+
+    def test_query_loop_inlines_skill_tool_messages_and_applies_context_overlay(self) -> None:
+        cwd = Path(__file__).resolve().parent / "_tmp_query_loop_skill_inline"
+        if cwd.exists():
+            import shutil
+
+            shutil.rmtree(cwd)
+        (cwd / ".claude" / "skills" / "ship").mkdir(parents=True)
+        (cwd / ".claude" / "skills" / "ship" / "SKILL.md").write_text(
+            "---\n"
+            "description: Ship release\n"
+            "arguments:\n"
+            "  - version\n"
+            "allowed-tools:\n"
+            "  - Read\n"
+            "  - Bash(git status:*)\n"
+            "model: claude-opus-4-6\n"
+            "effort: high\n"
+            "---\n\n"
+            "Release version: $version\n",
+            encoding="utf-8",
+        )
+        session = Session(
+            SessionConfig(
+                cwd=cwd,
+                interactive=False,
+            ),
+            persist_transcript=False,
+        )
+        session.permission_manager.require_approval = lambda request: None
+        events: list[RuntimeEvent] = []
+
+        class FakeProvider:
+            def __init__(self) -> None:
+                self.calls = 0
+                self.second_messages = []
+                self.second_tools = []
+                self.second_model_override = None
+                self.second_effort_override = None
+                self.capabilities = ProviderCapabilities(
+                    provider="fake",
+                    model="fake-model",
+                    supports_tool_calling=True,
+                    supports_streaming=False,
+                    supports_structured_output=False,
+                )
+
+            def create_message(
+                self,
+                *,
+                messages,
+                tools,
+                system_prompt,
+                model_override=None,
+                effort_override=None,
+            ):
+                del system_prompt
+                self.calls += 1
+                if self.calls == 1:
+                    return AssistantResponse(
+                        content=[
+                            {
+                                "type": "tool_use",
+                                "id": "skill-1",
+                                "name": "skill",
+                                "input": {"skill": "ship", "args": "1.2.3"},
+                            }
+                        ],
+                        text="",
+                        tool_calls=[
+                            ToolCall(id="skill-1", name="skill", input={"skill": "ship", "args": "1.2.3"})
+                        ],
+                    )
+                self.second_messages = list(messages)
+                self.second_tools = [tool["name"] for tool in tools]
+                self.second_model_override = model_override
+                self.second_effort_override = effort_override
+                return AssistantResponse(
+                    content=[{"type": "text", "text": "done"}],
+                    text="done",
+                    tool_calls=[],
+                )
+
+        provider = FakeProvider()
+        session.provider = provider
+
+        try:
+            result = run_query_loop(session, "hello", sink=events.append)
+
+            self.assertEqual(result, "done")
+            self.assertEqual(set(provider.second_tools), {"bash", "read_file"})
+            injected = provider.second_messages[-1]
+            self.assertEqual(injected["source_kind"], "skill_tool_inline")
+            self.assertEqual(injected["source_tool_use_id"], "skill-1")
+            self.assertEqual(injected["skill_name"], "ship")
+            self.assertIn("Release version: 1.2.3", injected["content"][0]["text"])
+            self.assertIsNone(session.transient_tool_context_policy())
+            self.assertIsNone(session.transient_runtime_override())
+            self.assertEqual(provider.second_model_override, "claude-opus-4-6")
+            self.assertEqual(provider.second_effort_override, "high")
+            self.assertTrue(
+                any(event.kind == "skill_tool_inline_messages_applied" for event in events)
+            )
+            self.assertTrue(any(event.kind == "skill_tool_context_applied" for event in events))
+            runtime_progress = session.runtime_progress_surface_payload()
+            self.assertIn(
+                "ship",
+                str(runtime_progress.get("runtime_skill_tool_inline_summary") or ""),
+            )
+            self.assertIn(
+                "read_file,bash",
+                str(runtime_progress.get("runtime_skill_tool_context_summary") or ""),
+            )
+        finally:
+            session.close()
+            if cwd.exists():
+                import shutil
+
+                shutil.rmtree(cwd)
+
+    def test_query_loop_persists_fork_skill_messages_and_context(self) -> None:
+        cwd = Path(__file__).resolve().parent / "_tmp_query_loop_skill_fork"
+        if cwd.exists():
+            import shutil
+
+            shutil.rmtree(cwd)
+        (cwd / ".claude" / "skills" / "ship").mkdir(parents=True)
+        (cwd / ".claude" / "skills" / "ship" / "SKILL.md").write_text(
+            "---\n"
+            "description: Ship release\n"
+            "context: fork\n"
+            "arguments:\n"
+            "  - version\n"
+            "allowed-tools:\n"
+            "  - Read\n"
+            "  - Bash(git status)\n"
+            "---\n\n"
+            "Release version: $version\n",
+            encoding="utf-8",
+        )
+        session = Session(SessionConfig(cwd=cwd, interactive=False), persist_transcript=False)
+        session.permission_manager.require_approval = lambda request: None
+        events: list[RuntimeEvent] = []
+
+        class FakeProvider:
+            def __init__(self) -> None:
+                self.calls = 0
+                self.second_messages = []
+                self.second_tools = []
+                self.capabilities = ProviderCapabilities(
+                    provider="fake",
+                    model="fake-model",
+                    supports_tool_calling=True,
+                    supports_streaming=False,
+                    supports_structured_output=False,
+                )
+
+            def create_message(self, *, messages, tools, system_prompt):
+                del system_prompt
+                self.calls += 1
+                if self.calls == 1:
+                    return AssistantResponse(
+                        content=[
+                            {
+                                "type": "tool_use",
+                                "id": "skill-1",
+                                "name": "skill",
+                                "input": {"skill": "ship", "args": "1.2.3"},
+                            }
+                        ],
+                        text="",
+                        tool_calls=[
+                            ToolCall(id="skill-1", name="skill", input={"skill": "ship", "args": "1.2.3"})
+                        ],
+                    )
+                self.second_messages = list(messages)
+                self.second_tools = [tool["name"] for tool in tools]
+                return AssistantResponse(
+                    content=[{"type": "text", "text": "done"}],
+                    text="done",
+                    tool_calls=[],
+                )
+
+        provider = FakeProvider()
+        session.provider = provider
+
+        try:
+            with patch.object(
+                session,
+                "run_forked_skill_mutation",
+                return_value=ForkedSkillMutationResult(
+                    result_text="forked result",
+                    new_messages=[
+                        {
+                            "role": "user",
+                            "content": [{"type": "text", "text": "child prompt"}],
+                            "source_kind": "skill_tool_fork",
+                            "source_tool_name": "skill",
+                            "source_tool_use_id": "skill-1",
+                            "skill_name": "ship",
+                            "skill_execution_context": "fork",
+                        },
+                        {
+                            "role": "assistant",
+                            "content": [{"type": "text", "text": "child answer"}],
+                            "source_kind": "skill_tool_fork",
+                            "source_tool_name": "skill",
+                            "source_tool_use_id": "skill-1",
+                            "skill_name": "ship",
+                            "skill_execution_context": "fork",
+                        },
+                    ],
+                    context_update=ToolContextUpdate(
+                        allowed_tool_names=("read_file", "bash"),
+                        allowed_bash_command_prefixes=("git status",),
+                        source="skill_tool_fork",
+                        skill_name="ship",
+                    ),
+                    injected_message_count=2,
+                ),
+            ):
+                result = run_query_loop(session, "hello", sink=events.append)
+
+            self.assertEqual(result, "done")
+            self.assertEqual(set(provider.second_tools), {"read_file", "bash"})
+            injected = [m for m in provider.second_messages if m.get("source_kind") == "skill_tool_fork"]
+            self.assertEqual(len(injected), 2)
+            self.assertEqual(injected[0]["source_tool_use_id"], "skill-1")
+            self.assertEqual(injected[1]["content"][0]["text"], "child answer")
+            self.assertIsNone(session.transient_tool_context_policy())
+            self.assertTrue(
+                any(event.kind == "skill_tool_fork_messages_applied" for event in events)
+            )
+            self.assertTrue(any(event.kind == "skill_tool_context_applied" for event in events))
+            runtime_progress = session.runtime_progress_surface_payload()
+            self.assertIn(
+                "ship",
+                str(runtime_progress.get("runtime_skill_tool_fork_summary") or ""),
+            )
+            self.assertIn(
+                "read_file,bash",
+                str(runtime_progress.get("runtime_skill_tool_context_summary") or ""),
+            )
+            status_payload = session.status_surface_payload()
+            self.assertIn(
+                "ship",
+                str(status_payload.get("status_runtime_skill_tool_fork_summary") or ""),
+            )
+        finally:
+            session.close()
+            if cwd.exists():
+                import shutil
+
+                shutil.rmtree(cwd)
+
+    def test_query_loop_rolls_back_injected_skill_messages_on_failure(self) -> None:
+        cwd = Path(__file__).resolve().parent / "_tmp_query_loop_skill_inline_failure"
+        if cwd.exists():
+            import shutil
+
+            shutil.rmtree(cwd)
+        (cwd / ".claude" / "skills" / "ship").mkdir(parents=True)
+        (cwd / ".claude" / "skills" / "ship" / "SKILL.md").write_text(
+            "---\n"
+            "description: Ship release\n"
+            "arguments:\n"
+            "  - version\n"
+            "allowed-tools:\n"
+            "  - Read\n"
+            "model: claude-opus-4-6\n"
+            "effort: medium\n"
+            "---\n\n"
+            "Release version: $version\n",
+            encoding="utf-8",
+        )
+        session = Session(
+            SessionConfig(
+                cwd=cwd,
+                interactive=False,
+                provider_max_retries=0,
+            ),
+            persist_transcript=False,
+        )
+        session.permission_manager.require_approval = lambda request: None
+        starting_messages = [{"role": "user", "content": [{"type": "text", "text": "before"}]}]
+        session.state.messages = list(starting_messages)
+
+        class FailingProvider:
+            def __init__(self) -> None:
+                self.calls = 0
+                self.capabilities = ProviderCapabilities(
+                    provider="fake",
+                    model="fake-model",
+                    supports_tool_calling=True,
+                    supports_streaming=False,
+                    supports_structured_output=False,
+                )
+
+            def create_message(self, *, messages, tools, system_prompt):
+                del messages, tools, system_prompt
+                self.calls += 1
+                if self.calls == 1:
+                    return AssistantResponse(
+                        content=[
+                            {
+                                "type": "tool_use",
+                                "id": "skill-1",
+                                "name": "skill",
+                                "input": {"skill": "ship", "args": "1.2.3"},
+                            }
+                        ],
+                        text="",
+                        tool_calls=[
+                            ToolCall(id="skill-1", name="skill", input={"skill": "ship", "args": "1.2.3"})
+                        ],
+                    )
+                raise ProviderNetworkError("network down")
+
+        session.provider = FailingProvider()
+
+        try:
+            with self.assertRaises(ProviderNetworkError):
+                run_query_loop(session, "hello")
+
+            self.assertEqual(session.state.messages, starting_messages)
+            self.assertIsNone(session.transient_tool_context_policy())
+            self.assertIsNone(session.transient_runtime_override())
+        finally:
+            session.close()
+            if cwd.exists():
+                import shutil
+
+                shutil.rmtree(cwd)
+
+    def test_query_loop_rolls_back_fork_skill_messages_on_failure(self) -> None:
+        cwd = Path(__file__).resolve().parent / "_tmp_query_loop_skill_fork_failure"
+        if cwd.exists():
+            import shutil
+
+            shutil.rmtree(cwd)
+        (cwd / ".claude" / "skills" / "ship").mkdir(parents=True)
+        (cwd / ".claude" / "skills" / "ship" / "SKILL.md").write_text(
+            "---\n"
+            "description: Ship release\n"
+            "context: fork\n"
+            "allowed-tools:\n"
+            "  - Read\n"
+            "---\n\n"
+            "Release workflow\n",
+            encoding="utf-8",
+        )
+        session = Session(
+            SessionConfig(
+                cwd=cwd,
+                interactive=False,
+                provider_max_retries=0,
+            ),
+            persist_transcript=False,
+        )
+        session.permission_manager.require_approval = lambda request: None
+        starting_messages = [{"role": "user", "content": [{"type": "text", "text": "before"}]}]
+        session.state.messages = list(starting_messages)
+
+        class FailingProvider:
+            def __init__(self) -> None:
+                self.calls = 0
+                self.capabilities = ProviderCapabilities(
+                    provider="fake",
+                    model="fake-model",
+                    supports_tool_calling=True,
+                    supports_streaming=False,
+                    supports_structured_output=False,
+                )
+
+            def create_message(self, *, messages, tools, system_prompt):
+                del messages, tools, system_prompt
+                self.calls += 1
+                if self.calls == 1:
+                    return AssistantResponse(
+                        content=[
+                            {
+                                "type": "tool_use",
+                                "id": "skill-1",
+                                "name": "skill",
+                                "input": {"skill": "ship"},
+                            }
+                        ],
+                        text="",
+                        tool_calls=[ToolCall(id="skill-1", name="skill", input={"skill": "ship"})],
+                    )
+                raise ProviderNetworkError("network down")
+
+        session.provider = FailingProvider()
+
+        try:
+            with patch.object(
+                session,
+                "run_forked_skill_mutation",
+                return_value=ForkedSkillMutationResult(
+                    result_text="forked result",
+                    new_messages=[
+                        {
+                            "role": "user",
+                            "content": [{"type": "text", "text": "child prompt"}],
+                            "source_kind": "skill_tool_fork",
+                            "source_tool_name": "skill",
+                            "source_tool_use_id": "skill-1",
+                            "skill_name": "ship",
+                            "skill_execution_context": "fork",
+                        }
+                    ],
+                    context_update=ToolContextUpdate(
+                        allowed_tool_names=("read_file",),
+                        source="skill_tool_fork",
+                        skill_name="ship",
+                    ),
+                    injected_message_count=1,
+                ),
+            ):
+                with self.assertRaises(ProviderNetworkError):
+                    run_query_loop(session, "hello")
+
+            self.assertEqual(session.state.messages, starting_messages)
+            self.assertIsNone(session.transient_tool_context_policy())
+        finally:
+            session.close()
+            if cwd.exists():
+                import shutil
+
+                shutil.rmtree(cwd)
 
     def test_query_loop_enforces_tool_round_limit(self) -> None:
         session = Session(

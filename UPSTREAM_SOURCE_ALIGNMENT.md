@@ -45,7 +45,7 @@ The goal is to distinguish:
 | Tool pool and orchestration | `src/tools.ts`, tool pool assembly, tool filtering, presets, lifecycle semantics | `claudecode_py/tools/*`, `claudecode_py/runtime/orchestrator.py`, `claudecode_py/runtime/tool_schema_cache.py` | Locally aligned with narrower breadth | The local tool loop, approval model, schema stability, lifecycle events, and plugin/MCP injection are structurally parallel, but the upstream tool ecosystem and feature-gated breadth are wider. |
 | State/history/memory/compaction | `src/state/*`, `src/history.ts`, query-side collapse/snip/compact behavior | `claudecode_py/storage/transcript.py`, `claudecode_py/history_compaction.py`, `claudecode_py/session_components/history_memory.py` | Locally aligned with narrower breadth | Transcript persistence, rewind boundaries, compact lifecycle, replacement-aware compaction, and resume semantics are strong locally; upstream still has broader history/product breadth. |
 | Runtime surfaces and consumers | upstream CLI/Ink/screens/remote consumers | `claudecode_py/context_usage.py`, `claudecode_py/session_components/summary_surfaces.py`, `claudecode_py/tui/*`, `claudecode_py/service/*` | Functional substitute, shallower mechanism | Local REPL/TUI/stdio/remote surfaces are coherent and share structured payloads, but upstream shell breadth and transport/product integration remain broader. |
-| Plugin / skills / project-context | `src/plugins/*`, `src/skills/*`, bundled/plugin prompt architecture | `claudecode_py/plugins/*`, `claudecode_py/skills/*`, `claudecode_py/session_components/project_context.py` | Functional substitute, shallower mechanism | The local architecture is coherent for builtin plus project-local declarative extensibility, but upstream packaging, distribution, and productized ecosystem breadth are wider. |
+| Plugin / skills / project-context | `src/plugins/*`, `src/skills/*`, bundled/plugin prompt architecture | `claudecode_py/plugins/*`, `claudecode_py/skills/*`, `claudecode_py/session_components/project_context.py` | Functional substitute, shallower mechanism | The local architecture is coherent for builtin plus project-local declarative extensibility, but upstream packaging, distribution, and productized ecosystem breadth are wider. Detailed skill mechanism-depth alignment is tracked separately in `SKILL_SOURCE_ALIGNMENT.md`. |
 | Background agents / detached workflow | `src/commands/agents/*`, background/task summary modules, task surfaces | background `ask`, `ps`, `logs`, `attach`, `/agents`, `background_metadata.py` | Functional substitute, shallower mechanism | The local detached workflow is usable and observability-rich, but upstream agent orchestration breadth is still larger. |
 | Remote / transport / hosted shell | `src/remote/*`, broader transports, hosted bridge/product shell | stdio service, TCP bridge, remote session proxy | Upstream-only breadth | The local implementation supports attachable local workflows, not the broader hosted transport/product matrix. |
 
@@ -174,6 +174,8 @@ The Python repo now has a coherent local architecture for:
 **Remaining gap**  
 Remaining difference is ecosystem/distribution breadth rather than a missing local extensibility architecture.
 
+Detailed skill runtime depth, including `/.claude/skills`, `/<skill-name>`, the local `skill` tool, and the remaining `paths` / richer-frontmatter / broader skill-runtime gaps, is tracked separately in `SKILL_SOURCE_ALIGNMENT.md`.
+
 ### Background agents and detached workflow
 
 **Upstream mechanism**  
@@ -193,6 +195,8 @@ The Python local workflow has:
 
 **Remaining gap**  
 The remaining difference is broader agent/product breadth more than missing detached local workflow mechanics.
+
+Detailed subagent mechanism-depth alignment, including foreground child-session execution, background agents, result-model gaps, transcript/resume depth, permission propagation, and agent-type/runtime-role breadth, is tracked separately in `SUBAGENT_SOURCE_ALIGNMENT.md`.
 
 ### Hosted/remote/product breadth
 

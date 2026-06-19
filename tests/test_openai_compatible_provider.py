@@ -23,6 +23,45 @@ def _tool_call_delta(*, index: int, id: str | None = None, name: str | None = No
 
 
 class OpenAICompatibleProviderStreamingTests(unittest.TestCase):
+    def test_create_message_uses_model_override_and_ignores_effort_override(self) -> None:
+        provider = OpenAICompatibleProvider(
+            model="gpt-test",
+            max_tokens=256,
+            api_key="k",
+            base_url="https://example.test/v1",
+        )
+
+        class FakeCompletions:
+            def __init__(self) -> None:
+                self.calls = []
+
+            def create(self, **kwargs):
+                self.calls.append(kwargs)
+                return SimpleNamespace(
+                    choices=[
+                        SimpleNamespace(
+                            message=SimpleNamespace(content="done", tool_calls=[]),
+                            finish_reason="stop",
+                        )
+                    ],
+                    usage=None,
+                )
+
+        fake_completions = FakeCompletions()
+        provider._client = SimpleNamespace(chat=SimpleNamespace(completions=fake_completions))
+
+        response = provider.create_message(
+            messages=[{"role": "user", "content": [{"type": "text", "text": "hi"}]}],
+            tools=[],
+            system_prompt="system",
+            model_override="gpt-override",
+            effort_override="high",
+        )
+
+        self.assertEqual(response.text, "done")
+        self.assertEqual(fake_completions.calls[0]["model"], "gpt-override")
+        self.assertNotIn("effort_override", fake_completions.calls[0])
+
     def test_stream_message_ignores_cache_plan_safely(self) -> None:
         provider = OpenAICompatibleProvider(
             model="gpt-test",

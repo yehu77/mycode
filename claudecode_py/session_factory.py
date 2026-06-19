@@ -148,12 +148,14 @@ class SessionFactory:
             if restored_state is None:
                 raise FileNotFoundError(f'No saved session found for id "{resume_session_id}".')
             self._resolve_restored_workspace_state(restored_state, cwd)
+            self._mark_plan_mode_reentry_attachment(restored_state)
             self._record_resume_boundary(restored_state)
             return restored_state, restored_from
         if restore_latest:
             restored_state, restored_from = load_latest_transcript(cwd)
             if restored_state is not None:
                 self._resolve_restored_workspace_state(restored_state, cwd)
+                self._mark_plan_mode_reentry_attachment(restored_state)
                 self._record_resume_boundary(restored_state)
             return restored_state, restored_from
         return None, None
@@ -204,6 +206,11 @@ class SessionFactory:
             isolated_workspace=isolated_workspace,
         )
         child_state = SessionState(
+            session_runtime_mode=parent.state.session_runtime_mode,
+            pre_plan_mode=parent.state.pre_plan_mode,
+            has_exited_plan_mode=parent.state.has_exited_plan_mode,
+            needs_plan_mode_exit_attachment=parent.state.needs_plan_mode_exit_attachment,
+            needs_plan_mode_reentry_attachment=parent.state.needs_plan_mode_reentry_attachment,
             session_execution_mode="child-session",
             session_command_policy_name=parent.state.session_command_policy_name,
             session_command_policy_source=parent.state.session_command_policy_source,
@@ -259,9 +266,17 @@ class SessionFactory:
             depth=parent.depth + 1,
             persist_transcript=False,
         )
+        parent.copy_plan_for_fork(child_session)
         if workspace is not None:
             child_session.set_workspace_cleanup(lambda: cleanup_isolated_workspace(workspace))
         return child_session
+
+    def _mark_plan_mode_reentry_attachment(self, state: SessionState) -> None:
+        if state.session_runtime_mode != "plan":
+            return
+        if not state.plan_slug:
+            return
+        state.needs_plan_mode_reentry_attachment = True
 
     def load_mcp_registry_from_config(
         self,

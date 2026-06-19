@@ -40,6 +40,9 @@ def _runtime_event_from_payload(event_payload: dict[str, Any]) -> RuntimeEvent |
         "tool_failed",
         "tool_result",
         "tool_result_summarized",
+        "skill_tool_inline_messages_applied",
+        "skill_tool_fork_messages_applied",
+        "skill_tool_context_applied",
         "tool_result_replacement_applied",
         "tool_result_replacement_reapplied",
         "tool_result_artifact_created",
@@ -1858,6 +1861,15 @@ class RemoteSessionProxy:
             "status_runtime_tool_result_microcompact_summary": payload.get(
                 "status_runtime_tool_result_microcompact_summary"
             ),
+            "status_runtime_skill_tool_fork_summary": payload.get(
+                "status_runtime_skill_tool_fork_summary"
+            ),
+            "status_runtime_skill_tool_inline_summary": payload.get(
+                "status_runtime_skill_tool_inline_summary"
+            ),
+            "status_runtime_skill_tool_context_summary": payload.get(
+                "status_runtime_skill_tool_context_summary"
+            ),
             "status_prompt_prefix_segment_count": payload.get(
                 "status_prompt_prefix_segment_count"
             ),
@@ -1866,6 +1878,62 @@ class RemoteSessionProxy:
             ),
             "status_prompt_prefix_dynamic_tail_chars": payload.get(
                 "status_prompt_prefix_dynamic_tail_chars"
+            ),
+            "status_prompt_prefix_attachment_count": payload.get(
+                "status_prompt_prefix_attachment_count"
+            ),
+            "status_prompt_prefix_attachment_kinds": payload.get(
+                "status_prompt_prefix_attachment_kinds"
+            ),
+            "status_prompt_prefix_attachment_summaries": payload.get(
+                "status_prompt_prefix_attachment_summaries"
+            ),
+            "status_prompt_prefix_attachment_summary": payload.get(
+                "status_prompt_prefix_attachment_summary"
+            ),
+            "status_prompt_prefix_attachment_mode": payload.get(
+                "status_prompt_prefix_attachment_mode"
+            ),
+            "status_prompt_prefix_attachment_change_reason": payload.get(
+                "status_prompt_prefix_attachment_change_reason"
+            ),
+            "status_plan_workflow_mode": payload.get("status_plan_workflow_mode"),
+            "status_plan_workflow_phase_family": payload.get(
+                "status_plan_workflow_phase_family"
+            ),
+            "status_plan_workflow_branch_identity": payload.get(
+                "status_plan_workflow_branch_identity"
+            ),
+            "status_plan_workflow_branch_summary": payload.get(
+                "status_plan_workflow_branch_summary"
+            ),
+            "status_plan_workflow_agent_count": payload.get(
+                "status_plan_workflow_agent_count"
+            ),
+            "status_plan_workflow_explore_agent_count": payload.get(
+                "status_plan_workflow_explore_agent_count"
+            ),
+            "status_plan_workflow_allowed_agent_names": payload.get(
+                "status_plan_workflow_allowed_agent_names"
+            ),
+            "status_plan_workflow_invocation_boundary_summary": payload.get(
+                "status_plan_workflow_invocation_boundary_summary"
+            ),
+            "status_plan_workflow_invocation_delegation_default": payload.get(
+                "status_plan_workflow_invocation_delegation_default"
+            ),
+            "status_plan_instruction_state": payload.get("status_plan_instruction_state"),
+            "status_plan_instruction_attachment_mode": payload.get(
+                "status_plan_instruction_attachment_mode"
+            ),
+            "status_plan_instruction_attachment_summary": payload.get(
+                "status_plan_instruction_attachment_summary"
+            ),
+            "status_plan_instruction_reentry_active": payload.get(
+                "status_plan_instruction_reentry_active"
+            ),
+            "status_plan_instruction_exit_active": payload.get(
+                "status_plan_instruction_exit_active"
             ),
             "status_prompt_prefix_cache_mode": payload.get(
                 "status_prompt_prefix_cache_mode"

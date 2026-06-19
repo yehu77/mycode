@@ -26,6 +26,7 @@ class SessionConfig:
     mcp_config_path: Path | None = None
     permission_config_path: Path | None = None
     max_agent_depth: int = 2
+    plan_mode_interview_phase: bool = False
 
 
 def default_model_for_provider(provider: str) -> str:
@@ -108,4 +109,6 @@ def load_config(
         else float(os.getenv("PYCLAUDE_PROVIDER_RETRY_BASE_DELAY_SEC", "0.5")),
         permission_mode=permission_mode or os.getenv("PYCLAUDE_PERMISSION_MODE", "default"),
         interactive=interactive,
+        plan_mode_interview_phase=os.getenv("PYCLAUDE_PLAN_MODE_INTERVIEW_PHASE", "").strip().lower()
+        in {"1", "true", "yes", "on"},
     )

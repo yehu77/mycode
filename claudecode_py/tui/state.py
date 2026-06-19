@@ -1102,6 +1102,25 @@ class TuiState:
                 f"stable_chars={int(status_metadata.get('status_prompt_prefix_stable_chars') or 0)} "
                 f"dynamic_tail_chars={int(status_metadata.get('status_prompt_prefix_dynamic_tail_chars') or 0)}"
             ),
+            "plan attachments: "
+            + str(status_metadata.get("status_prompt_prefix_attachment_summary") or "none"),
+            "plan attachment mode: "
+            + str(status_metadata.get("status_prompt_prefix_attachment_mode") or "none"),
+            "plan workflow: "
+            + (
+                f"{status_metadata.get('status_plan_workflow_mode') or 'five_phase'} "
+                f"agents={int(status_metadata.get('status_plan_workflow_agent_count') or 1)} "
+                f"explore_agents={int(status_metadata.get('status_plan_workflow_explore_agent_count') or 3)}"
+            ),
+            "plan workflow branch: "
+            + str(status_metadata.get("status_plan_workflow_branch_identity") or "none"),
+            "plan attachment state: "
+            + (
+                f"{status_metadata.get('status_plan_instruction_state') or 'inactive'} "
+                f"mode={status_metadata.get('status_plan_instruction_attachment_mode') or 'none'} "
+                f"reentry={'yes' if bool(status_metadata.get('status_plan_instruction_reentry_active')) else 'no'} "
+                f"exit={'yes' if bool(status_metadata.get('status_plan_instruction_exit_active')) else 'no'}"
+            ),
             "provider-view assembly: "
             + str(status_metadata.get("status_provider_view_assembly_summary") or "none"),
             "prompt prefix cache mode: "
@@ -1176,6 +1195,8 @@ class TuiState:
             + ("no" if bool(status_metadata.get("status_prompt_prefix_changed")) else "yes"),
             "prefix change reason: "
             + str(status_metadata.get("status_prompt_prefix_change_reason") or "none"),
+            "plan attachment change reason: "
+            + str(status_metadata.get("status_prompt_prefix_attachment_change_reason") or "none"),
             "budget pressure: "
             + (
                 str(status_metadata.get("status_budget_reason") or "none")

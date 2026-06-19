@@ -1,4 +1,4 @@
-from pathlib import Path
+﻿from pathlib import Path
 import shutil
 import subprocess
 import sys
@@ -35,6 +35,8 @@ from claudecode_py.permissions import PermissionManager
 from claudecode_py.runtime.events import RuntimeEvent
 from claudecode_py.storage.background_sessions import create_background_session, update_background_session
 from claudecode_py.tasks import TaskManager
+from claudecode_py.tools.apply_patch import ApplyPatchTool
+from claudecode_py.tools.edit_file import EditFileTool
 from claudecode_py.tools.write_file import WriteFileTool
 
 
@@ -467,7 +469,7 @@ class SessionViewsTests(unittest.TestCase):
             self.assertIn("/task advisor " + change_task.id, rendered)
             self.assertIn("/task drift " + change_task.id, rendered)
             self.assertIn("go_to_change: /changes show", rendered)
-            self.assertIn("go_to_plan: /plan execution", rendered)
+            self.assertIn("go_to_plan: /planning execution", rendered)
             self.assertIn("stay_on_surface: /tasks list | /tasks active | /tasks changes | /tasks context", rendered)
             self.assertIn("filter: changes", rendered_changes)
             self.assertIn(change_task.id, rendered_changes)
@@ -936,11 +938,11 @@ class SessionViewsTests(unittest.TestCase):
         self.assertIn("recent_plan_drift_analysis:", advisor_detail)
         self.assertIn("lineage:", lineage_detail)
         self.assertIn("current", lineage_detail)
-        self.assertIn("actions=/plan show", lineage_detail)
+        self.assertIn("actions=/planning show", lineage_detail)
         self.assertIn("selected_lineage_artifact_id:", lineage_detail)
         self.assertIn("selected_lineage_default_action:", lineage_detail)
         self.assertIn("next_actions:", lineage_detail)
-        self.assertIn("selected: /plan derive", lineage_detail)
+        self.assertIn("selected: /planning derive", lineage_detail)
 
     def test_describe_tasks_and_task_detail_render_permission_context(self) -> None:
         session = Session(SessionConfig(cwd=Path(__file__).resolve().parent, interactive=False))
@@ -1055,8 +1057,8 @@ class SessionViewsTests(unittest.TestCase):
         self.assertIn("lineage_audit_summary:", rendered)
         self.assertIn("artifacts:", rendered)
         self.assertIn(f"selected_audit_artifact_id: {active.artifact_id}", rendered)
-        self.assertIn(f"selected_audit_primary_action: /plan replay latest artifact={active.artifact_id}", rendered)
-        self.assertIn(f"/plan timeline all artifact={previous.artifact_id}", rendered)
+        self.assertIn(f"selected_audit_primary_action: /planning replay latest artifact={active.artifact_id}", rendered)
+        self.assertIn(f"/planning timeline all artifact={previous.artifact_id}", rendered)
         self.assertIn("selected_artifact_phase_summaries:", rendered)
         self.assertIn("- Execution Loop:", rendered)
         self.assertIn("selected_artifact_deltas:", rendered)
@@ -1143,7 +1145,7 @@ class SessionViewsTests(unittest.TestCase):
         self.assertIn("[Execution Loop] entries=", rendered)
         self.assertIn("[Advisor & Drift] entries=", rendered)
         self.assertIn("next_actions:", rendered)
-        self.assertIn("/plan execution", rendered)
+        self.assertIn("/planning execution", rendered)
 
     def test_active_plan_timeline_supports_kind_filter(self) -> None:
         session = Session(SessionConfig(cwd=Path(__file__).resolve().parent, interactive=False))
@@ -1417,7 +1419,7 @@ class SessionViewsTests(unittest.TestCase):
         self.assertIn("local:entries", rendered)
         self.assertIn("local:execution", rendered)
         self.assertIn("selected_timeline_compare_label: local:entries", rendered)
-        self.assertIn("selected_timeline_compare_primary_action: /plan timeline all phase=execution-loop", rendered)
+        self.assertIn("selected_timeline_compare_primary_action: /planning timeline all phase=execution-loop", rendered)
         self.assertNotIn("phase:Plan Setup", rendered)
 
     def test_active_plan_timeline_phase_local_delta_mode_surfaces_drift_slices(self) -> None:
@@ -1462,8 +1464,8 @@ class SessionViewsTests(unittest.TestCase):
         self.assertIn("local:after-drift", rendered)
         self.assertIn("local:execution-change", rendered)
         self.assertIn("selected_timeline_compare_label: local:before-drift", rendered)
-        self.assertIn("selected_timeline_compare_primary_action: /plan timeline all phase=execution-loop delta=before-drift", rendered)
-        self.assertIn("selected_timeline_compare_secondary_action: /plan timeline all phase=execution-loop delta=after-drift", rendered)
+        self.assertIn("selected_timeline_compare_primary_action: /planning timeline all phase=execution-loop delta=before-drift", rendered)
+        self.assertIn("selected_timeline_compare_secondary_action: /planning timeline all phase=execution-loop delta=after-drift", rendered)
 
     def test_active_plan_timeline_phase_local_audit_summary_surfaces_drift_windows(self) -> None:
         session = Session(SessionConfig(cwd=Path(__file__).resolve().parent, interactive=False))
@@ -1685,13 +1687,13 @@ class SessionViewsTests(unittest.TestCase):
         self.assertIn(f"- current_artifact: {artifact.artifact_id} goal=current plan", rendered)
         self.assertIn(f"- previous_artifact: {previous.artifact_id} goal=previous plan", rendered)
         self.assertIn("- selected_side: previous", rendered)
-        self.assertIn(f"- compare_previous_replay: /plan replay latest all artifact={previous.artifact_id}", rendered)
+        self.assertIn(f"- compare_previous_replay: /planning replay latest all artifact={previous.artifact_id}", rendered)
         self.assertIn(f"- added_execution_tasks: {current_execution.id}", rendered)
         self.assertIn(f"- removed_scout_tasks: {previous_scout.id}", rendered)
         self.assertIn("- entry_delta_scout:", rendered)
         self.assertIn("removed:", rendered)
         self.assertIn(previous_scout.id, rendered)
-        self.assertIn(f"actions=/task show {previous_scout.id} | /plan scouts", rendered)
+        self.assertIn(f"actions=/task show {previous_scout.id} | /planning scouts", rendered)
         self.assertIn("- entry_delta_execution:", rendered)
         self.assertIn(current_execution.id, rendered)
         self.assertIn(f"actions=/task show {current_execution.id} | /task advisor {current_execution.id}", rendered)
@@ -2133,7 +2135,7 @@ class SessionViewsTests(unittest.TestCase):
             self.assertIn("- next_actions:", rendered)
             self.assertIn("- go_to_task: /task show " + task.id, rendered)
             self.assertIn("- go_to_change: /changes show", rendered)
-            self.assertIn("- stay_on_surface: /plan execution | /plan advisor | /advisor status", rendered)
+            self.assertIn("- stay_on_surface: /planning execution | /planning advisor | /advisor status", rendered)
             self.assertIn("selected execution focused file:", rendered)
             self.assertIn("- focused file: runtime/session.py", rendered)
             self.assertIn("- related change:", rendered)
@@ -2189,7 +2191,7 @@ class SessionViewsTests(unittest.TestCase):
             self.assertIn("selected_scout_summary:", rendered)
             self.assertIn("- next_actions:", rendered)
             self.assertIn("- go_to_task: /task show " + scout.id, rendered)
-            self.assertIn("- stay_on_surface: /plan scouts", rendered)
+            self.assertIn("- stay_on_surface: /planning scouts", rendered)
             self.assertIn("selected scout focused file:", rendered)
             self.assertIn("- focused file: notes.md", rendered)
             self.assertIn("- related change:", rendered)
@@ -2352,21 +2354,21 @@ class SessionViewsTests(unittest.TestCase):
         self.assertIn("advisor_context:", drift_detail)
         self.assertIn("next_actions:", drift_detail)
         self.assertIn("go_to_change: none", drift_detail)
-        self.assertIn("go_to_plan: /plan execution 1 | /plan execution | /plan advisor", drift_detail)
+        self.assertIn("go_to_plan: /planning execution 1 | /planning execution | /planning advisor", drift_detail)
         self.assertIn("stay_on_surface: /task show " + task.id, drift_detail)
         self.assertIn("/task drift " + task.id, drift_detail)
         self.assertIn("navigation:", drift_detail)
         self.assertIn(f"/task advisor {task.id}", drift_detail)
-        self.assertIn("/plan execution 1", drift_detail)
+        self.assertIn("/planning execution 1", drift_detail)
         self.assertIn("advisor_review:", advisor_detail)
         self.assertIn("next_actions:", advisor_detail)
         self.assertIn("go_to_change: none", advisor_detail)
-        self.assertIn("go_to_plan: /plan execution 1 | /plan execution | /plan advisor", advisor_detail)
+        self.assertIn("go_to_plan: /planning execution 1 | /planning execution | /planning advisor", advisor_detail)
         self.assertIn("stay_on_surface: /task show " + task.id, advisor_detail)
         self.assertIn("/task advisor " + task.id, advisor_detail)
         self.assertIn("navigation:", advisor_detail)
         self.assertIn(f"/task drift {task.id}", advisor_detail)
-        self.assertIn("/plan advisor", advisor_detail)
+        self.assertIn("/planning advisor", advisor_detail)
 
     def test_active_plan_execution_detail_includes_comparison_summary(self) -> None:
         session = Session(SessionConfig(cwd=Path(__file__).resolve().parent, interactive=False))
@@ -2891,6 +2893,7 @@ class SessionViewsTests(unittest.TestCase):
         if cwd.exists():
             shutil.rmtree(cwd)
         (cwd / ".pyclaude" / "skills").mkdir(parents=True)
+        (cwd / ".claude" / "skills" / "ship").mkdir(parents=True)
         (cwd / "CLAUDE.md").write_text("Project memory text", encoding="utf-8")
         (cwd / ".pyclaude" / "skills" / "review.md").write_text(
             "---\n"
@@ -2903,6 +2906,16 @@ class SessionViewsTests(unittest.TestCase):
         )
         (cwd / ".pyclaude" / "skills" / "draft.md").write_text(
             "Draft user-facing text carefully.",
+            encoding="utf-8",
+        )
+        (cwd / ".claude" / "skills" / "ship" / "SKILL.md").write_text(
+            "---\n"
+            "description: Ship a release\n"
+            "arguments:\n"
+            "  - version\n"
+            "user-invocable: true\n"
+            "---\n\n"
+            "Ship version: $version",
             encoding="utf-8",
         )
 
@@ -2919,21 +2932,27 @@ class SessionViewsTests(unittest.TestCase):
             self.assertIn("next_actions:", memory)
             self.assertIn("skill registry:", skills)
             self.assertIn("registered skills:", skills)
-            self.assertIn("skill prompt composition: auto_enabled=1 manual_enabled=0 inactive=6", skills)
+            self.assertIn("skill prompt composition: auto_enabled=1 manual_enabled=0 inactive=7", skills)
             self.assertIn("prompt-active auto-enabled skills: review", skills)
+            self.assertIn("user-invocable skill commands: /ship", skills)
             self.assertIn("review", skills)
             self.assertIn("skill_status=enabled", skills)
             self.assertIn("skill_auto_enable_state=auto-enabled", skills)
             self.assertIn("draft", skills)
             self.assertIn("skill_status=inactive", skills)
             self.assertIn("skill_tags=review,quality", skills)
+            self.assertIn("ship", skills)
+            self.assertIn("user_invocable=yes", skills)
+            self.assertIn("slash_command=/ship", skills)
             self.assertIn("project context:", project_context)
-            self.assertIn("skill registry: registered=7 enabled=1 inactive=6 diagnostics=0", project_context)
-            self.assertIn("skill prompt composition: auto_enabled=1 manual_enabled=0 inactive=6", project_context)
+            self.assertIn("skill registry: registered=8 enabled=1 inactive=7 diagnostics=0", project_context)
+            self.assertIn("skill prompt composition: auto_enabled=1 manual_enabled=0 inactive=7", project_context)
             self.assertIn("project_memory: loaded", config)
-            self.assertIn("skill registry: registered=7 enabled=1 inactive=6 diagnostics=0", config)
+            self.assertIn("skill registry: registered=8 enabled=1 inactive=7 diagnostics=0", config)
             self.assertIn("manual skill overrides: enabled=0 disabled=0", config)
             self.assertIn("Auto-enabled project skills", prompt)
+            self.assertIn("User-invocable skills", prompt)
+            self.assertIn("/ship", prompt)
             self.assertNotIn("Manually enabled project skills", prompt)
         finally:
             if cwd.exists():
@@ -2979,6 +2998,58 @@ class SessionViewsTests(unittest.TestCase):
             skills_after_reload = session.describe_loaded_skills()
             self.assertIn("skill_status=disabled", skills_after_reload)
             self.assertIn("manual_override=manual-enabled", skills_after_reload)
+        finally:
+            if cwd.exists():
+                shutil.rmtree(cwd)
+
+    def test_skill_views_show_model_invocation_metadata_and_filter_prompt_guidance(self) -> None:
+        cwd = Path(__file__).resolve().parent / "_tmp_session_skill_model_views"
+        if cwd.exists():
+            shutil.rmtree(cwd)
+        (cwd / ".claude" / "skills" / "ship").mkdir(parents=True)
+        (cwd / ".claude" / "skills" / "review").mkdir(parents=True)
+        (cwd / ".claude" / "skills" / "ship" / "SKILL.md").write_text(
+            "---\n"
+            "description: Ship release\n"
+            "user-invocable: true\n"
+            "model: claude-opus-4-6\n"
+            "effort: high\n"
+            "---\n\n"
+            "Ship it.\n",
+            encoding="utf-8",
+        )
+        (cwd / ".claude" / "skills" / "review" / "SKILL.md").write_text(
+            "---\n"
+            "description: Review release\n"
+            "user-invocable: true\n"
+            "disable-model-invocation: true\n"
+            "---\n\n"
+            "Review it.\n",
+            encoding="utf-8",
+        )
+
+        try:
+            session = Session(SessionConfig(cwd=cwd, interactive=False))
+            skills = session.describe_loaded_skills()
+            prompt = session.build_system_prompt()
+            payload = session.skills_surface_payload()
+
+            self.assertIn("model_invocable=yes", skills)
+            self.assertIn("model_invocable=no", skills)
+            self.assertIn("disable_model_invocation=yes", skills)
+            self.assertIn("skill_model=claude-opus-4-6", skills)
+            self.assertIn("skill_effort=high", skills)
+            self.assertIn("model-invocable skills: ship", skills)
+            self.assertIn("model-disabled slash skills: review", skills)
+            self.assertIn("/ship", prompt)
+            self.assertNotIn("/review", prompt)
+            self.assertIn("Some slash skills are user-only", prompt)
+            entries = {entry["name"]: entry for entry in payload["skill_entries"]}
+            self.assertTrue(entries["ship"]["model_invocable"])
+            self.assertFalse(entries["review"]["model_invocable"])
+            self.assertTrue(entries["review"]["disable_model_invocation"])
+            self.assertEqual(entries["ship"]["model"], "claude-opus-4-6")
+            self.assertEqual(entries["ship"]["effort"], "high")
         finally:
             if cwd.exists():
                 shutil.rmtree(cwd)
@@ -3206,6 +3277,564 @@ class SessionViewsTests(unittest.TestCase):
             if cwd.exists():
                 shutil.rmtree(cwd, ignore_errors=True)
 
+    def test_plan_mode_tool_specs_only_expose_strict_allowlist(self) -> None:
+        cwd = Path(__file__).resolve().parent / "_tmp_plan_mode_tool_specs"
+        if cwd.exists():
+            shutil.rmtree(cwd)
+        cwd.mkdir(parents=True)
+        session = None
+
+        try:
+            session = Session(SessionConfig(cwd=cwd, interactive=False))
+            plan_path = session.enter_plan_mode()
+            specs = {spec["name"]: spec for spec in session.tool_specs()}
+
+            self.assertEqual(
+                set(specs),
+                {
+                    "ExitPlanMode",
+                    "agent",
+                    "apply_patch",
+                    "ask_user_question",
+                    "bash",
+                    "edit_file",
+                    "find_callees",
+                    "find_callers",
+                    "find_references",
+                    "find_symbol",
+                    "find_symbol_graph",
+                    "glob_search",
+                    "grep_search",
+                    "list_dir",
+                    "list_mcp_resources",
+                    "outline_file",
+                    "outline_project",
+                    "read_file",
+                    "read_mcp_resource",
+                    "write_file",
+                },
+            )
+            self.assertNotIn("skill", specs)
+            self.assertNotIn("todo_write", specs)
+            self.assertNotIn("session_task_list", specs)
+            self.assertNotIn("EnterPlanMode", specs)
+            self.assertIn("plan mode restriction", specs["write_file"]["description"].lower())
+            self.assertIn(plan_path.name, specs["write_file"]["description"])
+            self.assertIn("read-only shell commands", specs["bash"]["description"].lower())
+            self.assertIn("Explore and Plan agent types", specs["agent"]["description"])
+            self.assertIn("Agent usage:", specs["agent"]["description"])
+        finally:
+            if session is not None:
+                session.close()
+            if cwd.exists():
+                shutil.rmtree(cwd, ignore_errors=True)
+
+    def test_plan_mode_transition_tools_are_mode_and_execution_aware(self) -> None:
+        cwd = Path(__file__).resolve().parent / "_tmp_plan_mode_transition_tools"
+        if cwd.exists():
+            shutil.rmtree(cwd)
+        cwd.mkdir(parents=True)
+        session = None
+        child = None
+
+        try:
+            session = Session(SessionConfig(cwd=cwd, interactive=False))
+            default_specs = {spec["name"] for spec in session.tool_specs()}
+            self.assertIn("EnterPlanMode", default_specs)
+            self.assertNotIn("ExitPlanMode", default_specs)
+
+            session.enter_plan_mode()
+            plan_specs = {spec["name"] for spec in session.tool_specs()}
+            self.assertIn("ExitPlanMode", plan_specs)
+            self.assertNotIn("EnterPlanMode", plan_specs)
+
+            child = session.create_child_session(interactive=False)
+            child_specs = {spec["name"] for spec in child.tool_specs()}
+            self.assertNotIn("EnterPlanMode", child_specs)
+            self.assertNotIn("ExitPlanMode", child_specs)
+        finally:
+            if child is not None:
+                child.close()
+            if session is not None:
+                session.close()
+            if cwd.exists():
+                shutil.rmtree(cwd, ignore_errors=True)
+
+    def test_plan_mode_write_tools_only_allow_current_plan_file(self) -> None:
+        cwd = Path(__file__).resolve().parent / "_tmp_plan_mode_write_targets"
+        if cwd.exists():
+            shutil.rmtree(cwd)
+        cwd.mkdir(parents=True)
+        session = None
+
+        try:
+            session = Session(SessionConfig(cwd=cwd, interactive=False))
+            plan_path = session.enter_plan_mode()
+            rel_plan = plan_path.relative_to(cwd).as_posix()
+            plan_path.write_text("alpha\n", encoding="utf-8")
+
+            session.validate_tool_call_policy("write_file", {"path": rel_plan, "content": "hello\n"})
+            session.validate_tool_call_policy(
+                "edit_file",
+                {"path": rel_plan, "old_text": "alpha", "new_text": "beta"},
+            )
+            session.validate_tool_call_policy(
+                "apply_patch",
+                {
+                    "patch": (
+                        "*** Begin Patch\n"
+                        f"*** Update File: {rel_plan}\n"
+                        "@@\n"
+                        "-alpha\n"
+                        "+beta\n"
+                        "*** End Patch\n"
+                    )
+                },
+            )
+
+            with self.assertRaises(PermissionDeniedError):
+                session.validate_tool_call_policy(
+                    "write_file",
+                    {"path": "notes.txt", "content": "hello\n"},
+                )
+            with self.assertRaises(PermissionDeniedError):
+                session.validate_tool_call_policy(
+                    "edit_file",
+                    {"path": "notes.txt", "old_text": "a", "new_text": "b"},
+                )
+            with self.assertRaises(PermissionDeniedError):
+                session.validate_tool_call_policy(
+                    "apply_patch",
+                    {
+                        "patch": (
+                            "*** Begin Patch\n"
+                            "*** Add File: notes.txt\n"
+                            "+hello\n"
+                            "*** End Patch\n"
+                        )
+                    },
+                )
+            with self.assertRaises(PermissionDeniedError):
+                session.validate_tool_call_policy("apply_patch", {"patch": "not a patch"})
+        finally:
+            if session is not None:
+                session.close()
+            if cwd.exists():
+                shutil.rmtree(cwd, ignore_errors=True)
+
+    def test_plan_mode_bash_only_allows_read_commands(self) -> None:
+        cwd = Path(__file__).resolve().parent / "_tmp_plan_mode_bash"
+        if cwd.exists():
+            shutil.rmtree(cwd)
+        cwd.mkdir(parents=True)
+        session = None
+
+        try:
+            session = Session(SessionConfig(cwd=cwd, interactive=False))
+            session.enter_plan_mode()
+
+            allowed = session.evaluate_bash_command_policy("git status")
+            self.assertTrue(allowed.allowed)
+
+            redirected = session.evaluate_bash_command_policy("git status > out.txt")
+            self.assertFalse(redirected.allowed)
+            self.assertIn("plan mode only allows read-only shell commands", redirected.reason.lower())
+
+            with self.assertRaises(PermissionDeniedError):
+                session.validate_tool_call_policy("bash", {"command": "mkdir tmp"})
+        finally:
+            if session is not None:
+                session.close()
+            if cwd.exists():
+                shutil.rmtree(cwd, ignore_errors=True)
+
+    def test_plan_mode_agent_tool_only_allows_explore_and_plan_foreground_profiles(self) -> None:
+        cwd = Path(__file__).resolve().parent / "_tmp_plan_mode_agent_policy"
+        if cwd.exists():
+            shutil.rmtree(cwd)
+        cwd.mkdir(parents=True)
+        session = None
+
+        try:
+            session = Session(SessionConfig(cwd=cwd, interactive=False))
+            session.enter_plan_mode()
+
+            session.validate_tool_call_policy(
+                "agent",
+                {
+                    "agent_type": "Explore",
+                    "description": "map code paths",
+                    "prompt": "find relevant files",
+                },
+            )
+            session.validate_tool_call_policy(
+                "agent",
+                {
+                    "agent_type": "Plan",
+                    "description": "design implementation",
+                    "prompt": "produce a plan",
+                },
+            )
+
+            with self.assertRaises(PermissionDeniedError):
+                session.validate_tool_call_policy(
+                    "agent",
+                    {
+                        "agent_type": "default",
+                        "description": "implement directly",
+                        "prompt": "do the work",
+                    },
+                )
+            with self.assertRaises(PermissionDeniedError):
+                session.validate_tool_call_policy(
+                    "agent",
+                    {
+                        "agent_type": "Explore",
+                        "description": "background scout",
+                        "prompt": "search in background",
+                        "run_in_background": True,
+                    },
+                )
+            session.close()
+            session = Session(
+                SessionConfig(
+                    cwd=cwd,
+                    interactive=False,
+                    plan_mode_interview_phase=True,
+                )
+            )
+            session.enter_plan_mode()
+            specs = {spec["name"]: spec for spec in session.tool_specs()}
+            self.assertEqual(session.plan_mode_allowed_agent_type_sequence(), ("Explore",))
+            self.assertIn("only the Explore agent types may be launched", specs["agent"]["description"])
+            self.assertIn(
+                "Explore is optional and scoped in interview mode",
+                specs["agent"]["description"],
+            )
+            session.validate_tool_call_policy(
+                "agent",
+                {
+                    "agent_type": "Explore",
+                    "description": "map code paths",
+                    "prompt": "find relevant files",
+                },
+            )
+            with self.assertRaises(PermissionDeniedError) as denied:
+                session.validate_tool_call_policy(
+                    "agent",
+                    {
+                        "agent_type": "Plan",
+                        "description": "design implementation",
+                        "prompt": "produce a plan",
+                    },
+                )
+            self.assertIn("current workflow", str(denied.exception))
+            self.assertIn("Explore", str(denied.exception))
+        finally:
+            if session is not None:
+                session.close()
+            if cwd.exists():
+                shutil.rmtree(cwd, ignore_errors=True)
+
+    def test_run_subagent_builds_explore_reconnaissance_prompt(self) -> None:
+        cwd = Path(__file__).resolve().parent / "_tmp_explore_subagent_prompt"
+        if cwd.exists():
+            shutil.rmtree(cwd)
+        cwd.mkdir(parents=True)
+        session = None
+
+        class FakeChild:
+            def __init__(self) -> None:
+                self.execution_contract = None
+                self.prompt = None
+                self.ask_kwargs = None
+
+            def set_session_execution_contract(self, **kwargs):
+                self.execution_contract = kwargs
+
+            def ask(self, prompt, **kwargs):
+                self.prompt = prompt
+                self.ask_kwargs = kwargs
+                return "recon complete"
+
+        try:
+            session = Session(SessionConfig(cwd=cwd, interactive=False))
+            child = FakeChild()
+            session.create_child_session = lambda **kwargs: child  # type: ignore[method-assign]
+
+            result = session.run_subagent(
+                description="map runtime reuse points",
+                prompt="inspect prompt assembly and identify existing patterns",
+                read_only=True,
+                agent_type="Explore",
+            )
+
+            self.assertEqual(result, "recon complete")
+            self.assertIsNotNone(child.execution_contract)
+            self.assertEqual(child.execution_contract["execution_mode"], "read-only-subagent")
+            self.assertIn("You are the builtin Explore planning agent.", child.prompt)
+            self.assertIn("Your role is reconnaissance before design.", child.prompt)
+            self.assertIn("Relevant Files", child.prompt)
+            self.assertIn("Existing Implementations And Reuse Candidates", child.prompt)
+            self.assertIn("Code Path Traces", child.prompt)
+            self.assertIn("Do not produce a final implementation plan", child.prompt)
+            self.assertIn("map runtime reuse points", child.prompt)
+            self.assertIn("inspect prompt assembly and identify existing patterns", child.prompt)
+            self.assertTrue(child.ask_kwargs["require_read_only_subagents"])
+        finally:
+            if session is not None:
+                session.close()
+            if cwd.exists():
+                shutil.rmtree(cwd, ignore_errors=True)
+
+    def test_run_subagent_builds_plan_design_prompt(self) -> None:
+        cwd = Path(__file__).resolve().parent / "_tmp_plan_subagent_prompt"
+        if cwd.exists():
+            shutil.rmtree(cwd)
+        cwd.mkdir(parents=True)
+        session = None
+
+        class FakeChild:
+            def __init__(self) -> None:
+                self.execution_contract = None
+                self.prompt = None
+                self.ask_kwargs = None
+
+            def set_session_execution_contract(self, **kwargs):
+                self.execution_contract = kwargs
+
+            def ask(self, prompt, **kwargs):
+                self.prompt = prompt
+                self.ask_kwargs = kwargs
+                return "design complete"
+
+        try:
+            session = Session(SessionConfig(cwd=cwd, interactive=False))
+            child = FakeChild()
+            session.create_child_session = lambda **kwargs: child  # type: ignore[method-assign]
+
+            result = session.run_subagent(
+                description="design runtime implementation",
+                prompt="use the exploration findings to propose the approach",
+                read_only=True,
+                agent_type="Plan",
+            )
+
+            self.assertEqual(result, "design complete")
+            self.assertIsNotNone(child.execution_contract)
+            self.assertEqual(child.execution_contract["execution_mode"], "read-only-subagent")
+            self.assertIn("You are the builtin Plan planning agent.", child.prompt)
+            self.assertIn("Your role is Phase 2 implementation design after exploration.", child.prompt)
+            self.assertIn("Implementation Approach", child.prompt)
+            self.assertIn("Ordered Steps", child.prompt)
+            self.assertIn("Critical Files To Change", child.prompt)
+            self.assertIn("Reuse Notes From Exploration", child.prompt)
+            self.assertIn("Verification Ideas", child.prompt)
+            self.assertIn("Do not fall back to generic reconnaissance", child.prompt)
+            self.assertIn("design runtime implementation", child.prompt)
+            self.assertIn("use the exploration findings to propose the approach", child.prompt)
+            self.assertTrue(child.ask_kwargs["require_read_only_subagents"])
+        finally:
+            if session is not None:
+                session.close()
+            if cwd.exists():
+                shutil.rmtree(cwd, ignore_errors=True)
+
+    def test_resolve_agent_runtime_profile_freezes_builtin_planning_agents(self) -> None:
+        cwd = Path(__file__).resolve().parent / "_tmp_planning_agent_profile"
+        if cwd.exists():
+            shutil.rmtree(cwd, ignore_errors=True)
+        cwd.mkdir(parents=True)
+        session = None
+
+        try:
+            session = Session(SessionConfig(cwd=cwd, interactive=False))
+            for agent_type in ("Explore", "Plan"):
+                profile = session.resolve_agent_runtime_profile(agent_type)
+                self.assertEqual(profile["execution"], "child-session")
+                self.assertEqual(profile["tool_policy"], "read-only-subagent")
+                self.assertTrue(profile["read_only"])
+                self.assertFalse(profile["run_in_background"])
+                self.assertFalse(profile["isolated_workspace"])
+                self.assertTrue(profile["planning_only"])
+        finally:
+            if session is not None:
+                session.close()
+            if cwd.exists():
+                shutil.rmtree(cwd, ignore_errors=True)
+
+    def test_run_subagent_forces_builtin_planning_agents_into_read_only_contract(self) -> None:
+        cwd = Path(__file__).resolve().parent / "_tmp_planning_agent_forced_read_only"
+        if cwd.exists():
+            shutil.rmtree(cwd, ignore_errors=True)
+        cwd.mkdir(parents=True)
+        session = None
+
+        class FakeChild:
+            def __init__(self) -> None:
+                self.execution_contract = None
+                self.prompt = None
+                self.ask_kwargs = None
+
+            def set_session_execution_contract(self, **kwargs):
+                self.execution_contract = kwargs
+
+            def ask(self, prompt, **kwargs):
+                self.prompt = prompt
+                self.ask_kwargs = kwargs
+                return "planned"
+
+        try:
+            session = Session(SessionConfig(cwd=cwd, interactive=False))
+            child = FakeChild()
+            session.create_child_session = lambda **kwargs: child  # type: ignore[method-assign]
+
+            result = session.run_subagent(
+                description="design runtime implementation",
+                prompt="turn exploration notes into an approach",
+                read_only=False,
+                agent_type="Plan",
+            )
+
+            self.assertEqual(result, "planned")
+            self.assertEqual(child.execution_contract["execution_mode"], "read-only-subagent")
+            self.assertTrue(child.ask_kwargs["require_read_only_subagents"])
+            self.assertIn("You are the builtin Plan planning agent.", child.prompt)
+        finally:
+            if session is not None:
+                session.close()
+            if cwd.exists():
+                shutil.rmtree(cwd, ignore_errors=True)
+
+    def test_launch_background_agent_rejects_builtin_planning_agents(self) -> None:
+        cwd = Path(__file__).resolve().parent / "_tmp_planning_agent_background_reject"
+        if cwd.exists():
+            shutil.rmtree(cwd, ignore_errors=True)
+        cwd.mkdir(parents=True)
+        session = None
+
+        try:
+            session = Session(SessionConfig(cwd=cwd, interactive=False))
+            with self.assertRaises(ValueError) as denied:
+                session.launch_background_agent(
+                    description="map runtime reuse points",
+                    prompt="inspect prompt assembly",
+                    agent_type="Explore",
+                    read_only=True,
+                )
+            self.assertIn("foreground-only", str(denied.exception))
+        finally:
+            if session is not None:
+                session.close()
+            if cwd.exists():
+                shutil.rmtree(cwd, ignore_errors=True)
+
+    def test_plan_mode_direct_write_tool_execution_still_blocks_non_plan_targets(self) -> None:
+        cwd = Path(__file__).resolve().parent / "_tmp_plan_mode_direct_write"
+        if cwd.exists():
+            shutil.rmtree(cwd)
+        cwd.mkdir(parents=True)
+        session = None
+
+        try:
+            session = Session(SessionConfig(cwd=cwd, interactive=False))
+            plan_path = session.enter_plan_mode()
+            rel_plan = plan_path.relative_to(cwd).as_posix()
+            plan_path.write_text("alpha\n", encoding="utf-8")
+            ctx = ToolContext(
+                cwd=cwd,
+                permission_manager=PermissionManager(interactive=False),
+                task_manager=TaskManager(),
+                session=session,
+            )
+
+            with self.assertRaises(PermissionDeniedError):
+                WriteFileTool().execute({"path": "notes.txt", "content": "x"}, ctx)
+            with self.assertRaises(PermissionDeniedError):
+                EditFileTool().execute({"path": "notes.txt", "old_text": "a", "new_text": "b"}, ctx)
+            with self.assertRaises(PermissionDeniedError):
+                ApplyPatchTool().execute(
+                    {
+                        "patch": (
+                            "*** Begin Patch\n"
+                            "*** Add File: notes.txt\n"
+                            "+hello\n"
+                            "*** End Patch\n"
+                        )
+                    },
+                    ctx,
+                )
+
+            self.assertEqual(
+                WriteFileTool().execute({"path": rel_plan, "content": "plan\n"}, ctx),
+                f"Updated {rel_plan}",
+            )
+        finally:
+            if session is not None:
+                session.close()
+            if cwd.exists():
+                shutil.rmtree(cwd, ignore_errors=True)
+
+    def test_plan_mode_child_session_inherits_restrictions_and_own_plan_file(self) -> None:
+        cwd = Path(__file__).resolve().parent / "_tmp_plan_mode_child"
+        if cwd.exists():
+            shutil.rmtree(cwd)
+        cwd.mkdir(parents=True)
+        session = None
+        child = None
+
+        try:
+            session = Session(SessionConfig(cwd=cwd, interactive=False))
+            parent_plan = session.enter_plan_mode()
+            child = session.create_child_session(interactive=False)
+            child_plan = child.get_plan_file_path()
+
+            self.assertNotEqual(parent_plan.resolve(), child_plan.resolve())
+            self.assertEqual(
+                set(spec["name"] for spec in child.tool_specs()),
+                {
+                    "apply_patch",
+                    "ask_user_question",
+                    "bash",
+                    "edit_file",
+                    "find_callees",
+                    "find_callers",
+                    "find_references",
+                    "find_symbol",
+                    "find_symbol_graph",
+                    "glob_search",
+                    "grep_search",
+                    "list_dir",
+                    "list_mcp_resources",
+                    "outline_file",
+                    "outline_project",
+                    "read_file",
+                    "read_mcp_resource",
+                    "write_file",
+                },
+            )
+            self.assertNotIn("agent", {spec["name"] for spec in child.tool_specs()})
+
+            child.validate_tool_call_policy(
+                "write_file",
+                {"path": child_plan.relative_to(cwd).as_posix(), "content": "child plan\n"},
+            )
+            with self.assertRaises(PermissionDeniedError):
+                child.validate_tool_call_policy(
+                    "write_file",
+                    {"path": parent_plan.relative_to(cwd).as_posix(), "content": "parent plan\n"},
+                )
+            denied = child.evaluate_bash_command_policy("git add demo.txt")
+            self.assertFalse(denied.allowed)
+            self.assertIn("plan mode", denied.reason.lower())
+        finally:
+            if child is not None:
+                child.close()
+            if session is not None:
+                session.close()
+            if cwd.exists():
+                shutil.rmtree(cwd, ignore_errors=True)
+
     def test_create_child_session_prefers_git_worktree_when_repo_is_clean(self) -> None:
         if shutil.which("git") is None:
             self.skipTest("git is not installed")
@@ -3271,6 +3900,66 @@ class SessionViewsTests(unittest.TestCase):
             if child is not None:
                 child.close()
             session.close()
+
+    def test_create_child_session_copies_parent_plan_file(self) -> None:
+        cwd = Path(__file__).resolve().parent / "_tmp_session_child_plan_copy"
+        if cwd.exists():
+            shutil.rmtree(cwd, ignore_errors=True)
+        cwd.mkdir(parents=True)
+        session = None
+        child = None
+
+        try:
+            session = Session(SessionConfig(cwd=cwd, interactive=False))
+            session.enter_plan_mode()
+            parent_plan_path = session.get_plan_file_path()
+            parent_plan_path.write_text("# Parent plan\n- inspect runtime\n", encoding="utf-8")
+
+            child = session.create_child_session(interactive=False)
+
+            child_plan_path = child.get_plan_file_path()
+            self.assertNotEqual(child_plan_path, parent_plan_path)
+            self.assertTrue(child_plan_path.exists())
+            self.assertEqual(child_plan_path.read_text(encoding="utf-8"), "# Parent plan\n- inspect runtime\n")
+            self.assertEqual(child.state.session_runtime_mode, "plan")
+        finally:
+            if child is not None:
+                child.close()
+            if session is not None:
+                session.close()
+            if cwd.exists():
+                shutil.rmtree(cwd, ignore_errors=True)
+
+    def test_restored_session_recovers_plan_slug_and_plan_file(self) -> None:
+        cwd = Path(__file__).resolve().parent / "_tmp_session_restore_plan_mode"
+        if cwd.exists():
+            shutil.rmtree(cwd, ignore_errors=True)
+        cwd.mkdir(parents=True)
+
+        try:
+            session = Session(SessionConfig(cwd=cwd, interactive=False))
+            session.enter_plan_mode()
+            plan_path = session.get_plan_file_path()
+            plan_path.write_text("# Restored plan\n- continue\n", encoding="utf-8")
+            save_transcript(session.config, session.state)
+            session_id = session.state.session_id
+            session.close()
+
+            factory = SessionFactory(load_mcp_from_config=False)
+            restored, _ = factory.create_or_restore_session(
+                SessionConfig(cwd=cwd, interactive=False),
+                resume_session_id=session_id,
+            )
+            try:
+                self.assertEqual(restored.state.session_runtime_mode, "plan")
+                self.assertEqual(restored.get_plan_file_path(), plan_path)
+                self.assertEqual(restored.get_plan().strip(), "# Restored plan\n- continue")
+                self.assertTrue(restored.state.needs_plan_mode_reentry_attachment)
+            finally:
+                restored.close()
+        finally:
+            if cwd.exists():
+                shutil.rmtree(cwd, ignore_errors=True)
 
     def test_describe_config_and_tasks_include_workspace_context(self) -> None:
         cwd = Path(__file__).resolve().parent / "_tmp_session_workspace_views"
@@ -4037,8 +4726,8 @@ class SessionViewsTests(unittest.TestCase):
             self.assertIn("inspect_focused_diff: /changes show ", detail)
             self.assertIn("inspect_task: /task show " + task.id, detail)
             self.assertIn("/task show " + execution.id, detail)
-            self.assertIn("inspect_active_plan: /plan file 1", detail)
-            self.assertIn("/plan execution 1 file 1", detail)
+            self.assertIn("inspect_active_plan: /planning file 1", detail)
+            self.assertIn("/planning execution 1 file 1", detail)
             self.assertIn("stay_on_surface: /changes show ", detail)
             self.assertIn("/changes working-set", detail)
         finally:
@@ -4377,7 +5066,7 @@ class SessionViewsTests(unittest.TestCase):
             self.assertIn("inspect_focused_file=/files show 1", files)
             self.assertIn("inspect_change=/changes show", files)
             self.assertIn("inspect_task=/task show " + task.id, files)
-            self.assertIn("inspect_active_plan=/plan file 1", files)
+            self.assertIn("inspect_active_plan=/planning file 1", files)
             self.assertIn("filter: changes", changes)
             self.assertIn("app.py", changes)
             self.assertNotIn("notes.md", changes)
@@ -4553,7 +5242,7 @@ class SessionViewsTests(unittest.TestCase):
             encoding="utf-8",
         )
         try:
-            session = Session(SessionConfig(cwd=cwd, interactive=False))
+            session = Session(SessionConfig(cwd=cwd, interactive=False, max_tokens=8192))
             session.state.context_summary = "Earlier turns compacted."
             session.record_planning_artifact(
                 PlanningArtifact(
@@ -4586,7 +5275,11 @@ class SessionViewsTests(unittest.TestCase):
             self.assertEqual(prefix_payload["prompt_prefix_cache_mode"], "provider_hinted")
             self.assertTrue(prefix_payload["prompt_prefix_cache_supported"])
             self.assertEqual(prefix_payload["prompt_prefix_cache_provider"], "anthropic")
-            self.assertIn("stable prefix preserved", prefix_payload["prompt_prefix_cache_summary"])
+            self.assertIn(
+                prefix_payload["prompt_prefix_cache_summary"],
+                {"stable prefix preserved", "prefix-preserving reduction"},
+            )
+            self.assertEqual(prefix_payload["prompt_prefix_attachment_summary"], "none")
             self.assertEqual(prefix_payload["prompt_prefix_planner_mode"], "provider_hinted")
             self.assertIn("prompt_prefix_preserved_signature", prefix_payload)
             self.assertGreaterEqual(
@@ -4611,6 +5304,7 @@ class SessionViewsTests(unittest.TestCase):
             self.assertIn("dynamic prompt chars:", context_summary)
             self.assertIn("prompt prefix:", context_summary)
             self.assertIn("provider-view assembly:", context_summary)
+            self.assertIn("provider-view attachments:", context_summary)
             self.assertIn("prompt prefix cache mode:", context_summary)
             self.assertIn("prompt prefix cache supported:", context_summary)
             self.assertIn("prompt prefix cache provider:", context_summary)
@@ -4631,6 +5325,7 @@ class SessionViewsTests(unittest.TestCase):
             self.assertIn("prefix reduction tier:", context_summary)
             self.assertIn("prefix signature:", context_summary)
             self.assertIn("prompt prefix cache mode:", workflow)
+            self.assertIn("provider-view attachments:", workflow)
             self.assertIn("prompt prefix cache provider:", workflow)
             self.assertIn("provider-view planner:", workflow)
             self.assertIn("prefix planner reason:", workflow)
@@ -4641,6 +5336,504 @@ class SessionViewsTests(unittest.TestCase):
             self.assertIn("orchestration reason:", workflow)
             self.assertIn("preserved prefix signature:", workflow)
         finally:
+            if cwd.exists():
+                shutil.rmtree(cwd)
+
+    def test_plan_workflow_surfaces_share_one_family_source(self) -> None:
+        cwd = Path(__file__).resolve().parent / "_tmp_plan_workflow_family_surface"
+        if cwd.exists():
+            shutil.rmtree(cwd)
+        cwd.mkdir(parents=True)
+        session = Session(
+            SessionConfig(
+                cwd=cwd,
+                interactive=False,
+                plan_mode_interview_phase=True,
+            )
+        )
+        try:
+            session.enter_plan_mode()
+            assembly = session.build_provider_prompt_assembly(
+                messages=[{"role": "user", "content": [{"type": "text", "text": "plan"}]}]
+            )
+            session.record_prompt_prefix_assembly(
+                assembly,
+                source="test",
+                cache_plan=None,
+            )
+
+            prefix_payload = session.prompt_prefix_surface_payload()
+            status_payload = session.status_surface_payload()
+            context_text = session.describe_context()
+            workflow_text = session.describe_status(section="workflow")
+
+            self.assertEqual(session.plan_workflow_mode(), "interview")
+            self.assertEqual(prefix_payload["plan_workflow_mode"], "interview")
+            self.assertEqual(prefix_payload["plan_workflow_phase_family"], "interview")
+            self.assertEqual(prefix_payload["plan_workflow_branch_identity"], "interview_branch")
+            self.assertIn(
+                "Iterative interview planning branch",
+                prefix_payload["plan_workflow_branch_summary"],
+            )
+            self.assertEqual(
+                prefix_payload["plan_workflow_planning_cadence"],
+                "iterative_interview_loop",
+            )
+            self.assertEqual(
+                prefix_payload["plan_workflow_first_turn_contract"],
+                "quick_scan_then_skeleton_plan_then_first_question",
+            )
+            self.assertIn(
+                "Quickly scan a few key files",
+                prefix_payload["plan_workflow_first_turn_summary"],
+            )
+            self.assertEqual(
+                prefix_payload["plan_workflow_first_turn_scan_scope"],
+                "quickly_scan_a_few_key_files_only",
+            )
+            self.assertEqual(
+                prefix_payload["plan_workflow_first_turn_plan_expectation"],
+                "write_a_skeleton_plan_with_headers_and_rough_notes_before_questioning",
+            )
+            self.assertEqual(
+                prefix_payload["plan_workflow_first_turn_question_timing"],
+                "ask_first_round_of_questions_after_skeleton_plan",
+            )
+            self.assertEqual(
+                prefix_payload["plan_workflow_first_turn_regression_guard"],
+                "do_not_explore_exhaustively_or_finish_the_final_plan_before_first_questions",
+            )
+            self.assertEqual(
+                prefix_payload["plan_workflow_plan_update_contract"],
+                "incremental_plan_updates_during_discovery",
+            )
+            self.assertIn(
+                "immediately update the plan file",
+                prefix_payload["plan_workflow_plan_update_summary"],
+            )
+            self.assertEqual(
+                prefix_payload["plan_workflow_plan_update_trigger"],
+                "update_plan_file_after_each_meaningful_discovery",
+            )
+            self.assertEqual(
+                prefix_payload["plan_workflow_plan_update_capture_scope"],
+                "capture_relevant_findings_reuse_points_decisions_and_open_questions_immediately",
+            )
+            self.assertEqual(
+                prefix_payload["plan_workflow_plan_update_deferral_guard"],
+                "do_not_defer_plan_writing_until_the_end",
+            )
+            self.assertEqual(
+                prefix_payload["plan_workflow_question_loop_contract"],
+                "ask_user_when_code_cannot_resolve_decisions",
+            )
+            self.assertEqual(
+                prefix_payload["plan_workflow_turn_exit_contract"],
+                "ask_user_question_or_ExitPlanMode_only",
+            )
+            self.assertIn(
+                "Interview turns may end only by asking the user a clarification question or by calling ExitPlanMode for approval.",
+                prefix_payload["plan_workflow_turn_exit_summary"],
+            )
+            self.assertEqual(
+                prefix_payload["plan_workflow_clarification_channel"],
+                "ask_user_question_only",
+            )
+            self.assertEqual(
+                prefix_payload["plan_workflow_approval_channel"],
+                "ExitPlanMode_only",
+            )
+            self.assertEqual(
+                prefix_payload["plan_workflow_turn_exit_forbidden_patterns"],
+                "no_plain_text_approval_requests_no_plain_text_stop_no_fake_approval_via_ask_user_question",
+            )
+            self.assertIn(
+                "Explore is optional and scoped in interview mode",
+                prefix_payload["plan_workflow_planning_agent_usage_summary"],
+            )
+            self.assertEqual(
+                prefix_payload["plan_workflow_explore_agent_usage_rule"],
+                "Explore_optional_for_scoped_reconnaissance_only",
+            )
+            self.assertEqual(
+                prefix_payload["plan_workflow_plan_agent_delegation_rule"],
+                "do_not_default_to_Plan_agent_in_interview_mode",
+            )
+            self.assertEqual(
+                prefix_payload["plan_workflow_main_thread_design_owner"],
+                "main_thread_owns_implementation_design_synthesis",
+            )
+            self.assertEqual(
+                prefix_payload["plan_workflow_followup_continuity_contract"],
+                "sparse_reentry_reject_retry_preserve_interview_family",
+            )
+            self.assertIn(
+                "Later turns remain in interview-family semantics",
+                prefix_payload["plan_workflow_followup_continuity_summary"],
+            )
+            self.assertEqual(
+                prefix_payload["plan_workflow_branch_preservation_rule"],
+                "preserve_interview_family_across_followup_rejection_and_retry",
+            )
+            self.assertEqual(prefix_payload["plan_instruction_state"], "plan_mode_active")
+            self.assertEqual(prefix_payload["plan_instruction_attachment_summary"], "plan_mode")
+            self.assertEqual(prefix_payload["plan_workflow_allowed_agent_names"], ["Explore"])
+            self.assertEqual(
+                prefix_payload["plan_workflow_invocation_delegation_default"],
+                "main_thread_first",
+            )
+            self.assertIn(
+                "interview boundary",
+                prefix_payload["plan_workflow_invocation_boundary_summary"],
+            )
+            self.assertEqual(status_payload["status_plan_workflow_mode"], "interview")
+            self.assertEqual(status_payload["status_plan_workflow_phase_family"], "interview")
+            self.assertEqual(
+                status_payload["status_plan_workflow_branch_identity"],
+                "interview_branch",
+            )
+            self.assertEqual(
+                status_payload["status_plan_workflow_planning_cadence"],
+                "iterative_interview_loop",
+            )
+            self.assertIn(
+                "Quickly scan a few key files",
+                status_payload["status_plan_workflow_first_turn_summary"],
+            )
+            self.assertEqual(
+                status_payload["status_plan_workflow_first_turn_scan_scope"],
+                "quickly_scan_a_few_key_files_only",
+            )
+            self.assertEqual(
+                status_payload["status_plan_workflow_plan_update_trigger"],
+                "update_plan_file_after_each_meaningful_discovery",
+            )
+            self.assertEqual(
+                status_payload["status_plan_workflow_approval_channel"],
+                "ExitPlanMode_only",
+            )
+            self.assertEqual(
+                status_payload["status_plan_workflow_plan_agent_delegation_rule"],
+                "do_not_default_to_Plan_agent_in_interview_mode",
+            )
+            self.assertEqual(
+                status_payload["status_plan_workflow_followup_continuity_contract"],
+                "sparse_reentry_reject_retry_preserve_interview_family",
+            )
+            self.assertEqual(status_payload["status_plan_instruction_state"], "plan_mode_active")
+            self.assertEqual(status_payload["status_plan_workflow_allowed_agent_names"], ["Explore"])
+            self.assertEqual(
+                status_payload["status_plan_workflow_invocation_delegation_default"],
+                "main_thread_first",
+            )
+            self.assertIn("plan workflow: interview", context_text)
+            self.assertIn("plan workflow: interview", workflow_text)
+            self.assertIn("plan workflow branch: interview_branch", context_text)
+            self.assertIn("plan workflow branch: interview_branch", workflow_text)
+            self.assertIn(
+                "plan workflow branch summary: Iterative interview planning branch",
+                context_text,
+            )
+            self.assertIn(
+                "plan workflow branch summary: Iterative interview planning branch",
+                workflow_text,
+            )
+            self.assertIn(
+                "plan workflow contracts: cadence=iterative_interview_loop",
+                context_text,
+            )
+            self.assertIn(
+                "plan workflow contracts: cadence=iterative_interview_loop",
+                workflow_text,
+            )
+            self.assertIn(
+                "plan workflow first turn: Quickly scan a few key files",
+                context_text,
+            )
+            self.assertIn(
+                "plan workflow first turn: Quickly scan a few key files",
+                workflow_text,
+            )
+            self.assertIn(
+                "plan workflow first-turn detail: scan=quickly_scan_a_few_key_files_only",
+                context_text,
+            )
+            self.assertIn(
+                "plan workflow anti-drift: do_not_explore_exhaustively_or_finish_the_final_plan_before_first_questions",
+                workflow_text,
+            )
+            self.assertIn(
+                "plan workflow plan updates: After each meaningful discovery, immediately update the plan file",
+                context_text,
+            )
+            self.assertIn(
+                "plan workflow plan-update detail: trigger=update_plan_file_after_each_meaningful_discovery",
+                workflow_text,
+            )
+            self.assertIn(
+                "plan workflow turn exit: Interview turns may end only by asking the user a clarification question or by calling ExitPlanMode for approval.",
+                context_text,
+            )
+            self.assertIn(
+                "plan workflow turn-exit detail: clarification=ask_user_question_only approval=ExitPlanMode_only",
+                workflow_text,
+            )
+            self.assertIn(
+                "plan workflow turn-exit anti-drift: no_plain_text_approval_requests_no_plain_text_stop_no_fake_approval_via_ask_user_question",
+                workflow_text,
+            )
+            self.assertIn(
+                "plan workflow agent usage: Explore is optional and scoped in interview mode",
+                context_text,
+            )
+            self.assertIn(
+                "plan workflow agent detail: explore=Explore_optional_for_scoped_reconnaissance_only plan_delegate=do_not_default_to_Plan_agent_in_interview_mode design_owner=main_thread_owns_implementation_design_synthesis",
+                workflow_text,
+            )
+            self.assertIn(
+                "plan workflow follow-up continuity: Later turns remain in interview-family semantics",
+                context_text,
+            )
+            self.assertIn(
+                "plan workflow follow-up detail: sparse_reentry_reject_retry_preserve_interview_family",
+                workflow_text,
+            )
+            self.assertIn(
+                "plan workflow preservation: preserve_interview_family_across_followup_rejection_and_retry",
+                context_text,
+            )
+            self.assertIn("planning-agent boundary: interview boundary", context_text)
+            self.assertIn("planning-agent boundary: interview boundary", workflow_text)
+            self.assertIn("planning-agent allowed: Explore", context_text)
+            self.assertIn("planning-agent allowed: Explore", workflow_text)
+            self.assertIn("plan attachments: plan_mode", context_text)
+            self.assertIn("plan attachment mode: full", context_text)
+            self.assertIn(
+                "plan attachment state: plan_mode_active mode=full reentry=no exit=no",
+                context_text,
+            )
+            self.assertIn(
+                "plan attachment state: plan_mode_active mode=full reentry=no exit=no",
+                workflow_text,
+            )
+        finally:
+            session.close()
+            if cwd.exists():
+                shutil.rmtree(cwd)
+
+    def test_five_phase_plan_workflow_surfaces_expose_planning_agent_boundary(self) -> None:
+        cwd = Path(__file__).resolve().parent / "_tmp_plan_workflow_boundary_surface"
+        if cwd.exists():
+            shutil.rmtree(cwd)
+        cwd.mkdir(parents=True)
+        session = Session(SessionConfig(cwd=cwd, interactive=False))
+        try:
+            session.enter_plan_mode()
+            assembly = session.build_provider_prompt_assembly(
+                messages=[{"role": "user", "content": [{"type": "text", "text": "plan"}]}]
+            )
+            session.record_prompt_prefix_assembly(
+                assembly,
+                source="test",
+                cache_plan=None,
+            )
+
+            prefix_payload = session.prompt_prefix_surface_payload()
+            status_payload = session.status_surface_payload()
+            context_text = session.describe_context()
+            workflow_text = session.describe_status(section="workflow")
+
+            self.assertEqual(prefix_payload["plan_workflow_mode"], "five_phase")
+            self.assertEqual(prefix_payload["plan_workflow_branch_identity"], "five_phase_branch")
+            self.assertEqual(
+                prefix_payload["plan_workflow_planning_cadence"],
+                "phase_staged_workflow",
+            )
+            self.assertEqual(prefix_payload["plan_workflow_allowed_agent_names"], ["Explore", "Plan"])
+            self.assertEqual(
+                prefix_payload["plan_workflow_invocation_delegation_default"],
+                "phase_split",
+            )
+            self.assertIn(
+                "five_phase boundary",
+                prefix_payload["plan_workflow_invocation_boundary_summary"],
+            )
+            self.assertEqual(
+                status_payload["status_plan_workflow_allowed_agent_names"],
+                ["Explore", "Plan"],
+            )
+            self.assertEqual(status_payload["status_plan_workflow_mode"], "five_phase")
+            self.assertEqual(
+                status_payload["status_plan_workflow_phase_family"],
+                "five_phase",
+            )
+            self.assertEqual(
+                status_payload["status_plan_workflow_branch_identity"],
+                "five_phase_branch",
+            )
+            self.assertFalse(status_payload["status_plan_workflow_verification_agent_required"])
+            self.assertEqual(
+                status_payload["status_plan_workflow_verification_agent_scope"],
+                "post_milestone_b_followup",
+            )
+            self.assertIn(
+                "Verification agent is not required for Milestone B completion",
+                status_payload["status_plan_workflow_verification_agent_summary"],
+            )
+            self.assertEqual(
+                prefix_payload["plan_workflow_verification_agent_scope"],
+                "post_milestone_b_followup",
+            )
+            self.assertIn("planning-agent boundary: five_phase boundary", context_text)
+            self.assertIn("planning-agent boundary: five_phase boundary", workflow_text)
+            self.assertIn("plan workflow branch: five_phase_branch", context_text)
+            self.assertIn("plan workflow branch: five_phase_branch", workflow_text)
+            self.assertIn(
+                "verification-agent scope: post_milestone_b_followup",
+                context_text,
+            )
+            self.assertIn(
+                "verification-agent scope: post_milestone_b_followup",
+                workflow_text,
+            )
+            self.assertIn("planning-agent allowed: Explore,Plan", context_text)
+            self.assertIn("planning-agent allowed: Explore,Plan", workflow_text)
+        finally:
+            session.close()
+            if cwd.exists():
+                shutil.rmtree(cwd)
+
+    def test_plan_instruction_surfaces_expose_reentry_and_exit_followup_states(self) -> None:
+        cwd = Path(__file__).resolve().parent / "_tmp_plan_instruction_states_surface"
+        if cwd.exists():
+            shutil.rmtree(cwd)
+        cwd.mkdir(parents=True)
+        session = Session(SessionConfig(cwd=cwd, interactive=False))
+        try:
+            session.enter_plan_mode()
+            session.state.needs_plan_mode_reentry_attachment = True
+            reentry_assembly = session.build_provider_prompt_assembly(
+                messages=[{"role": "user", "content": [{"type": "text", "text": "plan"}]}]
+            )
+            session.record_prompt_prefix_assembly(
+                reentry_assembly,
+                source="test",
+                cache_plan=None,
+            )
+
+            reentry_prefix = session.prompt_prefix_surface_payload()
+            reentry_status = session.status_surface_payload()
+            reentry_context = session.describe_context()
+            reentry_workflow = session.describe_status(section="workflow")
+
+            self.assertEqual(reentry_prefix["plan_instruction_state"], "plan_mode_reentry_active")
+            self.assertEqual(reentry_prefix["prompt_prefix_attachment_mode"], "reentry")
+            self.assertEqual(reentry_prefix["plan_instruction_attachment_mode"], "reentry")
+            self.assertEqual(
+                reentry_prefix["plan_instruction_attachment_summary"],
+                "plan_mode_reentry,plan_mode",
+            )
+            self.assertTrue(reentry_prefix["plan_instruction_reentry_active"])
+            self.assertFalse(reentry_prefix["plan_instruction_exit_active"])
+            self.assertEqual(
+                reentry_status["status_plan_instruction_state"],
+                "plan_mode_reentry_active",
+            )
+            self.assertEqual(
+                reentry_status["status_plan_instruction_attachment_mode"],
+                "reentry",
+            )
+            self.assertTrue(reentry_status["status_plan_instruction_reentry_active"])
+            self.assertIn(
+                "plan attachment mode: reentry",
+                reentry_context,
+            )
+            self.assertIn(
+                "plan attachment state: plan_mode_reentry_active mode=reentry reentry=yes exit=no",
+                reentry_workflow,
+            )
+
+            session.exit_plan_mode(approved_plan="## Approved Plan\n- implement\n")
+            exit_assembly = session.build_provider_prompt_assembly(
+                messages=[{"role": "user", "content": [{"type": "text", "text": "implement"}]}]
+            )
+            session.record_prompt_prefix_assembly(
+                exit_assembly,
+                source="test",
+                cache_plan=None,
+            )
+
+            exit_prefix = session.prompt_prefix_surface_payload()
+            exit_status = session.status_surface_payload()
+            exit_context = session.describe_context()
+            exit_workflow = session.describe_status(section="workflow")
+
+            self.assertEqual(exit_prefix["plan_instruction_state"], "exit_followup")
+            self.assertEqual(exit_prefix["prompt_prefix_attachment_mode"], "exit")
+            self.assertEqual(exit_prefix["plan_instruction_attachment_mode"], "exit")
+            self.assertEqual(exit_prefix["plan_instruction_attachment_summary"], "plan_mode_exit")
+            self.assertFalse(exit_prefix["plan_instruction_reentry_active"])
+            self.assertTrue(exit_prefix["plan_instruction_exit_active"])
+            self.assertEqual(exit_status["status_plan_instruction_state"], "exit_followup")
+            self.assertEqual(exit_status["status_plan_instruction_attachment_mode"], "exit")
+            self.assertTrue(exit_status["status_plan_instruction_exit_active"])
+            self.assertIn("plan attachment mode: exit", exit_context)
+            self.assertIn(
+                "plan attachment state: exit_followup mode=exit reentry=no exit=yes",
+                exit_workflow,
+            )
+        finally:
+            session.close()
+            if cwd.exists():
+                shutil.rmtree(cwd)
+
+    def test_plan_instruction_surfaces_expose_sparse_followup_state(self) -> None:
+        cwd = Path(__file__).resolve().parent / "_tmp_plan_instruction_sparse_surface"
+        if cwd.exists():
+            shutil.rmtree(cwd)
+        cwd.mkdir(parents=True)
+        session = Session(SessionConfig(cwd=cwd, interactive=False))
+        try:
+            session.enter_plan_mode()
+            first_assembly = session.build_provider_prompt_assembly(
+                messages=[{"role": "user", "content": [{"type": "text", "text": "plan"}]}]
+            )
+            session.record_prompt_prefix_assembly(
+                first_assembly,
+                source="test",
+                cache_plan=None,
+            )
+            session.record_plan_mode_attachment_cycle(first_assembly.prompt_attachments)
+
+            sparse_assembly = session.build_provider_prompt_assembly(
+                messages=[{"role": "user", "content": [{"type": "text", "text": "continue"}]}]
+            )
+            session.record_prompt_prefix_assembly(
+                sparse_assembly,
+                source="test",
+                cache_plan=None,
+            )
+
+            sparse_prefix = session.prompt_prefix_surface_payload()
+            sparse_status = session.status_surface_payload()
+            sparse_context = session.describe_context()
+            sparse_workflow = session.describe_status(section="workflow")
+
+            self.assertEqual(sparse_prefix["plan_instruction_state"], "plan_mode_active")
+            self.assertEqual(sparse_prefix["prompt_prefix_attachment_mode"], "sparse")
+            self.assertEqual(sparse_prefix["plan_instruction_attachment_mode"], "sparse")
+            self.assertEqual(sparse_status["status_plan_instruction_state"], "plan_mode_active")
+            self.assertEqual(
+                sparse_status["status_plan_instruction_attachment_mode"],
+                "sparse",
+            )
+            self.assertIn("plan attachment mode: sparse", sparse_context)
+            self.assertIn(
+                "plan attachment state: plan_mode_active mode=sparse reentry=no exit=no",
+                sparse_workflow,
+            )
+        finally:
+            session.close()
             if cwd.exists():
                 shutil.rmtree(cwd)
 
@@ -5286,7 +6479,7 @@ class SessionViewsTests(unittest.TestCase):
 
             self.assertIn("- focused file: b.py", rendered_plan)
             self.assertIn("- focused file: b.py", rendered_advisor)
-            self.assertIn("go_to_plan: /plan file 2", rendered_advisor)
+            self.assertIn("go_to_plan: /planning file 2", rendered_advisor)
             self.assertIn("- focused file: b.py", rendered_scouts)
             self.assertIn("- focused file: b.py", rendered_execution)
         finally:
@@ -5769,3 +6962,4 @@ class SessionViewsTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
